@@ -1,14 +1,19 @@
 #!/bin/bash
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/path_config.sh"
+cd "${PROJECT_DIR}"
+
 dataset="cifar10"
-exp_path_base="experiment_${dataset}_acc_20"
-config_file="config_files_cifar"
+exp_path_base="${PROJECT_DIR}/experiment_${dataset}_acc_20"
+config_dir="${CONFIG_FILES_CIFAR_DIR}"
 fitness_metric="best_accuracy"
-data_path="${dataset}_data"
+data_path="${PROJECT_DIR}/${dataset}_data"
 log_level="INFO"
 network_config="dense"
 dataset_sample_size=10000
 
-configs=("config16.txt")
+configs=("config16.yml")
 exps=("exp1")
 cuda_devices=("0,1")
 
@@ -23,9 +28,9 @@ for ((j=0; j<${#configs[@]}; j++)); do
     for ((i=1; i<=3; i++)); do # Change the range to the number of repeats
         exp_path="${exp_path_base}/${exp}_repeat_$i"
 
-        CUDA_VISIBLE_DEVICES="$cuda_device" python run_evolution.py \
+        CUDA_VISIBLE_DEVICES="$cuda_device" uv run python "${SRC_DIR}/run_evolution.py" \
             --experiment_path "$exp_path" \
-            --config_file "${config_file}/${config}" \
+            --config_file "${config_dir}/${config}" \
             --data_path "$data_path" \
             --dataset "$dataset" \
             --limit_data_value "$dataset_sample_size" \

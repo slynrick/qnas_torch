@@ -7,44 +7,51 @@
 
 ## Environment Configuration
 
-The following steps are used to configure the environment for the project.
+The following steps are used to configure the environment for the project with Astral uv.
 
-- Miniconda Installation
-- Conda Environment Creation
-- Package Installation
+- uv installation
+- Python and virtual environment setup
+- Dependency synchronization
 
 **Notes**: 
 - An NVIDIA GPU is required to run the project. 
 - The project was tested using three NVIDIA RTX A30 GPUs to run evolutionary search with up to 20 individuals in parallel.
 - NVIDIA drivers and the CUDA Toolkit are necessary (tested with CUDA 11.6).
-- The following steps have been tested on Ubuntu 20.04 and WSL2 - Ubuntu 20.04.
+- The following steps have been tested on Ubuntu Linux.
 
-### Miniconda Installation
+### uv Installation
 
-Install Miniconda in the home directory. Refer to the [Miniconda Installation Guide](https://docs.anaconda.com/free/miniconda/#quick-command-line-install) for more information.
+Install uv following the official guide: [https://docs.astral.sh/uv/getting-started/installation/](https://docs.astral.sh/uv/getting-started/installation/).
 
-```bash
-mkdir -p ~/miniconda3
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
-bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
-rm -rf ~/miniconda3/miniconda.sh
-```
+For Linux/macOS, one option is:
 
 ```bash
-~/miniconda3/bin/conda init bash
-~/miniconda3/bin/conda init zsh
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### Conda Environment Creation
+### Python and Environment Setup
+
+Create and pin a Python 3.11 environment for the project:
 
 ```bash
-conda create -n qnas python=3.9
-conda activate qnas
+uv python install 3.11
+uv venv --python 3.11
 ```
 
-### Package Installation
+### Dependency Installation
+
+Install all dependencies (including CUDA 12.1 PyTorch wheels) from `pyproject.toml`:
 
 ```bash
-conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
-pip install -r requirements.txt
+uv sync
 ```
+
+### Running Scripts
+
+Use `uv run` to execute project commands inside the uv-managed environment:
+
+```bash
+uv run python src/run_evolution.py --help
+```
+
+The helper scripts in this repository (`run.sh`, `run_retrain.sh`, `run_resnet.sh`) already use `uv run`.

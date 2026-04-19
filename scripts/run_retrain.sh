@@ -1,5 +1,9 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/path_config.sh"
+cd "${PROJECT_DIR}"
+
 # Define variables for retrain experiment
 dataset="cifar10"
 network_config="default"
@@ -9,12 +13,12 @@ exp="exp1"
 
 repeat="1"
 echo "Starting $exp_num F13 repeat $repeat"
-exp_path="experiment_${dataset}_acc_${exp_num}/${exp}_repeat_${repeat}"
+exp_path="${PROJECT_DIR}/experiment_${dataset}_acc_${exp_num}/${exp}_repeat_${repeat}"
 
 # Retrain model
-CUDA_VISIBLE_DEVICES=0 python retrain_model.py \
+CUDA_VISIBLE_DEVICES=0 uv run python "${SRC_DIR}/retrain_model.py" \
     --experiment_path "$exp_path" \
-    --data_path "${dataset}_data" \
+    --data_path "${PROJECT_DIR}/${dataset}_data" \
     --dataset "$dataset" \
     --retrain_folder retrain \
     --config_code F13 \
@@ -32,12 +36,12 @@ CUDA_VISIBLE_DEVICES=0 python retrain_model.py \
 
 # repeat="2"
 # echo "Starting $exp_num F13 repeat $repeat"
-# exp_path="experiment_${dataset}_acc_${exp_num}/${exp}_repeat_${repeat}"
+# exp_path="${PROJECT_DIR}/experiment_${dataset}_acc_${exp_num}/${exp}_repeat_${repeat}"
 
 # # Retrain model
-# CUDA_VISIBLE_DEVICES=0 python retrain_model.py \
+# CUDA_VISIBLE_DEVICES=0 uv run python "${SRC_DIR}/retrain_model.py" \
 #     --experiment_path "$exp_path" \
-#     --data_path "${dataset}_data" \
+#     --data_path "${PROJECT_DIR}/${dataset}_data" \
 #     --dataset "$dataset" \
 #     --retrain_folder retrain \
 #     --config_code F13 \
@@ -54,12 +58,12 @@ CUDA_VISIBLE_DEVICES=0 python retrain_model.py \
 
 # repeat="3"
 # echo "Starting $exp_num F13 repeat $repeat"
-# exp_path="experiment_${dataset}_acc_${exp_num}/${exp}_repeat_${repeat}"
+# exp_path="${PROJECT_DIR}/experiment_${dataset}_acc_${exp_num}/${exp}_repeat_${repeat}"
 
 # # Retrain model
-# CUDA_VISIBLE_DEVICES=0 python retrain_model.py \
+# CUDA_VISIBLE_DEVICES=0 uv run python "${SRC_DIR}/retrain_model.py" \
 #     --experiment_path "$exp_path" \
-#     --data_path "${dataset}_data" \
+#     --data_path "${PROJECT_DIR}/${dataset}_data" \
 #     --dataset "$dataset" \
 #     --retrain_folder retrain \
 #     --config_code F13 \
