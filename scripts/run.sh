@@ -5,15 +5,15 @@ source "${SCRIPT_DIR}/path_config.sh"
 cd "${PROJECT_DIR}"
 
 dataset="cifar10"
-exp_path_base="${PROJECT_DIR}/experiment_${dataset}_acc_20"
-config_dir="${CONFIG_FILES_CIFAR_DIR}"
+exp_path_base="experiment_${dataset}_acc_17"
+config_file="config_files_cifar"
 fitness_metric="best_accuracy"
 data_path="${PROJECT_DIR}/${dataset}_data"
 log_level="INFO"
-network_config="dense"
+network_config="default"
 dataset_sample_size=10000
 
-configs=("config16.yml")
+configs=("config15.txt")
 exps=("exp1")
 cuda_devices=("0,1")
 
