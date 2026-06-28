@@ -1,0 +1,26 @@
+uv run python src/run_evolution.py \
+    --experiment_path /home/fcardoso/workspace/qnas_torch/experiment_cifar10_cell_stack/exp_run-base \
+    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
+    --dataset cifar10 \
+    --config_file configs/config_files_cifar/config0.yml \
+    --log_level INFO
+
+
+
+uv run python src/run_evolution.py \
+    --experiment_path /home/fcardoso/workspace/qnas_torch/experiment_cifar10_cell_stack/exp_run-7 \
+    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
+    --dataset cifar10 \
+    --config_file configs/config_files_cifar/config_cell_stack.yml \
+    --log_level INFO
+
+uv run python src/retrain_model.py \
+    --experiment_path /home/fcardoso/workspace/qnas_torch/experiment_cifar10_cell_stack/exp_run-7 \
+    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
+    --dataset cifar10 \
+    --network_config cell_stack \
+    --config_code run7_best \
+    --log_level INFO \
+    --device cuda:0 \
+    --num_repetitions 1 \
+    --max_epochs 300
