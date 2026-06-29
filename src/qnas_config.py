@@ -157,6 +157,29 @@ class ConfigParameters(object):
         self.QNAS_spec['early_stopping'] = self.args['early_stopping']
         self.QNAS_spec['en_pop_crossover'] = self.args['en_pop_crossover']
 
+        # MixedOp mode parameters (optional, with defaults)
+        self.QNAS_spec['mixedop_mode'] = self.args.get(
+            'mixedop_mode', config_file.get('train', {}).get('mixedop_mode', False)
+        )
+        self.QNAS_spec['alpha_noise_std'] = self.args.get(
+            'alpha_noise_std', config_file.get('train', {}).get('alpha_noise_std', 0.1)
+        )
+
+        # Weight reuse parameters (optional, with defaults)
+        self.train_spec['weight_reuse_enabled'] = self.args.get(
+            'weight_reuse_enabled', config_file.get('train', {}).get('weight_reuse_enabled', False)
+        )
+        self.train_spec['weight_bank_dir'] = self.args.get(
+            'weight_bank_dir', config_file.get('train', {}).get('weight_bank_dir', '')
+        )
+        self.train_spec['cosine_threshold'] = self.args.get(
+            'cosine_threshold', config_file.get('train', {}).get('cosine_threshold', 0.05)
+        )
+        self.train_spec['weight_reuse_finetune_epochs'] = self.args.get(
+            'weight_reuse_finetune_epochs',
+            config_file.get('train', {}).get('weight_reuse_finetune_epochs', 10)
+        )
+
         self._get_fn_spec()
 
         self.train_spec['experiment_path'] = self.args['experiment_path']

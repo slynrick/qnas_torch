@@ -12,13 +12,16 @@ Documentation:
 """
 import os
 import time
+from typing import Dict, List, Optional, Union, Any
+
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, List, Union, Any
-from cnn import model, input, metrics, fitness_utils
-from util import create_info_file, init_log, load_yaml
 from torch.cuda.amp import GradScaler
+
+from cnn import model, input, metrics, fitness_utils
+from cnn.mixed_model import MixedNetworkGraph
+from util import create_info_file, init_log, load_yaml
 
 
 TRAIN_TIMEOUT = 5400
@@ -215,10 +218,13 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     return training_results
 
 
-def fitness_calculation(id_num:str, params:Dict[str, Any], 
-                        fn_dict:Dict[str, Any], net_list:List[str],
-                        train_loader:torch.utils.data.DataLoader, val_loader:torch.utils.data.DataLoader,
-                        return_val,debug:bool=False) -> Dict[str, Union[List[float], float]]:
+def fitness_calculation(id_num: str, params: Dict[str, Any],
+                        fn_dict: Dict[str, Any], net_list: List[str],
+                        train_loader: torch.utils.data.DataLoader,
+                        val_loader: torch.utils.data.DataLoader,
+                        return_val, debug: bool = False,
+                        weight_bank=None,
+                        alpha_vec: Optional[np.ndarray] = None) -> None:
     """Train and evaluate a model using evolved hyperparameters.
 
     This function trains and evaluates a convolutional neural network model using the specified
@@ -248,7 +254,7 @@ def fitness_calculation(id_num:str, params:Dict[str, Any],
     model_path = os.path.join(params['experiment_path'], id_num)
     if not os.path.exists(model_path):
         os.makedirs(model_path)
-    
+
     params['model_path'] = model_path
     params['generation'] = id_num.split('_')[0]
     params['individual'] = id_num.split('_')[1]
@@ -259,31 +265,42 @@ def fitness_calculation(id_num:str, params:Dict[str, Any],
         dataset_info = input.available_datasets[params['dataset'].lower()]
     else:
         dataset_info = load_yaml(os.path.join(params['data_path'], 'data_info.txt'))
-    
+
     params['num_classes'] = dataset_info['num_classes']
     params['task'] = dataset_info['task']
-        
+
     # check if cbam is a key in the fn_dict
     has_cbam_key = any(key.startswith('cbam') for key in fn_dict)
-    
-    # Create the model    
-    model_net = model.NetworkGraph(num_classes=dataset_info['num_classes'], 
-                                   network_config=params['network_config'], 
+
+    # Create the model
+    model_net = model.NetworkGraph(num_classes=dataset_info['num_classes'],
+                                   network_config=params['network_config'],
                                    network_gap=params['network_gap'])
     filtered_dict = {key: item for key, item in fn_dict.items() if key in net_list}
     model_net.create_functions(fn_dict=filtered_dict, net_list=net_list, cbam=has_cbam_key)
-    
+
     # Add the fully connected layer to the model
     input_shape =  [params['batch_size']] + dataset_info['shape']
     inputs = torch.randn(input_shape)
     with torch.no_grad():
         _ = model_net(inputs)
     model_net.to(device)
-    
+
     params['input_shape'] = input_shape
-    
+
+    # Weight reuse: load weights from a close architecture if available
+    if weight_bank is not None and alpha_vec is not None:
+        closest_path = weight_bank.find_close_match(alpha_vec)
+        if closest_path is not None:
+            loaded = weight_bank.load_weights_into_model(model_net, closest_path, device)
+            if loaded:
+                finetune_epochs = params.get('weight_reuse_finetune_epochs', params['max_epochs'])
+                params['max_epochs'] = finetune_epochs
+                params['weight_reuse_applied'] = True
+                LOGGER.info(f"Weight reuse applied for {id_num} from {closest_path}")
+
     criterion = nn.CrossEntropyLoss()
-    
+
     if params['optimizer'] == 'RMSProp':
         optimizer = torch.optim.RMSprop(model_net.parameters())
     elif params['optimizer'] == 'Adam':
@@ -295,21 +312,20 @@ def fitness_calculation(id_num:str, params:Dict[str, Any],
 
     # Training time start counting here.
     params['t0'] = time.time()
-    
+
     # Train the model in fitness scheme
     try:
-        results_dict = train(model_net, criterion, optimizer, train_loader, val_loader,params,debug)
+        results_dict = train(model_net, criterion, optimizer, train_loader, val_loader, params, debug)
         if debug:
             result = results_dict
             return result
         else:
-            #return_val.value = results_dict['best_accuracy']
             if params['fitness_metric'] == 'best_accuracy':
                 return_val[0] = results_dict['best_accuracy']
                 return_val[1] = results_dict['total_trainable_params']
                 return_val[2] = results_dict['cuda_inference_time']
             elif params['fitness_metric'] == 'best_loss':
-                return_val[0] = results_dict['fitness_val_loss'] # 1 - best_validation_loss
+                return_val[0] = results_dict['fitness_val_loss']
                 return_val[1] = results_dict['total_trainable_params']
                 return_val[2] = results_dict['cuda_inference_time']
             elif params['fitness_metric'] == 'scalar_multi_objective':
@@ -318,8 +334,17 @@ def fitness_calculation(id_num:str, params:Dict[str, Any],
                 return_val[2] = results_dict['cuda_inference_time']
             else:
                 raise ValueError(f"Invalid fitness metric: {params['fitness_metric']}")
+
         LOGGER.info(f"Training of model {id_num} finished, best {params['fitness_metric']}: {round(return_val[0], 2)}")
-        
+
+        # Save weights and alpha signature for weight bank registration (main process reads these)
+        best_model_path = os.path.join(model_path, 'best_model.pth')
+        torch.save(model_net.state_dict(), best_model_path)
+        with open(os.path.join(model_path, 'weights_path.txt'), 'w') as _f:
+            _f.write(best_model_path)
+        if alpha_vec is not None:
+            np.save(os.path.join(model_path, 'alpha_signature.npy'), alpha_vec)
+
     except (TimeoutError, MemoryError) as e:
         LOGGER.error(f"Exception: {e}")
         return_val[:] = [0.0, 0.0, 0.0]
@@ -329,5 +354,140 @@ def fitness_calculation(id_num:str, params:Dict[str, Any],
             return_val[:] = [0.0, 0.0, 0.0]
         else:
             LOGGER.error(f"Exception: {e}")
+            return_val[:] = [0.0, 0.0, 0.0]
+        raise e
+
+
+def fitness_calculation_mixedop(
+    id_num: str,
+    params: Dict[str, Any],
+    fn_dict: Dict[str, Any],
+    fn_list: List[str],
+    alpha_matrix: np.ndarray,
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: torch.utils.data.DataLoader,
+    return_val,
+    debug: bool = False,
+    weight_bank=None,
+) -> None:
+    """Train and evaluate a MixedNetworkGraph (DARTS-style) individual.
+
+    Each node runs all candidate operations in parallel, combined via softmax(alpha)
+    weights. Alpha is an nn.Parameter updated by gradient descent alongside the network
+    weights. After training, the trained alpha matrix is saved to disk so the main
+    process can update the quantum alpha_logits.
+
+    Args:
+        id_num: "{generation}_{individual}" identifier string.
+        params: training parameters dict.
+        fn_dict: full operation config dict.
+        fn_list: ordered list of operation names (defines alpha column order).
+        alpha_matrix: np.ndarray of shape [num_nodes, num_ops], initial alpha logits
+                      derived from quantum alpha_logits for this individual.
+        train_loader / val_loader: data loaders.
+        return_val: mp.Array('f', 3) for returning (fitness, params_M, infer_us).
+        weight_bank: optional WeightBank snapshot for weight reuse lookup.
+    """
+    device = params['device']
+    model_path = os.path.join(params['experiment_path'], id_num)
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+
+    params['model_path'] = model_path
+    params['generation'] = id_num.split('_')[0]
+    params['individual'] = id_num.split('_')[1]
+
+    LOGGER.info(f"Training MixedOp model {id_num} on device {device} ...")
+
+    if params['dataset'].lower() in input.available_datasets:
+        dataset_info = input.available_datasets[params['dataset'].lower()]
+    else:
+        dataset_info = load_yaml(os.path.join(params['data_path'], 'data_info.txt'))
+
+    params['num_classes'] = dataset_info['num_classes']
+    params['task'] = dataset_info['task']
+
+    # Build MixedNetworkGraph
+    model_net = MixedNetworkGraph(
+        num_classes=dataset_info['num_classes'],
+        in_channels=dataset_info['shape'][0],
+        network_gap=params.get('network_gap', False),
+    )
+    model_net.create_mixed_ops(fn_dict=fn_dict, fn_list=fn_list, alpha_matrix=alpha_matrix)
+
+    # Warm-up forward pass to initialise fc layer
+    input_shape = [params['batch_size']] + dataset_info['shape']
+    with torch.no_grad():
+        _ = model_net(torch.randn(input_shape))
+    model_net.to(device)
+    params['input_shape'] = input_shape
+
+    # Weight reuse: load closest trained architecture weights
+    alpha_flat = alpha_matrix.flatten()
+    if weight_bank is not None:
+        closest_path = weight_bank.find_close_match(alpha_flat)
+        if closest_path is not None:
+            loaded = weight_bank.load_weights_into_model(model_net, closest_path, device)
+            if loaded:
+                finetune_epochs = params.get('weight_reuse_finetune_epochs', params['max_epochs'])
+                params['max_epochs'] = finetune_epochs
+                params['weight_reuse_applied'] = True
+                LOGGER.info(f"Weight reuse applied for {id_num} from {closest_path}")
+
+    criterion = nn.CrossEntropyLoss()
+
+    # Optimizer covers ALL parameters including alpha (registered as nn.Parameter)
+    if params['optimizer'] == 'RMSProp':
+        optimizer = torch.optim.RMSprop(model_net.parameters())
+    elif params['optimizer'] == 'Adam':
+        optimizer = torch.optim.Adam(model_net.parameters())
+    elif params['optimizer'] == 'AdamW':
+        optimizer = torch.optim.AdamW(model_net.parameters())
+    else:
+        optimizer = torch.optim.SGD(model_net.parameters(), lr=params['learning_rate'])
+
+    params['t0'] = time.time()
+
+    try:
+        results_dict = train(model_net, criterion, optimizer, train_loader, val_loader, params, debug)
+        if debug:
+            return results_dict
+
+        if params['fitness_metric'] == 'best_accuracy':
+            return_val[0] = results_dict['best_accuracy']
+        elif params['fitness_metric'] == 'best_loss':
+            return_val[0] = results_dict['fitness_val_loss']
+        elif params['fitness_metric'] == 'scalar_multi_objective':
+            return_val[0] = results_dict['scalar_multi_objective']
+        else:
+            raise ValueError(f"Invalid fitness metric: {params['fitness_metric']}")
+        return_val[1] = results_dict['total_trainable_params']
+        return_val[2] = results_dict['cuda_inference_time']
+
+        LOGGER.info(f"MixedOp model {id_num} finished, best {params['fitness_metric']}: {round(return_val[0], 2)}")
+
+        # Save trained alpha for quantum update feedback (main process reads this)
+        trained_alpha = model_net.get_trained_alpha()
+        np.save(os.path.join(model_path, 'trained_alpha.npy'), trained_alpha)
+
+        # Save weights and alpha signature for weight bank registration
+        best_model_path = os.path.join(model_path, 'best_model.pth')
+        torch.save(model_net.state_dict(), best_model_path)
+        with open(os.path.join(model_path, 'weights_path.txt'), 'w') as _f:
+            _f.write(best_model_path)
+        # Use trained softmax weights (not logits) as the bank signature
+        alpha_t = torch.tensor(trained_alpha, dtype=torch.float32)
+        trained_probs = torch.softmax(alpha_t, dim=-1).numpy()
+        np.save(os.path.join(model_path, 'alpha_signature.npy'), trained_probs.flatten())
+
+    except (TimeoutError, MemoryError) as e:
+        LOGGER.error(f"Exception: {e}")
+        return_val[:] = [0.0, 0.0, 0.0]
+    except Exception as e:
+        if "out of memory" in str(e):
+            LOGGER.error(f"CUDA out of memory exception for {id_num}: {e}")
+            return_val[:] = [0.0, 0.0, 0.0]
+        else:
+            LOGGER.error(f"Exception for {id_num}: {e}")
             return_val[:] = [0.0, 0.0, 0.0]
         raise e

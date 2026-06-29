@@ -279,3 +279,62 @@ class QPopulationNetwork(QPopulation):
         best_classic = self.current_pop[:self.num_ind]
         self.probabilities[mask] = self._update(self.probabilities[mask], best_classic[mask],
                                                 update_value)
+
+    # ------------------------------------------------------------------
+    # MixedOp mode: PDF (alpha logits) representation
+    # ------------------------------------------------------------------
+
+    def initialize_alpha_logits(self):
+        """Initialize quantum representation as real-valued alpha logits (all zeros →
+        uniform softmax). Shape: [num_ind, num_nodes, num_functions].
+        """
+        self.alpha_logits = np.zeros(
+            (self.num_ind, self.chromosome.num_genes, self.chromosome.num_functions),
+            dtype=np.float64,
+        )
+
+    def generate_classical_mixedop(self, sigma: float = 0.1) -> np.ndarray:
+        """Generate classical individuals as alpha logit matrices (PDF mode).
+
+        Each classical individual = quantum alpha_logits + N(0, sigma) noise.
+
+        Args:
+            sigma: std of Gaussian noise added to alpha_logits for diversification.
+
+        Returns:
+            np.ndarray of shape [num_ind * repetition, num_nodes, num_functions].
+        """
+        # Tile quantum logits for each repetition
+        tiled = np.tile(self.alpha_logits, (self.repetition, 1, 1))
+        noise = np.random.normal(0.0, sigma, size=tiled.shape)
+        return tiled + noise
+
+    def update_quantum_from_alpha(self, trained_alphas: np.ndarray,
+                                   best_indices: np.ndarray,
+                                   intensity: float):
+        """Update alpha_logits using trained alpha values from MixedOp training.
+
+        For each quantum individual i, blends its alpha_logits toward the trained
+        alpha of the best-ranked classical individual associated with it.
+
+        Args:
+            trained_alphas: np.ndarray [total_ind, num_nodes, num_functions].
+            best_indices: ordered indices of classical individuals (best first).
+            intensity: blending weight in [0, 1].
+        """
+        random = np.random.rand(self.num_ind, self.chromosome.num_genes)
+        mask_ind, mask_node = np.where(random <= self.update_quantum_rate)
+
+        for q_idx in range(self.num_ind):
+            # Best classical individual for this quantum individual
+            ind_idx = best_indices[q_idx] if q_idx < len(best_indices) else q_idx
+            if ind_idx >= len(trained_alphas):
+                continue
+            trained_alpha = trained_alphas[ind_idx]  # [num_nodes, num_functions]
+
+            # Select nodes that pass the stochastic gate for this quantum individual
+            nodes_to_update = mask_node[mask_ind == q_idx]
+            for node in nodes_to_update:
+                # EMA: shift alpha_logits toward trained alpha logits
+                diff = trained_alpha[node] - self.alpha_logits[q_idx, node]
+                self.alpha_logits[q_idx, node] += intensity * diff

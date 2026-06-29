@@ -54,12 +54,15 @@ class QNAS(object):
 
         self.qpop_params = None
         self.qpop_net = None
+        self.best_alpha = None  # trained alpha matrix of the best individual so far (mixedop_mode)
 
     def initialize_qnas(self, num_quantum_ind, params_ranges, repetition, max_generations,
                         crossover_rate, update_quantum_gen, replace_method, fn_list,
                         initial_probs, update_quantum_rate, max_num_nodes, reducing_fns_list,
-                        patience,early_stopping, save_data_freq=0, penalize_number=0, crossover_frequency = 5,
-                        en_pop_crossover=False,pop_crossover_rate=0.25, pop_crossover_method='hux'):
+                        patience, early_stopping, save_data_freq=0, penalize_number=0,
+                        crossover_frequency=5, en_pop_crossover=False,
+                        pop_crossover_rate=0.25, pop_crossover_method='hux',
+                        mixedop_mode=False, alpha_noise_std=0.1):
 
         """ Initialize algorithm with several parameter values.
 
@@ -110,6 +113,10 @@ class QNAS(object):
         self.en_pop_crossover = en_pop_crossover
         self.pop_crossover_rate = pop_crossover_rate
         self.crossover_frequency = crossover_frequency
+        self.mixedop_mode = mixedop_mode
+        self.alpha_noise_std = alpha_noise_std
+        self._last_trained_alphas = None  # set after each eval in mixedop mode
+        self.weight_reuse_enabled = False  # set by run_evolution.py via eval_func
 
         if reducing_fns_list:
             self.penalties = np.zeros(shape=(num_quantum_ind * repetition))
@@ -130,8 +137,11 @@ class QNAS(object):
                                             repetition=repetition,
                                             update_quantum_rate=update_quantum_rate,
                                             fn_list=fn_list,
-                                            initial_probs=initial_probs, 
+                                            initial_probs=initial_probs,
                                             crossover_method=pop_crossover_method)
+
+        if self.mixedop_mode:
+            self.qpop_net.initialize_alpha_logits()
                                             
 
     def replace_pop(self, new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses):
@@ -235,6 +245,12 @@ class QNAS(object):
         if new_fitnesses[idx[0]] > self.best_so_far:
             self.best_so_far_id = self.current_best_id
 
+            if self.mixedop_mode and self._last_trained_alphas is not None:
+                best_idx = int(idx[0])
+                if best_idx < len(self._last_trained_alphas) and \
+                        self._last_trained_alphas[best_idx] is not None:
+                    self.best_alpha = np.copy(self._last_trained_alphas[best_idx])
+
     def generate_classical(self):
         """ Generate a specific number of classical individuals from the observation of quantum
             individuals. This number is equal to (*num_ind* x *repetition*). The new classic
@@ -249,19 +265,37 @@ class QNAS(object):
         if self.current_gen > 0:
             new_pop_params = self.qpop_params.classic_crossover(new_pop=new_pop_params,
                                                                 distance=self.random)
-        # Generate classical pop for network structure
-        new_pop_net = self.qpop_net.generate_classical()
-        
-        ###---Cross-over for network structure---###
-        if self.current_gen > 0 and self.en_pop_crossover:
-            if self.current_gen % self.crossover_frequency == 0:
-                num_offspring = int(len(new_pop_net) * self.pop_crossover_rate)
-                best_current_pop = self.qpop_net.current_pop[:num_offspring]
-                new_pop_net[:num_offspring] = self.qpop_net.apply_crossover(best_current_pop, new_pop_net[:num_offspring])
-        
-        self.logger.info("new population created =%s", new_pop_net)
-        # Evaluate population
-        new_fitnesses, raw_fitnesses = self.eval_pop(new_pop_params, new_pop_net)
+
+        if self.mixedop_mode:
+            # MixedOp mode: individuals are alpha logit matrices (PDF representation)
+            alpha_matrices = self.qpop_net.generate_classical_mixedop(sigma=self.alpha_noise_std)
+            self.logger.info("new MixedOp population generated, shape=%s", alpha_matrices.shape)
+
+            # Evaluate: alpha_matrices[i] is passed to fitness_calculation_mixedop
+            new_fitnesses, raw_fitnesses, trained_alphas = self.eval_pop(
+                new_pop_params, alpha_matrices, mixedop_mode=True
+            )
+            self._last_trained_alphas = trained_alphas
+
+            # In mixedop mode, current_pop stores individual indices (0..total_ind-1)
+            total_ind = new_pop_params.shape[0]
+            new_pop_net = np.arange(total_ind, dtype=np.int32).reshape(-1, 1)
+        else:
+            # Discrete mode: classical individuals are operation index arrays
+            new_pop_net = self.qpop_net.generate_classical()
+
+            if self.current_gen > 0 and self.en_pop_crossover:
+                if self.current_gen % self.crossover_frequency == 0:
+                    num_offspring = int(len(new_pop_net) * self.pop_crossover_rate)
+                    best_current_pop = self.qpop_net.current_pop[:num_offspring]
+                    new_pop_net[:num_offspring] = self.qpop_net.apply_crossover(
+                        best_current_pop, new_pop_net[:num_offspring]
+                    )
+
+            self.logger.info("new population created =%s", new_pop_net)
+            new_fitnesses, raw_fitnesses, _ = self.eval_pop(
+                new_pop_params, new_pop_net, mixedop_mode=False
+            )
 
         self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses)
 
@@ -287,32 +321,63 @@ class QNAS(object):
 
         return decoded_params, decoded_nets
 
-    def eval_pop(self, pop_params, pop_net):
+    def eval_pop(self, pop_params, pop_net_or_alpha, mixedop_mode=False):
         """ Decode and evaluate a population of networks and hyperparameters.
 
         Args:
             pop_params: float numpy array with a classic population of hyperparameters.
-            pop_net: int numpy array with a classic population of networks.
+            pop_net_or_alpha: in discrete mode, int ndarray of operation indices;
+                              in mixedop_mode, float ndarray [total_ind, num_nodes, num_ops].
+            mixedop_mode: bool, whether to evaluate as MixedNetworkGraph.
 
         Returns:
-            fitnesses with penalization and without penalization; note that they are equal if
-            no penalization is applied.
+            (penalized_fitnesses, raw_fitnesses, trained_alphas)
+            trained_alphas is a list of np.ndarray or None (mixedop_mode only).
         """
+        if mixedop_mode:
+            # pop_net_or_alpha is [total_ind, num_nodes, num_ops] alpha matrices
+            decoded_params = [
+                self.qpop_params.chromosome.decode(pop_params[i])
+                for i in range(pop_params.shape[0])
+            ]
+            alpha_matrices = [pop_net_or_alpha[i] for i in range(pop_net_or_alpha.shape[0])]
 
-        decoded_params, decoded_nets = self.decode_pop(pop_params, pop_net)
+            self.logger.info('Evaluating MixedOp population ...')
+            fitnesses, trained_alphas = self.eval_func(
+                decoded_params, alpha_matrices,
+                generation=self.current_gen,
+                alpha_matrices=alpha_matrices,
+            )
+            penalized_fitnesses = np.copy(fitnesses)
+        else:
+            decoded_params, decoded_nets = self.decode_pop(pop_params, pop_net_or_alpha)
 
-        self.logger.info('Evaluating new population ...')
-        fitnesses = self.eval_func(decoded_params, decoded_nets, generation=self.current_gen)
-        penalized_fitnesses = np.copy(fitnesses)
+            # For discrete mode with weight reuse: provide quantum prob vectors as alpha
+            alpha_matrices = None
+            if getattr(self, 'weight_reuse_enabled', False):
+                total_ind = pop_params.shape[0]
+                alpha_matrices = []
+                for i in range(total_ind):
+                    q_idx = i % self.qpop_net.num_ind
+                    alpha_matrices.append(self.qpop_net.probabilities[q_idx].flatten())
 
-        if self.penalize_number:
-            penalties = self.get_penalties(pop_net)
-            penalized_fitnesses -= penalties
+            self.logger.info('Evaluating new population ...')
+            fitnesses, _ = self.eval_func(
+                decoded_params, decoded_nets,
+                generation=self.current_gen,
+                alpha_matrices=alpha_matrices,
+            )
+            trained_alphas = None
+            penalized_fitnesses = np.copy(fitnesses)
+
+            if self.penalize_number:
+                penalties = self.get_penalties(pop_net_or_alpha)
+                penalized_fitnesses -= penalties
 
         # Update the total evaluation counter
         self.total_eval = self.total_eval + np.size(pop_params, axis=0)
 
-        return penalized_fitnesses, fitnesses
+        return penalized_fitnesses, fitnesses, trained_alphas
 
     def get_penalties(self, pop_net, penalty_factor=0.01):
         """ Penalize individuals with more than *self.penalize_number* reducing layers. The
@@ -363,18 +428,23 @@ class QNAS(object):
         else:
             data = load_pkl(self.data_file)
 
-        data[self.current_gen] = {'time': str(datetime.datetime.now()),
-                                'total_eval': self.total_eval,
-                                'best_so_far': self.best_so_far,
-                                'best_so_far_id': self.best_so_far_id,
-                                'fitnesses': self.fitnesses,
-                                'raw_fitnesses': self.raw_fitnesses,
-                                'lower': self.qpop_params.lower,
-                                'upper': self.qpop_params.upper,
-                                'params_pop': self.qpop_params.current_pop,
-                                'net_probs': self.qpop_net.probabilities,
-                                'num_net_nodes': self.qpop_net.chromosome.num_genes,
-                                'net_pop': self.qpop_net.current_pop}
+        entry = {'time': str(datetime.datetime.now()),
+                 'total_eval': self.total_eval,
+                 'best_so_far': self.best_so_far,
+                 'best_so_far_id': self.best_so_far_id,
+                 'fitnesses': self.fitnesses,
+                 'raw_fitnesses': self.raw_fitnesses,
+                 'lower': self.qpop_params.lower,
+                 'upper': self.qpop_params.upper,
+                 'params_pop': self.qpop_params.current_pop,
+                 'net_probs': self.qpop_net.probabilities,
+                 'num_net_nodes': self.qpop_net.chromosome.num_genes,
+                 'net_pop': self.qpop_net.current_pop}
+
+        if self.mixedop_mode and hasattr(self.qpop_net, 'alpha_logits'):
+            entry['alpha_logits'] = self.qpop_net.alpha_logits
+
+        data[self.current_gen] = entry
 
         self.dump_pkl_data(data)
 
@@ -418,6 +488,9 @@ class QNAS(object):
 
         self.qpop_params.current_pop = log_data['params_pop']
         self.qpop_net.current_pop = log_data['net_pop']
+
+        if self.mixedop_mode and 'alpha_logits' in log_data:
+            self.qpop_net.alpha_logits = log_data['alpha_logits']
         
     def check_early_stopping(self):
         """
@@ -446,7 +519,22 @@ class QNAS(object):
                         self.update_quantum_gen) == 0 and self.current_gen > 0:
 
             self.qpop_params.update_quantum(intensity=self.random)
-            self.qpop_net.update_quantum(intensity=self.random)
+
+            if self.mixedop_mode and self._last_trained_alphas is not None:
+                # Use trained alpha values to update quantum alpha_logits (PDF mode)
+                valid_alphas = [a for a in self._last_trained_alphas if a is not None]
+                if valid_alphas:
+                    num_ind = self.qpop_net.num_ind
+                    # best_indices: indices of best-ranked individuals (already ordered)
+                    best_indices = np.arange(
+                        min(num_ind, len(valid_alphas)), dtype=np.int32
+                    )
+                    trained_arr = np.stack(valid_alphas, axis=0)
+                    self.qpop_net.update_quantum_from_alpha(
+                        trained_arr, best_indices, intensity=self.random
+                    )
+            else:
+                self.qpop_net.update_quantum(intensity=self.random)
     
     def go_next_gen(self):
         """ Go to the next generation --> update quantum genes, log data, delete unnecessary
@@ -463,6 +551,43 @@ class QNAS(object):
         delete_old_dirs(self.experiment_path, keep_best=True,
                         best_id=f'{self.best_so_far_id[0]}_{self.best_so_far_id[1]}')
         self.current_gen += 1
+
+    def collapse_best_network(self):
+        """ Collapse the best alpha found during the evolution (mixedop_mode) into a discrete
+            network: for each node, keep only the single operation with the highest alpha
+            weight. Saves the result to *self.experiment_path*.
+
+        Returns:
+            list of function names representing the collapsed (discrete) network, or None if
+            not running in mixedop_mode / no alpha is available.
+        """
+
+        if not self.mixedop_mode:
+            return None
+
+        alpha = self.best_alpha
+        if alpha is None:
+            self.logger.info("No best_alpha tracked; falling back to quantum alpha_logits "
+                            "centroid for collapsing the network.")
+            alpha = self.qpop_net.alpha_logits[0]
+
+        op_indices = np.argmax(alpha, axis=-1).astype(np.int32)
+        net_list = self.qpop_net.chromosome.decode(op_indices)
+
+        self.logger.info(f"Collapsed best network (one operation per node): {net_list}")
+
+        result = {
+            'best_so_far_id': self.best_so_far_id,
+            'best_so_far': self.best_so_far,
+            'op_indices': op_indices.tolist(),
+            'net_list': net_list,
+        }
+
+        out_path = os.path.join(self.experiment_path, 'best_network_collapsed.pkl')
+        with open(out_path, 'wb') as f:
+            dump(result, f, protocol=HIGHEST_PROTOCOL)
+
+        return net_list
 
     def evolve(self):
         """ Run the evolution. """
@@ -493,3 +618,6 @@ class QNAS(object):
         end_evolution = time.time()
         evolution_hours, evolution_minutes = calculate_time(start_evolution,end_evolution)
         self.logger.info(f"Total evolution time: {evolution_hours} hours and {evolution_minutes} minutes")
+
+        if self.mixedop_mode:
+            self.collapse_best_network()
