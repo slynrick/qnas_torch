@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Union, Any
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 from cnn import model, input, metrics, fitness_utils
 from cnn.mixed_model import MixedNetworkGraph
@@ -130,7 +130,8 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     start_eval = max_epochs - epochs_to_eval
     
     # Automatic mixed precision training (AMP)
-    scaler = GradScaler(enabled=params['mixed_precision']) 
+    amp_device = torch.device(params['device']).type
+    scaler = GradScaler(amp_device, enabled=params['mixed_precision'])
 
     for epoch in range(1, max_epochs + 1):
         train_loss, train_accuracy = train_epoch(model, criterion, optimizer, train_loader, params,scaler)

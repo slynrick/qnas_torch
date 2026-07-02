@@ -2,11 +2,11 @@
 
 QNAS:
     crossover_rate: 0.5
-    max_generations: 300
+    max_generations: 100
     max_num_nodes: 20
     num_quantum_ind: 5
     penalize_number: 3
-    repetition: 4
+    repetition: 1
     replace_method: best
     update_quantum_gen: 5
     update_quantum_rate: 0.1
@@ -48,7 +48,7 @@ train:
     fitness_metric: best_loss
     mo_metric_base: loss
     mixed_precision: True
-    available_gpus: [0, 1] # gpu0, gpu1, gpu2 [0, 1, 2]
+    available_gpus: [0] # gpu0, gpu1, gpu2 [0, 1, 2]
     device: cuda:0
 
     # Dataset
@@ -57,12 +57,12 @@ train:
     subtract_mean: True
     limit_data: True
     limit_data_value: 10000
-    num_workers: 4
+    num_workers: 2
 
     # Tensorflow
     save_checkpoints_epochs: 5
     save_summary_epochs: 0.25
-    threads: 20
+    threads: 2
 
     # penalization parameters - scalarized fitness
     max_params: 114090 # 1.9M
