@@ -233,7 +233,10 @@ class GenericDataLoader:
     else:
       raise NotImplementedError('Custom dataset is not implemented yet.')
     
-    drop_last = True if self.params['dataset'].lower() == 'organamnist' else False
+    # Drop the trailing partial batch so every training step has the same shape -
+    # keeps cudnn.benchmark's autotune cache hot instead of re-benchmarking on a
+    # smaller last batch.
+    drop_last = True
         
     if not for_train:
       test_loader = DataLoader(
@@ -242,7 +245,8 @@ class GenericDataLoader:
         num_workers=self.params['num_workers'],
         shuffle=False,
         pin_memory=True,
-        pin_memory_device=pin_memory_device)
+        pin_memory_device=pin_memory_device,
+        persistent_workers=self.params['num_workers'] > 0)
       return test_loader
     
     if hasattr(torchvision.datasets, self.params['dataset'].upper()):
@@ -324,16 +328,18 @@ class GenericDataLoader:
       num_workers=self.params['num_workers'],
       shuffle=True,
       drop_last=drop_last,
-      pin_memory=True, 
-      pin_memory_device=pin_memory_device)
+      pin_memory=True,
+      pin_memory_device=pin_memory_device,
+      persistent_workers=self.params['num_workers'] > 0)
 
     val_loader = DataLoader(
       valid_dataset,
       batch_size=self.params['eval_batch_size'],
       num_workers=self.params['num_workers'],
       shuffle=False,
-      pin_memory=True, 
-      pin_memory_device=pin_memory_device)
+      pin_memory=True,
+      pin_memory_device=pin_memory_device,
+      persistent_workers=self.params['num_workers'] > 0)
   
     self.info_dict['train_records'] = len(train_dataset)
     self.info_dict['valid_records'] = len(valid_dataset)

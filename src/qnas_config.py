@@ -157,17 +157,27 @@ class ConfigParameters(object):
         self.QNAS_spec['early_stopping'] = self.args['early_stopping']
         self.QNAS_spec['en_pop_crossover'] = self.args['en_pop_crossover']
 
-        # MixedOp mode parameters (optional, with defaults)
-        self.QNAS_spec['mixedop_mode'] = self.args.get(
-            'mixedop_mode', config_file.get('train', {}).get('mixedop_mode', False)
+        # MixedOp mode parameters (optional, with defaults).
+        # store_true CLI flags always populate self.args, so `.get(key, fallback)`
+        # never falls through to the config file value - OR them together instead.
+        self.QNAS_spec['mixedop_mode'] = (
+            self.args.get('mixedop_mode', False)
+            or config_file.get('QNAS', {}).get('mixedop_mode', False)
         )
         self.QNAS_spec['alpha_noise_std'] = self.args.get(
-            'alpha_noise_std', config_file.get('train', {}).get('alpha_noise_std', 0.1)
+            'alpha_noise_std', config_file.get('QNAS', {}).get('alpha_noise_std', 0.1)
+        )
+        # Cap on MixedOp's canonical channel width (see MixedOp docstring in
+        # cnn/mixed_model.py). No CLI flag - config-file only, so there's no
+        # args.get/argparse-default collision to worry about.
+        self.train_spec['mixedop_max_channels'] = config_file.get('train', {}).get(
+            'mixedop_max_channels', None
         )
 
         # Weight reuse parameters (optional, with defaults)
-        self.train_spec['weight_reuse_enabled'] = self.args.get(
-            'weight_reuse_enabled', config_file.get('train', {}).get('weight_reuse_enabled', False)
+        self.train_spec['weight_reuse_enabled'] = (
+            self.args.get('weight_reuse_enabled', False)
+            or config_file.get('train', {}).get('weight_reuse_enabled', False)
         )
         self.train_spec['weight_bank_dir'] = self.args.get(
             'weight_bank_dir', config_file.get('train', {}).get('weight_bank_dir', '')

@@ -38,16 +38,18 @@ LOGGER = init_log("INFO", name=__name__, file_path=log_file)
 
 def train_epoch(model, criterion, optimizer, data_loader, params, scaler):
     model.train()
-    train_loss = 0.0
-    correct = 0
     total = 0
     device = torch.device(params['device'])
     amp_device = device.type  # 'cuda' or 'cpu'
-    
+    # Accumulate on-device and only sync to host once, after the loop - a per-batch
+    # .item() call forces a CUDA sync and stalls the async training pipeline.
+    train_loss_t = torch.zeros((), device=device)
+    correct_t = torch.zeros((), device=device)
+
     for inputs, labels in data_loader:
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
-        
+
         with torch.autocast(device_type=amp_device, dtype=torch.float16, enabled=params['mixed_precision']):
             y_logits = model(inputs)
             if params['task'] == 'multi-class':
@@ -56,22 +58,22 @@ def train_epoch(model, criterion, optimizer, data_loader, params, scaler):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        train_loss += loss.item()
+        train_loss_t += loss.detach()
         _, predicted = y_logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        
-    accuracy = 100 * correct / total
-    train_loss /= len(data_loader)
+        correct_t += predicted.eq(labels).sum()
+
+    accuracy = 100 * correct_t.item() / total
+    train_loss = train_loss_t.item() / len(data_loader)
     return train_loss, accuracy
 
 def evaluate(model, criterion, data_loader, params):
     model.eval()
-    validation_loss = 0.0
-    correct = 0
     total = 0
     device = torch.device(params['device'])
     amp_device = device.type  # 'cuda' or 'cpu'
+    validation_loss_t = torch.zeros((), device=device)
+    correct_t = torch.zeros((), device=device)
 
     with torch.no_grad():
         for inputs, labels in data_loader:
@@ -81,13 +83,13 @@ def evaluate(model, criterion, data_loader, params):
                 if params['task'] == 'multi-class':
                     labels = labels.squeeze().long() # medmnist
                 loss = criterion(y_logits, labels)
-            validation_loss += loss.item()
+            validation_loss_t += loss.detach()
             _, predicted = y_logits.max(1)
             total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            correct_t += predicted.eq(labels).sum()
 
-    accuracy = 100 * correct / total
-    validation_loss /= len(data_loader)
+    accuracy = 100 * correct_t.item() / total
+    validation_loss = validation_loss_t.item() / len(data_loader)
 
     return validation_loss, accuracy
 
@@ -250,6 +252,9 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
         TimeoutError: If the training process takes too long to complete.
     """
 
+    # Fixed input/batch shape per run - let cudnn autotune the fastest conv algorithms.
+    torch.backends.cudnn.benchmark = True
+
     device = params['device']
     params['net_list'] = net_list
     model_path = os.path.join(params['experiment_path'], id_num)
@@ -389,6 +394,9 @@ def fitness_calculation_mixedop(
         return_val: mp.Array('f', 3) for returning (fitness, params_M, infer_us).
         weight_bank: optional WeightBank snapshot for weight reuse lookup.
     """
+    # Fixed input/batch shape per run - let cudnn autotune the fastest conv algorithms.
+    torch.backends.cudnn.benchmark = True
+
     device = params['device']
     model_path = os.path.join(params['experiment_path'], id_num)
     if not os.path.exists(model_path):
@@ -414,7 +422,8 @@ def fitness_calculation_mixedop(
         in_channels=dataset_info['shape'][0],
         network_gap=params.get('network_gap', False),
     )
-    model_net.create_mixed_ops(fn_dict=fn_dict, fn_list=fn_list, alpha_matrix=alpha_matrix)
+    model_net.create_mixed_ops(fn_dict=fn_dict, fn_list=fn_list, alpha_matrix=alpha_matrix,
+                                max_channels=params.get('mixedop_max_channels'))
 
     # Warm-up forward pass to initialise fc layer
     input_shape = [params['batch_size']] + dataset_info['shape']

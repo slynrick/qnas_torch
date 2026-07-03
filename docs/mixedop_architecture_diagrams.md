@@ -47,6 +47,53 @@ Every node fans out to **all candidate ops simultaneously** (edges weighted by
 `softmax(alpha)`), aligned in channels/spatial size, then summed — this is `MixedOp` in
 [`src/cnn/mixed_model.py`](../src/cnn/mixed_model.py).
 
+### Memory optimization: capped canonical channel width (PC-DARTS-style)
+
+By default, `canonical_out_channels` at each node is `max()` over every candidate op's
+output width. With a `fn_list` that includes a wide conv (e.g. `conv_3_1_256`), **every**
+op — including cheap ones like `no_op` and `max_pool_2_2` — gets projected up to 256
+channels before the weighted sum, and that width then becomes the next node's
+`in_channels`, compounding across all `max_num_nodes` layers.
+
+```mermaid
+graph LR
+    subgraph "Uncapped (canonical = max = 256)"
+    direction LR
+    A1[no_op] -->|"1x1 proj → 256ch"| S1(("Σ"))
+    A2[conv_1_1_32] -->|"1x1 proj → 256ch"| S1
+    A3[conv_3_1_256] -->|"identity"| S1
+    S1 --> N1["node i+1<br/>in_channels=256"]
+    end
+    subgraph "Capped (mixedop_max_channels=64)"
+    direction LR
+    B1[no_op] -->|"1x1 proj → 64ch"| S2(("Σ"))
+    B2[conv_1_1_32] -->|"1x1 proj → 64ch"| S2
+    B3[conv_3_1_256] -->|"1x1 proj → 64ch"| S2
+    S2 --> N2["node i+1<br/>in_channels=64"]
+    end
+```
+
+Setting `mixedop_max_channels` in the config's `train:` section (see
+`config_mixedop.yml`) caps `canonical_out_channels` at that value instead of following
+the widest op. This is the same idea PC-DARTS uses to bound search-time memory: every
+op's output — even the naturally-wide one — gets projected down to the cap, so channel
+width no longer grows unboundedly with the widest entry in `fn_list`. Because the capped
+width also becomes the next node's `in_channels`, the saving compounds with depth
+(conv FLOPs/activation memory scale with `in_channels × out_channels`), which is why a
+modest cap (e.g. 64 vs. 256) cuts total parameters by ~75% in practice.
+
+Trade-off: the wide op's own internal computation is unaffected (it still runs at its
+configured filter count, e.g. 256, before being projected down), so it doesn't reduce
+that op's own peak activation — only what propagates onward. It does mean a wide op's
+full representation is squeezed through the same bottleneck as every other candidate,
+which can bias the learned alpha logits against wide/expensive ops during search. This
+only affects the search-time proxy: `collapse_best_network()` only keeps the winning
+*operation names*, and the retrain phase rebuilds the discrete network via
+`NetworkGraph.create_functions()` at each op's full native width — uncapped.
+Implementation: `MixedOp`/`MixedNetworkGraph.create_mixed_ops()` in
+[`src/cnn/mixed_model.py`](../src/cnn/mixed_model.py); read from the config in
+[`src/qnas_config.py`](../src/qnas_config.py) (config-file only, no CLI flag).
+
 ### End of evolution: collapse back to a discrete chain
 
 ```mermaid

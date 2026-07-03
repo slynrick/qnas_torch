@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+import torch.utils.checkpoint as checkpoint
 from typing import Dict, List, Any
 
 from cnn.model import (
@@ -64,21 +65,30 @@ class MixedOp(nn.Module):
         fn_list: ordered list of op names (defines alpha index order).
         in_channels: number of input channels flowing into this node.
         alpha_init: np.array of shape [num_ops], initial alpha logit values.
+        max_channels: optional cap on canonical_out_channels. Every op's output
+            gets projected to this width regardless of direction (up or down),
+            so capping it bounds the activation memory of every node instead of
+            following the single largest conv in fn_list (e.g. a 256-filter
+            conv would otherwise force all 11 ops, including no_op/pooling, to
+            materialize 256-channel tensors at every node).
     """
 
     def __init__(self, fn_dict: Dict, fn_list: List[str],
-                 in_channels: int, alpha_init: np.ndarray):
+                 in_channels: int, alpha_init: np.ndarray,
+                 max_channels: int = None):
         super().__init__()
 
         self.fn_list = fn_list
         self.num_ops = len(fn_list)
 
-        # Determine canonical output channels (max across all ops)
+        # Determine canonical output channels (max across all ops, optionally capped)
         out_channels_per_op = [
             _get_op_out_channels(name, fn_dict[name], in_channels)
             for name in fn_list
         ]
         self.canonical_out_channels = max(out_channels_per_op)
+        if max_channels is not None:
+            self.canonical_out_channels = min(self.canonical_out_channels, max_channels)
 
         # Build ops and channel projectors
         ops = []
@@ -146,13 +156,15 @@ class MixedNetworkGraph(nn.Module):
         self.fc: nn.Module = None
 
     def create_mixed_ops(self, fn_dict: Dict[str, Any], fn_list: List[str],
-                         alpha_matrix: np.ndarray):
+                         alpha_matrix: np.ndarray, max_channels: int = None):
         """Build MixedOp at each node position.
 
         Args:
             fn_dict: full operation config dict (may include ops not in fn_list).
             fn_list: ordered list of op names matching alpha_matrix columns.
             alpha_matrix: np.array of shape [num_nodes, num_ops], initial alpha logits.
+            max_channels: optional cap on each node's canonical_out_channels
+                (see MixedOp docstring) to bound activation memory.
         """
         num_nodes = alpha_matrix.shape[0]
         # Filter fn_dict to fn_list entries only
@@ -167,6 +179,7 @@ class MixedNetworkGraph(nn.Module):
                 fn_list=fn_list,
                 in_channels=cur_channels,
                 alpha_init=alpha_init,
+                max_channels=max_channels,
             )
             ops.append(mixed_op)
             cur_channels = mixed_op.canonical_out_channels
@@ -194,7 +207,14 @@ class MixedNetworkGraph(nn.Module):
 
     def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         for mixed_op in self.mixed_ops:
-            x = mixed_op(x)
+            if self.training:
+                # Recompute each node's forward during backward instead of
+                # keeping all num_ops activations resident - MixedOp memory
+                # scales with num_nodes * num_ops, so this materially cuts
+                # peak memory at the cost of extra compute.
+                x = checkpoint.checkpoint(mixed_op, x, use_reentrant=False)
+            else:
+                x = mixed_op(x)
             if debug:
                 print(f"MixedOp output shape: {x.shape}")
 

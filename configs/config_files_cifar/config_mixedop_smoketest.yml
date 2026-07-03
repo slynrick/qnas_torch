@@ -1,10 +1,12 @@
-# Configuration file: MixedOperation (DARTS-style PDF) mode + alpha-based weight reuse
+# Smoke-test config: tiny MixedOperation + weight-reuse run to verify
+# the qnas_config.py mixedop_mode/weight_reuse_enabled fix actually
+# activates both features from the config file alone (no CLI flags).
 
 QNAS:
     crossover_rate: 0.5
-    max_generations: 100
-    max_num_nodes: 20
-    num_quantum_ind: 3
+    max_generations: 2
+    max_num_nodes: 6
+    num_quantum_ind: 2
     penalize_number: 3
     repetition: 1
     replace_method: best
@@ -12,12 +14,10 @@ QNAS:
     update_quantum_rate: 0.1
     save_data_freq: 1
     crossover_frequency: 5
-    pop_crossover_rate: 0.4 # offspring replacement proportion in the population
-    pop_crossover_method: hux # hux, uniform
+    pop_crossover_rate: 0.4
+    pop_crossover_method: hux
     patience: 60
 
-    # MixedOperation mode: quantum representation is a PDF over alpha logits
-    # instead of a PMF used for discrete sampling.
     mixedop_mode: True
     alpha_noise_std: 0.1
 
@@ -40,35 +40,31 @@ QNAS:
                      'no_op':        {'function': 'NoOp', 'params': {}, 'prob': 1.0/3.0}}
 
 train:
-    batch_size: 256
-    eval_batch_size: 256
-    max_epochs: 50
-    epochs_to_eval: 5
+    batch_size: 32
+    eval_batch_size: 32
+    max_epochs: 2
+    epochs_to_eval: 1
     optimizer: AdamW
     fitness_metric: best_loss
     mo_metric_base: loss
     mixed_precision: True
-    available_gpus: [0] # gpu0, gpu1, gpu2 [0, 1, 2]
+    available_gpus: [0]
     device: cuda:0
 
-    # Dataset
     dataset: Cifar10
     data_augmentation: False
     subtract_mean: True
     limit_data: True
-    limit_data_value: 10000
-    num_workers: 4
+    limit_data_value: 512
+    num_workers: 2
 
-    # Tensorflow
     save_checkpoints_epochs: 5
     save_summary_epochs: 0.25
-    threads: 2
+    threads: 1
 
-    # penalization parameters - scalarized fitness
-    max_params: 114090 # 1.9M
-    max_inference_time: 1000 # us
+    max_params: 114090
+    max_inference_time: 1000
 
-    # Network structure Configuration
     network_config: default
     network_gap: False
 
@@ -76,10 +72,7 @@ train:
     # the largest conv in function_dict (conv_3_1_256) - see mixed_model.py.
     mixedop_max_channels: 64
 
-    # Weight reuse: closest already-trained architecture is found by comparing
-    # alpha weight vectors (cosine distance) and its weights are loaded for
-    # fine-tuning instead of training from scratch.
     weight_reuse_enabled: True
     weight_bank_dir: ""
     cosine_threshold: 0.05
-    weight_reuse_finetune_epochs: 10
+    weight_reuse_finetune_epochs: 1
