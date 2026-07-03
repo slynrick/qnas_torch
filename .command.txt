@@ -1,47 +1,15 @@
-uv run python src/run_evolution.py \
-    --experiment_path /home/fcardoso/workspace/qnas_torch/experiment_cifar10_cell_stack/exp_run-base \
-    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
-    --dataset cifar10 \
-    --config_file configs/config_files_cifar/config0.yml \
-    --log_level INFO
+# Equivalent to the two commands above (evolve + retrain) plus generate_infographic.py,
+# run back-to-back in one shot: evolve -> retrain -> infographic.
+# -e experiment_path   -c evolve config_file   -d dataset   -n network_config
+# -m fitness_metric (evolve)   -g config_code (retrain)   -R num_repetitions (retrain)
+# -E max_epochs (retrain)
+scripts/run_pipeline.sh \
+    -e experiment_cifar10_mixedop/exp1 \
+    -c configs/config_files_cifar/config_mixedop.yml \
+    -d cifar10 \
+    -n default \
+    -m best_accuracy \
+    -g run1_best \
+    -R 5 \
+    -E 300
 
-
-
-uv run python src/run_evolution.py \
-    --experiment_path /home/fcardoso/workspace/qnas_torch/experiment_cifar10_cell_stack/exp_run-7 \
-    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
-    --dataset cifar10 \
-    --config_file configs/config_files_cifar/config_cell_stack.yml \
-    --log_level INFO
-
-uv run python src/retrain_model.py \
-    --experiment_path /home/fcardoso/workspace/qnas_torch/experiment_cifar10_cell_stack/exp_run-7 \
-    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
-    --dataset cifar10 \
-    --network_config cell_stack \
-    --config_code run7_best \
-    --log_level INFO \
-    --device cuda:0 \
-    --num_repetitions 1 \
-    --max_epochs 300
-
-
-uv run python src/run_evolution.py \
-    --experiment_path experiment_cifar10_mixedop/exp1 \
-    --config_file configs/config_files_cifar/config_mixedop.yml \
-    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
-    --dataset cifar10 \
-    --fitness_metric best_accuracy \
-    --network_config default \
-    --log_level INFO
-
-uv run python src/retrain_model.py \
-    --experiment_path experiment_cifar10_mixedop/exp1 \
-    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
-    --dataset cifar10 \
-    --network_config default \
-    --config_code run1_best \
-    --log_level INFO \
-    --device cuda:0 \
-    --num_repetitions 5 \
-    --max_epochs 300
