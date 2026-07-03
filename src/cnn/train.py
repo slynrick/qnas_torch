@@ -10,7 +10,9 @@ Documentation:
         - https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html#all-together-automatic-mixed-precision
     
 """
+import logging
 import os
+import shutil
 import time
 from typing import Dict, List, Optional, Union, Any
 
@@ -20,19 +22,38 @@ import torch.nn as nn
 from torch.amp import GradScaler
 
 from cnn import model, input, metrics, fitness_utils
-from cnn.mixed_model import MixedNetworkGraph
+from cnn.mixed_model import MixedNetworkGraph, transfer_weights
 from util import create_info_file, init_log, load_yaml
 
 
 TRAIN_TIMEOUT = 5400
 
-current_directory = os.path.dirname(os.path.dirname(__file__))
-log_directory = os.path.join(current_directory, 'logs')
-if not os.path.exists(log_directory):
-    os.makedirs(log_directory)
+# Console output always on (also how individual training progress reaches the
+# terminal live - see the per-epoch print() in train()). The file handler is
+# attached lazily per experiment_path (see _attach_experiment_log_file), since
+# the experiment path is only known at call time, not at import time.
+LOGGER = init_log("INFO", name=__name__)
+_log_file_experiment_path = None
 
-log_file = os.path.join(log_directory, 'train.log')
-LOGGER = init_log("INFO", name=__name__, file_path=log_file)
+
+def _attach_experiment_log_file(experiment_path: str):
+    """Write training logs into <experiment_path>/train.log instead of a fixed
+    repo-wide location, so each experiment's logs live alongside its other
+    artifacts. A no-op if already attached for this experiment_path (workers
+    train many individuals in the same process across a run).
+    """
+    global _log_file_experiment_path
+    if _log_file_experiment_path == experiment_path:
+        return
+
+    log_path = os.path.join(experiment_path, 'train.log')
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter(
+        '%(levelname)s: %(module)s: %(asctime)s.%(msecs)03d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    LOGGER.addHandler(handler)
+    _log_file_experiment_path = experiment_path
 
 
 
@@ -130,10 +151,22 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     max_epochs = params['max_epochs']
     epochs_to_eval = params['epochs_to_eval']
     start_eval = max_epochs - epochs_to_eval
-    
+
+    # Per-individual early stopping: stop THIS model's training once its validation
+    # loss stops improving, instead of always running the full max_epochs. Distinct
+    # from QNAS-level early_stopping (src/qnas.py), which stops the whole generational
+    # search - this stops one individual's training loop.
+    individual_es_enabled = params.get('early_stopping_enabled', False)
+    individual_es_patience = params.get('early_stopping_patience', 5)
+    individual_es_min_delta = params.get('early_stopping_min_delta', 0.0)
+    individual_es_counter = 0
+    stopped_early_at = None
+
     # Automatic mixed precision training (AMP)
     amp_device = torch.device(params['device']).type
     scaler = GradScaler(amp_device, enabled=params['mixed_precision'])
+
+    id_num = f"{params.get('generation', '?')}_{params.get('individual', '?')}"
 
     for epoch in range(1, max_epochs + 1):
         train_loss, train_accuracy = train_epoch(model, criterion, optimizer, train_loader, params,scaler)
@@ -143,8 +176,13 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
         if epoch < start_eval and (time.time() - params['t0']) > TRAIN_TIMEOUT:
             print("Timeout reached")
             raise TimeoutError()
-        
-        if epoch > start_eval:
+
+        progress = (f"[{id_num}] epoch {epoch}/{max_epochs} - "
+                   f"train_loss={train_loss:.4f} train_acc={train_accuracy:.2f}%")
+
+        # With early stopping enabled, validate every epoch (needed to actually detect
+        # a plateau) instead of only the last epochs_to_eval epochs.
+        if epoch > start_eval or individual_es_enabled:
             validation_loss, accuracy = evaluate(model, criterion, val_loader, params)
             validation_losses.append(validation_loss)
             validation_accuracies.append(accuracy)
@@ -152,9 +190,26 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 create_info_file(params['model_path'], {'best_accuracy': best_accuracy}, 'best_accuracy.txt')
-            if validation_loss < best_validation_loss:
+            if validation_loss < best_validation_loss - individual_es_min_delta:
                 best_validation_loss = validation_loss
                 create_info_file(params['model_path'], {'best_validation_loss': best_validation_loss}, 'best_validation_loss.txt')
+                individual_es_counter = 0
+            else:
+                individual_es_counter += 1
+
+            progress += f" - val_loss={validation_loss:.4f} val_acc={accuracy:.2f}%"
+
+        # Plain print (not LOGGER, which is file-only) so this shows up live in the
+        # terminal - individual training can take minutes/epoch with nothing else
+        # printed in between otherwise.
+        print(progress, flush=True)
+
+        if individual_es_enabled and individual_es_counter >= individual_es_patience:
+            stopped_early_at = epoch
+            LOGGER.info(f"Early stopping {id_num} at epoch {epoch}/{max_epochs} "
+                        f"(no val_loss improvement for {individual_es_patience} epochs)")
+            print(f"[{id_num}] early stopped at epoch {epoch}/{max_epochs}", flush=True)
+            break
     if debug:
         if epoch >= start_eval:
             print(f"Epoch [{epoch}/{max_epochs}] - Training Loss: {train_loss:.4f} - Validation Loss: {validation_loss:.4f} - Validation Accuracy: {accuracy:.2f}%")
@@ -200,8 +255,11 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     params['best_validation_loss'] = best_validation_loss
     params['fitness_val_loss'] = fitness_val_loss
     params['scalar_multi_objective'] = scalar_multi_objective
+    params['stopped_early'] = stopped_early_at is not None
+    if stopped_early_at is not None:
+        params['stopped_early_at_epoch'] = stopped_early_at
 
-    
+
     LOGGER.info(f"Cuda Inference time: {cuda_inference_time} microseconds")
     LOGGER.info(f"Total trainable parameters: {round(total_trainable_params / 1e6,2)}M")
     
@@ -255,6 +313,8 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     # Fixed input/batch shape per run - let cudnn autotune the fastest conv algorithms.
     torch.backends.cudnn.benchmark = True
 
+    _attach_experiment_log_file(params['experiment_path'])
+
     device = params['device']
     params['net_list'] = net_list
     model_path = os.path.join(params['experiment_path'], id_num)
@@ -275,6 +335,28 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     params['num_classes'] = dataset_info['num_classes']
     params['task'] = dataset_info['task']
 
+    # Fitness cache: check BEFORE building any model, so a hit skips model
+    # construction and the warm-up forward pass too, not just training.
+    if weight_bank is not None and alpha_vec is not None:
+        cache_hit = weight_bank.find_cached_result(alpha_vec)
+        if cache_hit is not None:
+            return_val[0] = cache_hit['fitness']
+            return_val[1] = cache_hit['params_m']
+            return_val[2] = cache_hit['inference_us']
+            params['weight_reuse_applied'] = True
+            params['cache_hit'] = True
+            params['training_time'] = 0.0
+            params['total_trainable_params'] = cache_hit['params_m'] * 1e6
+            params['cuda_inference_time'] = cache_hit['inference_us']
+            LOGGER.info(f"Cache hit for {id_num}: reusing fitness {cache_hit['fitness']:.3f} "
+                        f"from {cache_hit['weights_path']}")
+            try:
+                shutil.copy(cache_hit['weights_path'], os.path.join(model_path, 'best_model.pth'))
+            except OSError:
+                pass
+            create_info_file(model_path, params, 'training_params.txt')
+            return
+
     # check if cbam is a key in the fn_dict
     has_cbam_key = any(key.startswith('cbam') for key in fn_dict)
 
@@ -293,17 +375,6 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     model_net.to(device)
 
     params['input_shape'] = input_shape
-
-    # Weight reuse: load weights from a close architecture if available
-    if weight_bank is not None and alpha_vec is not None:
-        closest_path = weight_bank.find_close_match(alpha_vec)
-        if closest_path is not None:
-            loaded = weight_bank.load_weights_into_model(model_net, closest_path, device)
-            if loaded:
-                finetune_epochs = params.get('weight_reuse_finetune_epochs', params['max_epochs'])
-                params['max_epochs'] = finetune_epochs
-                params['weight_reuse_applied'] = True
-                LOGGER.info(f"Weight reuse applied for {id_num} from {closest_path}")
 
     criterion = nn.CrossEntropyLoss()
 
@@ -375,6 +446,7 @@ def fitness_calculation_mixedop(
     return_val,
     debug: bool = False,
     weight_bank=None,
+    warm_start_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Train and evaluate a MixedNetworkGraph (DARTS-style) individual.
 
@@ -393,9 +465,15 @@ def fitness_calculation_mixedop(
         train_loader / val_loader: data loaders.
         return_val: mp.Array('f', 3) for returning (fitness, params_M, infer_us).
         weight_bank: optional WeightBank snapshot for weight reuse lookup.
+        warm_start_info: optional dict {'state_dict_path', 'old_fn_list', 'old_num_nodes'}
+            set only for the first generation of a new progressive-growth stage - warm-
+            starts this individual from the previous stage's best model instead of the
+            normal (stage-scoped, and at this point still-empty) weight bank lookup.
     """
     # Fixed input/batch shape per run - let cudnn autotune the fastest conv algorithms.
     torch.backends.cudnn.benchmark = True
+
+    _attach_experiment_log_file(params['experiment_path'])
 
     device = params['device']
     model_path = os.path.join(params['experiment_path'], id_num)
@@ -416,6 +494,30 @@ def fitness_calculation_mixedop(
     params['num_classes'] = dataset_info['num_classes']
     params['task'] = dataset_info['task']
 
+    # Fitness cache: check BEFORE building any model, so a hit skips model
+    # construction and the warm-up forward pass too, not just training. Progressive
+    # warm-start (below) always applies on its transition generation regardless of
+    # cache state, so the cache is only consulted when there's no warm-start in play.
+    if warm_start_info is None and weight_bank is not None:
+        cache_hit = weight_bank.find_cached_result(alpha_matrix.flatten())
+        if cache_hit is not None:
+            return_val[0] = cache_hit['fitness']
+            return_val[1] = cache_hit['params_m']
+            return_val[2] = cache_hit['inference_us']
+            params['weight_reuse_applied'] = True
+            params['cache_hit'] = True
+            params['training_time'] = 0.0
+            params['total_trainable_params'] = cache_hit['params_m'] * 1e6
+            params['cuda_inference_time'] = cache_hit['inference_us']
+            LOGGER.info(f"Cache hit for {id_num}: reusing fitness {cache_hit['fitness']:.3f} "
+                        f"from {cache_hit['weights_path']}")
+            try:
+                shutil.copy(cache_hit['weights_path'], os.path.join(model_path, 'best_model.pth'))
+            except OSError:
+                pass
+            create_info_file(model_path, params, 'training_params.txt')
+            return
+
     # Build MixedNetworkGraph
     model_net = MixedNetworkGraph(
         num_classes=dataset_info['num_classes'],
@@ -432,17 +534,21 @@ def fitness_calculation_mixedop(
     model_net.to(device)
     params['input_shape'] = input_shape
 
-    # Weight reuse: load closest trained architecture weights
-    alpha_flat = alpha_matrix.flatten()
-    if weight_bank is not None:
-        closest_path = weight_bank.find_close_match(alpha_flat)
-        if closest_path is not None:
-            loaded = weight_bank.load_weights_into_model(model_net, closest_path, device)
-            if loaded:
-                finetune_epochs = params.get('weight_reuse_finetune_epochs', params['max_epochs'])
-                params['max_epochs'] = finetune_epochs
-                params['weight_reuse_applied'] = True
-                LOGGER.info(f"Weight reuse applied for {id_num} from {closest_path}")
+    if warm_start_info is not None and os.path.exists(warm_start_info.get('state_dict_path', '')):
+        # Progressive-growth stage transition: warm-start from the previous (shallower/
+        # wider op-set) stage's best model instead of the (still-empty) stage-scoped
+        # weight bank.
+        old_state_dict = torch.load(warm_start_info['state_dict_path'], map_location=device)
+        model_net = transfer_weights(
+            old_state_dict, model_net,
+            old_fn_list=warm_start_info['old_fn_list'],
+            new_fn_list=fn_list,
+            old_num_nodes=warm_start_info['old_num_nodes'],
+        )
+        params['weight_reuse_applied'] = True
+        params['progressive_warm_start'] = True
+        LOGGER.info(f"Progressive warm-start applied for {id_num} from "
+                    f"{warm_start_info['state_dict_path']}")
 
     criterion = nn.CrossEntropyLoss()
 

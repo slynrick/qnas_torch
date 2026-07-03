@@ -34,3 +34,14 @@ uv run python src/run_evolution.py \
     --fitness_metric best_accuracy \
     --network_config default \
     --log_level INFO
+
+uv run python src/retrain_model.py \
+    --experiment_path experiment_cifar10_mixedop/exp1 \
+    --data_path /home/fcardoso/workspace/qnas_torch/cifar10_data \
+    --dataset cifar10 \
+    --network_config default \
+    --config_code run1_best \
+    --log_level INFO \
+    --device cuda:0 \
+    --num_repetitions 5 \
+    --max_epochs 300

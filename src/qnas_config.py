@@ -174,6 +174,16 @@ class ConfigParameters(object):
             'mixedop_max_channels', None
         )
 
+        # P-DARTS-style progressive depth growth + operation pruning (optional).
+        # List of {gen_start, num_nodes, num_ops} stages, sorted by gen_start.
+        # Config-file only, no CLI flag.
+        stages = config_file.get('QNAS', {}).get('progressive_stages', None)
+        if stages:
+            stages = sorted(stages, key=lambda s: s['gen_start'])
+            if stages[0]['gen_start'] != 0:
+                raise ValueError("progressive_stages must include a stage starting at gen_start=0")
+        self.QNAS_spec['progressive_stages'] = stages
+
         # Weight reuse parameters (optional, with defaults)
         self.train_spec['weight_reuse_enabled'] = (
             self.args.get('weight_reuse_enabled', False)
@@ -185,9 +195,18 @@ class ConfigParameters(object):
         self.train_spec['cosine_threshold'] = self.args.get(
             'cosine_threshold', config_file.get('train', {}).get('cosine_threshold', 0.05)
         )
-        self.train_spec['weight_reuse_finetune_epochs'] = self.args.get(
-            'weight_reuse_finetune_epochs',
-            config_file.get('train', {}).get('weight_reuse_finetune_epochs', 10)
+
+        # Per-individual training early stopping (optional, config-file only). Distinct
+        # from the QNAS-level early_stopping/patience above, which stops the whole
+        # generational search instead of one individual's training loop.
+        self.train_spec['early_stopping_enabled'] = config_file.get('train', {}).get(
+            'early_stopping_enabled', False
+        )
+        self.train_spec['early_stopping_patience'] = config_file.get('train', {}).get(
+            'early_stopping_patience', 5
+        )
+        self.train_spec['early_stopping_min_delta'] = config_file.get('train', {}).get(
+            'early_stopping_min_delta', 0.0
         )
 
         self._get_fn_spec()
@@ -400,6 +419,17 @@ class ConfigParameters(object):
         net_list = best_individual_info.get('net_list', [])
         generation = best_individual_info.get('generation', 0)
         individual = best_individual_info.get('individual', 0)
+
+        if not net_list:
+                # MixedOp mode individuals have no discrete net_list in training_params.txt
+                # (they train via alpha logits, not a fixed op-per-node chain) - fall back
+                # to the collapsed network saved by QNAS.collapse_best_network() at the end
+                # of a mixedop_mode run.
+                collapsed_path = os.path.join(experiment_path, 'best_network_collapsed.pkl')
+                if os.path.exists(collapsed_path):
+                        collapsed = load_pkl(collapsed_path)
+                        net_list = collapsed['net_list']
+                        generation, individual = collapsed['best_so_far_id']
         
         if generation == 0 and individual == 0: # only for old format
                 matches = re.search(r'(\d+)_(\d+)$', best_result_folder)

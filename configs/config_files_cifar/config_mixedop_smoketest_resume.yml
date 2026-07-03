@@ -1,10 +1,10 @@
-# Smoke-test config: tiny MixedOperation + weight-reuse run to verify
-# the qnas_config.py mixedop_mode/weight_reuse_enabled fix actually
-# activates both features from the config file alone (no CLI flags).
+# Same as config_mixedop_smoketest.yml but with a longer schedule + a 3rd stage,
+# used to verify --continue_path correctly resumes mid-run (not restart, not
+# double-extend) after the base smoketest halts at max_generations: 2.
 
 QNAS:
     crossover_rate: 0.5
-    max_generations: 2
+    max_generations: 4
     max_num_nodes: 6
     num_quantum_ind: 2
     penalize_number: 3
@@ -21,11 +21,10 @@ QNAS:
     mixedop_mode: True
     alpha_noise_std: 0.1
 
-    # P-DARTS-style progressive depth growth + op pruning: 2 tiny stages so a
-    # transition fires within this 2-generation smoke test (at gen_start: 1).
     progressive_stages:
       - {gen_start: 0, num_nodes: 4, num_ops: 11}
       - {gen_start: 1, num_nodes: 6, num_ops: 6}
+      - {gen_start: 3, num_nodes: 8, num_ops: 4}
 
     params_ranges:
         decay: 0.9
@@ -51,8 +50,6 @@ train:
     max_epochs: 6
     epochs_to_eval: 1
 
-    # Per-individual training early stopping (small patience so a smoke test can
-    # actually demonstrate it firing before max_epochs).
     early_stopping_enabled: True
     early_stopping_patience: 2
     early_stopping_min_delta: 0.0
@@ -81,8 +78,6 @@ train:
     network_config: default
     network_gap: False
 
-    # Caps MixedOp's per-node canonical channel width instead of following
-    # the largest conv in function_dict (conv_3_1_256) - see mixed_model.py.
     mixedop_max_channels: 64
 
     weight_reuse_enabled: True

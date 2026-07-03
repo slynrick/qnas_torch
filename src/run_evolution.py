@@ -56,7 +56,13 @@ def main(**args):
     qnas_cnn.weight_reuse_enabled = weight_reuse_enabled
 
     qnas_cnn.initialize_qnas(**config.QNAS_spec)
-    
+
+    if phase == 'continue_evolution':
+        logger.info(f"Restoring QNAS state from {config.files_spec['previous_data_file']} ...")
+        qnas_cnn.load_qnas_data(config.files_spec['previous_data_file'])
+        logger.info(f"Resuming at generation {qnas_cnn.current_gen} "
+                    f"(best so far: {qnas_cnn.best_so_far_id} -> {qnas_cnn.best_so_far}) ...")
+
     # Start evolution
     logger.info(f"Starting evolution ...")
     qnas_cnn.evolve()
@@ -106,17 +112,15 @@ if __name__ == '__main__':
                         help='Std of Gaussian noise added to alpha_logits when generating '
                              'classical individuals in mixedop_mode. Default = 0.1.')
 
-    # Weight reuse
+    # Fitness cache (reuse cached fitness for architectures with close alpha weights,
+    # skipping training entirely on a cache hit)
     parser.add_argument('--weight_reuse_enabled', action='store_true',
-                        help='Enable weight reuse from architectures with close alpha weights. '
-                             'Default = False.')
+                        help='Enable the fitness cache for architectures with close alpha '
+                             'weights. Default = False.')
     parser.add_argument('--weight_bank_dir', type=str, default='',
-                        help='Directory for the weight bank (defaults to experiment_path/weight_bank).')
+                        help='Directory for the fitness cache (defaults to experiment_path/weight_bank).')
     parser.add_argument('--cosine_threshold', type=float, default=0.05,
-                        help='Max cosine distance for a weight bank match. Default = 0.05.')
-    parser.add_argument('--weight_reuse_finetune_epochs', type=int, default=10,
-                        help='Epochs to train when weight reuse is applied (< max_epochs). '
-                             'Default = 10.')
+                        help='Max cosine distance for a cache hit. Default = 0.05.')
 
     arguments = parser.parse_args()
 

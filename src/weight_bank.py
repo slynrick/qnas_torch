@@ -1,15 +1,18 @@
-""" Weight bank for reusing trained model weights across similar architectures.
+""" Fitness cache for reusing evaluation results across similar architectures.
 
 Similarity is measured by cosine distance between softmax-normalized alpha vectors,
 making it applicable to both discrete (PMF-derived alpha) and mixedop mode architectures.
+
+On a cache hit, the cached fitness/params/inference-time are reused directly and no
+training happens at all (no weight loading, no fine-tuning) - this trades search-time
+accuracy for speed, on the assumption that architectures with near-identical alpha
+vectors would train to near-identical fitness anyway.
 """
 
 import json
 import os
 import numpy as np
-import torch
-import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -34,7 +37,8 @@ def signature_to_vec(sig: str) -> np.ndarray:
 
 
 class WeightBank:
-    """JSON-indexed cache of trained model weights, keyed by architecture alpha signature.
+    """JSON-indexed cache of (fitness, params, inference_time, weights_path) results,
+    keyed by architecture alpha signature.
 
     Workers only READ the index (snapshot before generation). The main process writes
     the index after all workers join, so no locking is needed.
@@ -57,48 +61,45 @@ class WeightBank:
         with open(self.index_path, "w") as f:
             json.dump(self._index, f, indent=2)
 
-    def find_close_match(self, alpha_vec: np.ndarray) -> Optional[str]:
-        """Return the weights path of the closest architecture, or None if no match.
+    def find_cached_result(self, alpha_vec: np.ndarray) -> Optional[dict]:
+        """Return the cached result of the closest architecture, or None if no match.
 
         Args:
             alpha_vec: flat (or multi-dim) alpha logit array for the candidate architecture.
 
         Returns:
-            Path string to the closest best_model.pth, or None.
+            {"weights_path", "fitness", "params_m", "inference_us"} of the closest
+            cached architecture within cosine_threshold, or None.
         """
         if not self._index:
             return None
 
         query = _softmax(alpha_vec.flatten())
         best_dist = float("inf")
-        best_path = None
+        best_entry = None
 
-        for sig, path in self._index.items():
-            if not os.path.exists(path):
+        for sig, entry in self._index.items():
+            if not os.path.exists(entry["weights_path"]):
                 continue
             ref = signature_to_vec(sig)
             d = _cosine_distance(query, ref)
             if d < best_dist and d <= self.cosine_threshold:
                 best_dist = d
-                best_path = path
+                best_entry = entry
 
-        return best_path
+        return best_entry
 
-    def save_weights(self, alpha_vec: np.ndarray, weights_path: str):
-        """Register a trained model in the bank (main process only)."""
+    def register(self, alpha_vec: np.ndarray, weights_path: str, fitness: float,
+                 params_m: float, inference_us: float):
+        """Register an evaluated architecture's result in the bank (main process only)."""
         sig = alpha_to_signature(alpha_vec)
-        self._index[sig] = weights_path
+        self._index[sig] = {
+            "weights_path": weights_path,
+            "fitness": fitness,
+            "params_m": params_m,
+            "inference_us": inference_us,
+        }
         self._save_index()
-
-    def load_weights_into_model(self, model: nn.Module, weights_path: str,
-                                 device: str) -> bool:
-        """Load saved weights into model with strict=False (partial loading OK)."""
-        try:
-            state_dict = torch.load(weights_path, map_location=device)
-            model.load_state_dict(state_dict, strict=False)
-            return True
-        except Exception:
-            return False
 
     def snapshot(self) -> "WeightBank":
         """Return a read-only copy of the bank (for subprocess use)."""

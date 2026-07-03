@@ -4,7 +4,7 @@ QNAS:
     crossover_rate: 0.5
     max_generations: 100
     max_num_nodes: 20
-    num_quantum_ind: 3
+    num_quantum_ind: 4
     penalize_number: 3
     repetition: 1
     replace_method: best
@@ -20,6 +20,14 @@ QNAS:
     # instead of a PMF used for discrete sampling.
     mixedop_mode: True
     alpha_noise_std: 0.1
+
+    # P-DARTS-style progressive depth growth + operation pruning: 3 stages over
+    # max_generations: 100, final stage matches max_num_nodes (20). Op pruning
+    # ranks candidates by mean trained softmax(alpha) weight at each transition.
+    progressive_stages:
+      - {gen_start: 0,  num_nodes: 7,  num_ops: 11}
+      - {gen_start: 33, num_nodes: 13, num_ops: 7}
+      - {gen_start: 66, num_nodes: 20, num_ops: 4}
 
     params_ranges:
         decay: 0.9
@@ -44,6 +52,13 @@ train:
     eval_batch_size: 256
     max_epochs: 50
     epochs_to_eval: 5
+
+    # Per-individual training early stopping: stop one model's training once its
+    # validation loss stops improving, instead of always running max_epochs. With
+    # this enabled, validation runs every epoch (not just the last epochs_to_eval).
+    early_stopping_enabled: True
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.05
     optimizer: AdamW
     fitness_metric: best_loss
     mo_metric_base: loss
@@ -76,10 +91,9 @@ train:
     # the largest conv in function_dict (conv_3_1_256) - see mixed_model.py.
     mixedop_max_channels: 64
 
-    # Weight reuse: closest already-trained architecture is found by comparing
-    # alpha weight vectors (cosine distance) and its weights are loaded for
-    # fine-tuning instead of training from scratch.
+    # Fitness cache: closest already-evaluated architecture is found by comparing
+    # alpha weight vectors (cosine distance); on a hit, its fitness/params/inference
+    # time are reused directly and training is skipped entirely.
     weight_reuse_enabled: True
     weight_bank_dir: ""
     cosine_threshold: 0.05
-    weight_reuse_finetune_epochs: 10

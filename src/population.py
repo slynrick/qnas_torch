@@ -293,6 +293,52 @@ class QPopulationNetwork(QPopulation):
             dtype=np.float64,
         )
 
+    def grow_and_prune(self, new_num_nodes: int, new_fn_list: list):
+        """Resize the quantum alpha_logits for a P-DARTS-style progressive stage transition.
+
+        Grows the node axis (new nodes start at zero logits → uniform softmax, matching
+        initialize_alpha_logits's convention) and prunes the op axis down to *new_fn_list*
+        (ops dropped from fn_list are simply removed; kept ops carry their trained logits
+        over, matched by name since pruning can reorder indices).
+
+        Args:
+            new_num_nodes: new depth (>= current depth).
+            new_fn_list: new (pruned) ordered list of operation names.
+        """
+        old_fn_list = list(self.chromosome.fn_list)
+        old_num_nodes = self.chromosome.num_genes
+        old_op_idx = {name: i for i, name in enumerate(old_fn_list)}
+        new_op_idx = {name: i for i, name in enumerate(new_fn_list)}
+        shared_ops = set(old_fn_list) & set(new_fn_list)
+
+        new_alpha_logits = np.zeros(
+            (self.num_ind, new_num_nodes, len(new_fn_list)), dtype=np.float64,
+        )
+        carry_over_nodes = min(old_num_nodes, new_num_nodes)
+        for op_name in shared_ops:
+            old_i, new_i = old_op_idx[op_name], new_op_idx[op_name]
+            new_alpha_logits[:, :carry_over_nodes, new_i] = \
+                self.alpha_logits[:, :carry_over_nodes, old_i]
+
+        self.alpha_logits = new_alpha_logits
+
+        # self.probabilities (discrete-mode PMF) isn't used for individual generation in
+        # mixedop mode, but save_data()/load_qnas_data() serialize it unconditionally -
+        # keep its shape consistent with the new node/op counts too.
+        new_probabilities = np.tile(
+            np.full(len(new_fn_list), 1.0 / len(new_fn_list)),
+            (self.num_ind, new_num_nodes, 1),
+        )
+        for op_name in shared_ops:
+            old_i, new_i = old_op_idx[op_name], new_op_idx[op_name]
+            new_probabilities[:, :carry_over_nodes, new_i] = \
+                self.probabilities[:, :carry_over_nodes, old_i]
+        self.probabilities = new_probabilities
+
+        self.chromosome.fn_list = new_fn_list
+        self.chromosome.num_functions = len(new_fn_list)
+        self.chromosome.set_num_genes(new_num_nodes)
+
     def generate_classical_mixedop(self, sigma: float = 0.1) -> np.ndarray:
         """Generate classical individuals as alpha logit matrices (PDF mode).
 

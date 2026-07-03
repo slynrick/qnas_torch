@@ -224,3 +224,44 @@ class MixedNetworkGraph(nn.Module):
                                      units=self.num_classes)
             self.fc = self.fc.to(x.device)
         return self.fc(x)
+
+
+def transfer_weights(old_state_dict: Dict[str, torch.Tensor], new_model: "MixedNetworkGraph",
+                      old_fn_list: List[str], new_fn_list: List[str],
+                      old_num_nodes: int) -> "MixedNetworkGraph":
+    """Warm-start a deeper/pruned MixedNetworkGraph from a shallower stage's trained weights
+    (P-DARTS-style progressive growth).
+
+    For node indices < old_num_nodes, copies each op's (and its channel projector's)
+    weights, matched by *op name* rather than positional index - operation pruning
+    between stages shifts indices, so a name-based lookup is required. New nodes
+    (index >= old_num_nodes) and any op that didn't survive pruning simply keep the
+    fresh initialization already in new_model. Tensors are only copied when their
+    shape matches exactly (canonical channel width is fixed by mixedop_max_channels
+    across stages, so this should always hold in practice, but a shape check keeps
+    a config change from turning into a crash instead of a silent skip).
+    """
+    new_state_dict = new_model.state_dict()
+    old_op_idx = {name: i for i, name in enumerate(old_fn_list)}
+    new_op_idx = {name: i for i, name in enumerate(new_fn_list)}
+    shared_ops = set(old_fn_list) & set(new_fn_list)
+
+    for node in range(min(old_num_nodes, len(new_model.mixed_ops))):
+        for op_name in shared_ops:
+            old_i, new_i = old_op_idx[op_name], new_op_idx[op_name]
+            for submodule in ("ops", "projectors"):
+                old_prefix = f"mixed_ops.{node}.{submodule}.{old_i}."
+                new_prefix = f"mixed_ops.{node}.{submodule}.{new_i}."
+                for old_key, old_val in old_state_dict.items():
+                    if not old_key.startswith(old_prefix):
+                        continue
+                    new_key = new_prefix + old_key[len(old_prefix):]
+                    if new_key in new_state_dict and new_state_dict[new_key].shape == old_val.shape:
+                        new_state_dict[new_key] = old_val.clone()
+
+            alpha_key = f"mixed_ops.{node}.alpha"
+            if alpha_key in old_state_dict and alpha_key in new_state_dict:
+                new_state_dict[alpha_key][new_i] = old_state_dict[alpha_key][old_i]
+
+    new_model.load_state_dict(new_state_dict)
+    return new_model

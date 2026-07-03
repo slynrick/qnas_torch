@@ -78,6 +78,12 @@ class EvalPopulation(object):
         self.mixedop_mode = mixedop_mode
         self.fn_list = fn_list or []
         self.weight_reuse_enabled = weight_reuse_enabled
+        # Progressive stage growth (P-DARTS style): set by QNAS right after a stage
+        # transition to warm-start the transition generation's individuals from the
+        # previous (shallower/wider op-set) stage's best model. Cleared after that
+        # generation's __call__ so later generations in the same stage fall back to
+        # normal (stage-scoped) weight-bank reuse instead of repeating the warm-start.
+        self.warm_start_info: Optional[Dict[str, Any]] = None
         self.logger = init_log(log_level, name=__name__)
         self.gpus = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
         self.loader = input.GenericDataLoader(params=self.train_params)
@@ -97,7 +103,20 @@ class EvalPopulation(object):
             f"Evaluation process initialized with {len(self.gpus)} GPUs, "
             f"mixedop_mode={mixedop_mode}, weight_reuse={weight_reuse_enabled}"
         )
-        
+
+    def set_stage_weight_bank(self, stage_idx: int):
+        """Point the weight bank at a stage-scoped directory (P-DARTS progressive growth).
+
+        A new stage has a different num_nodes/fn_list, so cosine-signature matching
+        against a previous stage's (differently-shaped) signatures is meaningless -
+        each stage gets its own bank instead of trying to reconcile shapes.
+        """
+        if self.weight_bank is None:
+            return
+        bank_dir = os.path.join(self.train_params['experiment_path'], f'weight_bank_stage_{stage_idx}')
+        self.weight_bank = WeightBank(bank_dir=bank_dir, cosine_threshold=self.weight_bank.cosine_threshold)
+        self.train_params['weight_bank_dir'] = bank_dir
+
     def __call__(self, decoded_params: list, decoded_nets: list, generation: int,
                  alpha_matrices: Optional[List[np.ndarray]] = None
                  ) -> Tuple[np.ndarray, Optional[List[np.ndarray]]]:
@@ -159,13 +178,16 @@ class EvalPopulation(object):
                 target=self.run_individuals,
                 args=(generation, self.train_params, self.fn_dict, self.fn_list,
                       individuals_selected_thread, gpu_device, bank_snapshot,
-                      self.mixedop_mode),
+                      self.mixedop_mode, self.warm_start_info),
             )
             process.start()
             processes.append(process)
 
         for p in processes:
             p.join()
+
+        # Warm-start only applies to the single transition generation.
+        self.warm_start_info = None
 
         for idx, val in enumerate(variables):
             evaluations[idx] = val[0]
@@ -183,14 +205,14 @@ class EvalPopulation(object):
             trained_alphas = self._collect_trained_alphas(decoded_nets, generation)
 
         if self.weight_bank is not None:
-            self._register_weights_in_bank(decoded_nets, generation, alpha_matrices)
+            self._register_weights_in_bank(decoded_nets, generation, alpha_matrices, variables)
 
         return evaluations, trained_alphas
             
             
     def run_individuals(self, generation, train_params, fn_dict, fn_list,
                         individuals_selected_thread, gpu_device, bank_snapshot,
-                        mixedop_mode: bool):
+                        mixedop_mode: bool, warm_start_info: Optional[Dict[str, Any]] = None):
         train_loader, val_loader = self.loader.get_loader(pin_memory_device=gpu_device)
         for individual, selected_thread, decoded_net, decoded_params, return_val, alpha in \
                 individuals_selected_thread:
@@ -201,6 +223,7 @@ class EvalPopulation(object):
                     id_num, p, fn_dict, fn_list, alpha,
                     train_loader, val_loader, return_val,
                     weight_bank=bank_snapshot,
+                    warm_start_info=warm_start_info,
                 )
             else:
                 train.fitness_calculation(
@@ -232,8 +255,12 @@ class EvalPopulation(object):
         return trained_alphas
 
     def _register_weights_in_bank(self, decoded_nets: list, generation: int,
-                                   alpha_matrices: Optional[List[np.ndarray]]):
-        """Register each individual's trained weights in the WeightBank (main process)."""
+                                   alpha_matrices: Optional[List[np.ndarray]], variables):
+        """Register each actually-trained individual's result in the WeightBank (main
+        process). Cache-hit individuals never write weights_path.txt (see
+        cnn/train.py's fitness_calculation[_mixedop]), so they're naturally skipped
+        here instead of re-registering an already-cached result.
+        """
         for idx in range(len(decoded_nets)):
             model_path = os.path.join(
                 self.train_params['experiment_path'], f"{generation}_{idx}"
@@ -259,4 +286,6 @@ class EvalPopulation(object):
             else:
                 continue
 
-            self.weight_bank.save_weights(alpha_vec, weights_path)
+            fitness, params_m, inference_us = variables[idx]
+            self.weight_bank.register(alpha_vec, weights_path, fitness=fitness,
+                                      params_m=params_m, inference_us=inference_us)

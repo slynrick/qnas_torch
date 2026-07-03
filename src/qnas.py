@@ -55,6 +55,15 @@ class QNAS(object):
         self.qpop_params = None
         self.qpop_net = None
         self.best_alpha = None  # trained alpha matrix of the best individual so far (mixedop_mode)
+        self.best_alpha_fn_list = None  # fn_list active when best_alpha was captured -
+                                         # progressive stages can prune fn_list after the
+                                         # best individual's generation, so best_alpha's op
+                                         # indices must be decoded against ITS fn_list, not
+                                         # whatever fn_list is active at collapse time.
+
+        # P-DARTS-style progressive depth growth + op pruning (mixedop_mode only, optional)
+        self.progressive_stages = None
+        self.current_stage_idx = 0
 
     def initialize_qnas(self, num_quantum_ind, params_ranges, repetition, max_generations,
                         crossover_rate, update_quantum_gen, replace_method, fn_list,
@@ -62,7 +71,7 @@ class QNAS(object):
                         patience, early_stopping, save_data_freq=0, penalize_number=0,
                         crossover_frequency=5, en_pop_crossover=False,
                         pop_crossover_rate=0.25, pop_crossover_method='hux',
-                        mixedop_mode=False, alpha_noise_std=0.1):
+                        mixedop_mode=False, alpha_noise_std=0.1, progressive_stages=None):
 
         """ Initialize algorithm with several parameter values.
 
@@ -117,6 +126,19 @@ class QNAS(object):
         self.alpha_noise_std = alpha_noise_std
         self._last_trained_alphas = None  # set after each eval in mixedop mode
         self.weight_reuse_enabled = False  # set by run_evolution.py via eval_func
+
+        # P-DARTS-style progressive growth: stage 0 always starts from the full fn_list
+        # (op pruning only makes sense once there's a trained alpha to rank ops by, at
+        # the end of stage 0) - later stages narrow fn_list and grow num_nodes.
+        self.progressive_stages = progressive_stages
+        self.current_stage_idx = 0
+        if progressive_stages:
+            if progressive_stages[0]['num_ops'] != len(fn_list):
+                raise ValueError(
+                    "progressive_stages[0].num_ops must equal len(fn_list) - the first "
+                    "stage has no trained alpha yet to rank/prune ops by."
+                )
+            max_num_nodes = progressive_stages[0]['num_nodes']
 
         if reducing_fns_list:
             self.penalties = np.zeros(shape=(num_quantum_ind * repetition))
@@ -250,6 +272,7 @@ class QNAS(object):
                 if best_idx < len(self._last_trained_alphas) and \
                         self._last_trained_alphas[best_idx] is not None:
                     self.best_alpha = np.copy(self._last_trained_alphas[best_idx])
+                    self.best_alpha_fn_list = list(self.qpop_net.chromosome.fn_list)
 
     def generate_classical(self):
         """ Generate a specific number of classical individuals from the observation of quantum
@@ -410,8 +433,18 @@ class QNAS(object):
 
         np.set_printoptions(precision=4)
 
-        self.logger.info(f'New generation finished running!\n\n'
+        stage_line = ''
+        if self.progressive_stages:
+            stage = self.progressive_stages[self.current_stage_idx]
+            stage_line = (
+                f'- Stage: {self.current_stage_idx} '
+                f'(gen_start={stage["gen_start"]}, num_nodes={stage["num_nodes"]}, '
+                f'num_ops={stage["num_ops"]})\n'
+            )
+
+        self.logger.info(f'New generation finished running!\n'
                         f'- Generation: {self.current_gen}\n'
+                        f'{stage_line}'
                         f'- Best so far: {self.best_so_far_id} --> {self.best_so_far:.5f}\n'
                         f'- Fitnesses: {self.fitnesses}\n'
                         f'- Fitnesses without penalties: {self.raw_fitnesses}\n')
@@ -443,6 +476,18 @@ class QNAS(object):
 
         if self.mixedop_mode and hasattr(self.qpop_net, 'alpha_logits'):
             entry['alpha_logits'] = self.qpop_net.alpha_logits
+
+        if self.progressive_stages:
+            entry['current_stage_idx'] = self.current_stage_idx
+            entry['fn_list'] = list(self.qpop_net.chromosome.fn_list)
+
+        if self.mixedop_mode and self.best_alpha is not None:
+            # Needed to resume correctly and to collapse the right network later -
+            # best_alpha's shape/fn_list may predate later progressive-stage prunings,
+            # so it must be restored alongside the fn_list that was active when it was
+            # captured (see collapse_best_network()).
+            entry['best_alpha'] = self.best_alpha
+            entry['best_alpha_fn_list'] = self.best_alpha_fn_list
 
         data[self.current_gen] = entry
 
@@ -491,7 +536,18 @@ class QNAS(object):
 
         if self.mixedop_mode and 'alpha_logits' in log_data:
             self.qpop_net.alpha_logits = log_data['alpha_logits']
-        
+
+        if self.progressive_stages and 'current_stage_idx' in log_data:
+            self.current_stage_idx = log_data['current_stage_idx']
+            self.qpop_net.chromosome.fn_list = log_data['fn_list']
+            self.qpop_net.chromosome.num_functions = len(log_data['fn_list'])
+            self.eval_func.fn_list = log_data['fn_list']
+            self.eval_func.set_stage_weight_bank(self.current_stage_idx)
+
+        if self.mixedop_mode and 'best_alpha' in log_data:
+            self.best_alpha = log_data['best_alpha']
+            self.best_alpha_fn_list = log_data['best_alpha_fn_list']
+
     def check_early_stopping(self):
         """
         Compute the early stopping of the evolution. If the best fitness does not improve 
@@ -566,13 +622,18 @@ class QNAS(object):
             return None
 
         alpha = self.best_alpha
+        fn_list = self.best_alpha_fn_list
         if alpha is None:
             self.logger.info("No best_alpha tracked; falling back to quantum alpha_logits "
                             "centroid for collapsing the network.")
             alpha = self.qpop_net.alpha_logits[0]
+            fn_list = self.qpop_net.chromosome.fn_list
 
         op_indices = np.argmax(alpha, axis=-1).astype(np.int32)
-        net_list = self.qpop_net.chromosome.decode(op_indices)
+        # Decode against fn_list as it was when best_alpha was captured, NOT the
+        # current chromosome's fn_list - progressive stages may have pruned it since
+        # (op_indices would then point past the end of a shorter, later fn_list).
+        net_list = [fn_list[gene] for gene in op_indices]
 
         self.logger.info(f"Collapsed best network (one operation per node): {net_list}")
 
@@ -589,6 +650,68 @@ class QNAS(object):
 
         return net_list
 
+    def _rank_and_prune_ops(self, old_fn_list, num_ops):
+        """Rank ops by mean trained softmax(alpha) weight (across the population and all
+        nodes) from the stage that just finished, and keep the top *num_ops*.
+
+        Falls back to keeping the first *num_ops* of *old_fn_list* if no trained alphas
+        are available yet (shouldn't normally happen, since stage transitions only occur
+        after at least one generation has been evaluated).
+        """
+        if num_ops >= len(old_fn_list):
+            return list(old_fn_list)
+
+        valid_alphas = [a for a in (self._last_trained_alphas or []) if a is not None]
+        if not valid_alphas:
+            self.logger.info("No trained alphas available for op pruning; keeping first "
+                            f"{num_ops} ops of {old_fn_list}.")
+            return list(old_fn_list[:num_ops])
+
+        stacked = np.stack(valid_alphas, axis=0)  # [ind, nodes, ops]
+        exp = np.exp(stacked - stacked.max(axis=-1, keepdims=True))
+        softmax = exp / exp.sum(axis=-1, keepdims=True)
+        mean_weight = softmax.mean(axis=(0, 1))  # [ops]
+
+        ranked = sorted(range(len(old_fn_list)), key=lambda i: mean_weight[i], reverse=True)
+        kept_indices = sorted(ranked[:num_ops])
+        new_fn_list = [old_fn_list[i] for i in kept_indices]
+        self.logger.info(f"Op pruning: {old_fn_list} -> {new_fn_list}")
+        return new_fn_list
+
+    def _transition_stage(self, new_stage_idx):
+        """Grow depth / prune ops / warm-start weights at a progressive-stage boundary."""
+        stage = self.progressive_stages[new_stage_idx]
+        old_fn_list = list(self.qpop_net.chromosome.fn_list)
+        old_num_nodes = self.qpop_net.chromosome.num_genes
+
+        new_fn_list = self._rank_and_prune_ops(old_fn_list, stage['num_ops'])
+        self.qpop_net.grow_and_prune(stage['num_nodes'], new_fn_list)
+
+        self.eval_func.fn_list = new_fn_list
+        self.eval_func.set_stage_weight_bank(new_stage_idx)
+
+        best_gen, best_ind = self.best_so_far_id
+        src_path = os.path.join(self.experiment_path, f'{best_gen}_{best_ind}', 'best_model.pth')
+        if os.path.exists(src_path):
+            self.eval_func.warm_start_info = {
+                'state_dict_path': src_path,
+                'old_fn_list': old_fn_list,
+                'old_num_nodes': old_num_nodes,
+            }
+        else:
+            self.logger.info(f"No best model found at {src_path}; stage {new_stage_idx} "
+                            "will train from scratch instead of warm-starting.")
+            self.eval_func.warm_start_info = None
+
+        self.current_stage_idx = new_stage_idx
+        self.logger.info(
+            f"Progressive stage transition -> stage {new_stage_idx} "
+            f"(gen_start={stage['gen_start']}, num_nodes={stage['num_nodes']}, "
+            f"num_ops={stage['num_ops']}): "
+            f"{old_num_nodes} -> {stage['num_nodes']} nodes, "
+            f"{len(old_fn_list)} -> {len(new_fn_list)} ops."
+        )
+
     def evolve(self):
         """ Run the evolution. """
         start_evolution = time.time()
@@ -598,8 +721,12 @@ class QNAS(object):
         
         # Update maximum number of generations if continue previous evolution process
         if self.current_gen > 0:
-            max_generations += self.current_gen + 1
-            # Increment current generation, as in the log file we have the completed generations
+            # Resuming (crash/restart via --continue_path): current_gen is the last
+            # COMPLETED generation restored from the log, so pick up at the next one.
+            # max_generations stays the original absolute target from config, so a
+            # resumed run finishes the SAME run instead of tacking on extra generations
+            # every time it's resumed. To deliberately extend a finished run, raise
+            # max_generations in the config before resuming.
             self.current_gen += 1
 
         while self.current_gen < max_generations:
@@ -609,6 +736,14 @@ class QNAS(object):
                 int_hours, int_mins, est_hours, est_mins = calculate_time(start_evolution,int_time,self.current_gen, max_generations, end_evol=False)
                 self.logger.info(f"Current evolution time at generation {self.current_gen}: {int_hours} hours and {int_mins} mins")
                 self.logger.info(f"Estimated time to finish the evolution: {est_hours} hours and {est_mins} mins")
+
+            if self.mixedop_mode and self.progressive_stages:
+                target_stage_idx = max(
+                    i for i, s in enumerate(self.progressive_stages)
+                    if s['gen_start'] <= self.current_gen
+                )
+                if target_stage_idx != self.current_stage_idx:
+                    self._transition_stage(target_stage_idx)
 
             self.generate_classical()
             self.go_next_gen()

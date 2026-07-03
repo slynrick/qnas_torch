@@ -325,21 +325,33 @@ def draw_retrain_panel(fig, gs_cell, retrain_results, indiv_df):
         return
 
     search_best = indiv_df["best_accuracy"].max() if not indiv_df.empty else np.nan
+    search_best_params = indiv_df.loc[indiv_df["best_accuracy"].idxmax(), "total_trainable_params"] \
+        if not indiv_df.empty and indiv_df["best_accuracy"].notna().any() else None
+
     retrain_accs = []
+    retrain_params = []
     for run_name, res in retrain_results.items():
         acc = res.get("test_accuracy", res.get("best_accuracy"))
         if acc is not None:
             retrain_accs.append(acc)
+            retrain_params.append(res.get("total_trainable_params"))
 
     labels = ["best in search"] + [f"retrain {i+1}" for i in range(len(retrain_accs))]
     values = [search_best] + retrain_accs
+    params_labels = [search_best_params] + retrain_params
     colors = [ACCENT] + [ACCENT_2] * len(retrain_accs)
     bars = ax.bar(labels, values, color=colors, width=0.5)
     ax.set_ylabel("accuracy", color=MUTED, fontsize=9)
-    for bar, val in zip(bars, values):
-        if val == val:
-            ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:.1f}", ha="center",
-                    va="bottom", color=INK, fontsize=8)
+    for bar, val, params in zip(bars, values, params_labels):
+        if val != val:
+            continue
+        ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:.1f}", ha="center",
+                va="bottom", color=INK, fontsize=8)
+        # Param count of the collapsed/retrained architecture, under the accuracy label.
+        if params:
+            ax.text(bar.get_x() + bar.get_width() / 2, val * 0.5,
+                    f"{params/1e6:.2f}M params", ha="center", va="center",
+                    color=BG, fontsize=7.5, fontweight="bold")
 
 
 def draw_stat_tiles(fig, gs_row, indiv_df, weight_bank, gen_data):
