@@ -35,6 +35,10 @@ def main(**args):
     
     # update experiment path name to retrain_"config_code"_1
     config.train_spec['experiment_path'] = os.path.join(experiment_path, f"retrain_{config_code}_{1}")
+    # Root experiment dir (not the per-repetition retrain_*_N subfolder) - used so
+    # retrain.log lands next to the search's other artifacts instead of a fixed
+    # repo-wide location, and stays a single file across all repetitions.
+    config.train_spec['experiment_path_root'] = experiment_path
     
     output_dict = {}
     # Retrain model for the number of repetitions

@@ -5,6 +5,7 @@
 
 
 """
+import logging
 import os
 import time
 import numpy as np
@@ -18,13 +19,31 @@ from cnn import model, input, metrics
 from util import create_info_file, init_log, load_yaml
 from torch.optim.lr_scheduler import ReduceLROnPlateau, ExponentialLR, CosineAnnealingLR, MultiStepLR
 
-current_directory = os.path.dirname(os.path.dirname(__file__))
-log_directory = os.path.join(current_directory, 'logs')
-if not os.path.exists(log_directory):
-    os.makedirs(log_directory)
-    
-log_file = os.path.join(log_directory, 'retrain.log')
-LOGGER = init_log("INFO", name=__name__, file_path=log_file)
+# Console output always on. The file handler is attached lazily per experiment,
+# since the experiment path is only known at call time - see
+# _attach_experiment_log_file(). Mirrors cnn/train.py's LOGGER setup.
+LOGGER = init_log("INFO", name=__name__)
+_log_file_experiment_path = None
+
+
+def _attach_experiment_log_file(experiment_path: str):
+    """Write retrain logs into <experiment_path>/retrain.log instead of a fixed
+    repo-wide location, so each experiment's logs live alongside its other
+    artifacts. A no-op if already attached for this experiment_path (all
+    num_repetitions of one retrain run share the same root experiment_path).
+    """
+    global _log_file_experiment_path
+    if _log_file_experiment_path == experiment_path:
+        return
+
+    log_path = os.path.join(experiment_path, 'retrain.log')
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter(
+        '%(levelname)s: %(module)s: %(asctime)s.%(msecs)03d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    LOGGER.addHandler(handler)
+    _log_file_experiment_path = experiment_path
 
 def release_gpu_memory(gpu_name='cuda:0'):
     """
@@ -318,6 +337,8 @@ def train_and_eval(params: Dict[str, Any],
         - 'total_trainable_params' (int): Total number of trainable parameters in the model.
     """
     
+    _attach_experiment_log_file(params.get('experiment_path_root', params['experiment_path']))
+
     device = params['device']
     model_path = os.path.join(params['experiment_path'])
     if not os.path.exists(model_path):
