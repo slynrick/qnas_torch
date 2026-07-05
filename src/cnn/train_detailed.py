@@ -225,14 +225,24 @@ def train(model: torch.nn.Module,
     validation_losses = []
     validation_accuracies = []
     best_accuracy = 0.0
+    best_validation_loss = float('inf')
     auc_value = 0.0
     acc_med = 0.0
     training_results = {}
     max_epochs = params['max_epochs']
     milestones = [0.5 * max_epochs, 0.75 * max_epochs]
 
+    # Early stopping: stop retraining once validation loss plateaus instead of
+    # always running the full max_epochs (mirrors cnn/train.py's search-phase
+    # early stopping). Disabled by default - opt in via --early_stopping_enabled.
+    es_enabled = params.get('early_stopping_enabled', False)
+    es_patience = params.get('early_stopping_patience', 10)
+    es_min_delta = params.get('early_stopping_min_delta', 0.0)
+    es_counter = 0
+    stopped_early_at = None
+
     best_model_path = os.path.join(params['model_path'], 'best_model.pth')
-    
+
     if params['lr_scheduler'] == 'exponential':
         lr_scheduler = ExponentialLR(optimizer, gamma=0.9)
     elif params['lr_scheduler'] == 'reduce_on_plateau':
@@ -253,10 +263,16 @@ def train(model: torch.nn.Module,
         validation_losses.append(validation_loss)
         validation_accuracies.append(accuracy)
         
-        if accuracy > best_accuracy: 
+        if accuracy > best_accuracy:
             best_accuracy = accuracy
             torch.save(model.state_dict(), best_model_path)
             create_info_file(params['model_path'], {'best_accuracy': best_accuracy}, 'best_accuracy.txt')
+
+        if validation_loss < best_validation_loss - es_min_delta:
+            best_validation_loss = validation_loss
+            es_counter = 0
+        else:
+            es_counter += 1
 
         if epoch % 25 == 0:
             LOGGER.info(f"Experiment: {params['experiment_path']} - Epoch [{epoch}/{max_epochs}] - Training loss: {train_loss:.2f} - Validation loss: {validation_loss:.2f} - Validation accuracy: {accuracy:.2f}%")
@@ -264,10 +280,16 @@ def train(model: torch.nn.Module,
 
         if lr_scheduler is not None:
             if params['lr_scheduler'] == 'reduce_on_plateau':
-                lr_scheduler.step(validation_loss)                
+                lr_scheduler.step(validation_loss)
             else:
                 lr_scheduler.step()
-        
+
+        if es_enabled and es_counter >= es_patience:
+            stopped_early_at = epoch
+            LOGGER.info(f"Experiment: {params['experiment_path']} - Early stopping at epoch "
+                        f"{epoch}/{max_epochs} (no val_loss improvement for {es_patience} epochs)")
+            break
+
     best_model_loaded = reset_and_load_best_model(params, best_model_path)
     test_loss, test_accuracy, auc_value, acc_med, confusion_matrix = evaluate(best_model_loaded, criterion, test_loader, params, test=True)
     
@@ -275,7 +297,10 @@ def train(model: torch.nn.Module,
     #print(f"Test loss: {test_loss} - Test accuracy: {test_accuracy}%")
             
     params['t1'] = time.time()
-    
+    params['stopped_early'] = stopped_early_at is not None
+    if stopped_early_at is not None:
+        params['stopped_early_at_epoch'] = stopped_early_at
+
     create_info_file(params['model_path'], params, 'retraining_params.txt')
     
     model_metrics = metrics.ModelMetrics(best_model_loaded, device=params['device'])

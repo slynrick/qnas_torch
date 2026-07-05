@@ -114,6 +114,15 @@ if __name__ == '__main__':
                     help='Enable network gap during evolution. Default = False.')
     parser.add_argument('--network_config', type=str, required=True,  help='Network structure configuration.', default='default',
                         choices=['default', 'dense'])
+
+    # Early stopping: stop retraining once validation loss plateaus instead of
+    # always running the full max_epochs.
+    parser.add_argument('--early_stopping_enabled', action='store_true',
+                        help='Enable early stopping during retrain. Default = False.')
+    parser.add_argument('--early_stopping_patience', type=int, default=10,
+                        help='Epochs without val_loss improvement before stopping. Default = 10.')
+    parser.add_argument('--early_stopping_min_delta', type=float, default=0.0,
+                        help='Minimum val_loss improvement to reset patience. Default = 0.0.')
     arguments = parser.parse_args()
 
     main(**vars(arguments))

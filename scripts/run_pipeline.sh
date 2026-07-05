@@ -22,6 +22,8 @@
 #   -R  retrain num_repetitions (default: 1)
 #   -L  retrain lr_scheduler: cosine|reduce_on_plateau|exponential|multistep|None (default: None)
 #   -A  pass to enable retrain data_augmentation (flag, no value)
+#   -T  pass to enable retrain early stopping (flag, no value)
+#   -P  retrain early_stopping_patience (default: 10, only used if -T is passed)
 #
 # Optional (skip steps, e.g. to only regenerate the infographic):
 #   -S  comma-separated steps to skip: evolve,retrain,infographic (default: none)
@@ -41,9 +43,11 @@ retrain_max_epochs=300
 retrain_num_repetitions=1
 lr_scheduler="None"
 data_augmentation_flag=""
+early_stopping_flag=""
+early_stopping_patience=10
 skip_steps=""
 
-while getopts "e:c:d:n:m:C:g:E:R:L:AS:" opt; do
+while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:" opt; do
     case "$opt" in
         e) experiment_path="$OPTARG" ;;
         c) config_file="$OPTARG" ;;
@@ -56,6 +60,8 @@ while getopts "e:c:d:n:m:C:g:E:R:L:AS:" opt; do
         R) retrain_num_repetitions="$OPTARG" ;;
         L) lr_scheduler="$OPTARG" ;;
         A) data_augmentation_flag="--data_augmentation" ;;
+        T) early_stopping_flag="--early_stopping_enabled" ;;
+        P) early_stopping_patience="$OPTARG" ;;
         S) skip_steps="$OPTARG" ;;
         *) echo "Unknown option"; exit 1 ;;
     esac
@@ -109,7 +115,9 @@ if should_run "retrain"; then
         --num_repetitions "$retrain_num_repetitions" \
         --max_epochs "$retrain_max_epochs" \
         --lr_scheduler "$lr_scheduler" \
-        $data_augmentation_flag
+        --early_stopping_patience "$early_stopping_patience" \
+        $data_augmentation_flag \
+        $early_stopping_flag
 else
     echo "=== [2/3] Retrain: skipped ==="
 fi
