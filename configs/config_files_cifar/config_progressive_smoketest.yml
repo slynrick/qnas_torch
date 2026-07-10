@@ -1,0 +1,71 @@
+# Tiny/fast variant of config_progressive.yml, for smoke-testing the discrete
+# progressive-growth pipeline end-to-end (evolve -> retrain -> infographic).
+
+QNAS:
+    crossover_rate: 0.5
+    max_generations: 2
+    max_num_nodes: 6
+    num_quantum_ind: 2
+    penalize_number: 3
+    repetition: 2
+    replace_method: best
+    update_quantum_gen: 1
+    update_quantum_rate: 0.1
+    save_data_freq: 1
+    crossover_frequency: 1
+    pop_crossover_rate: 0.4
+    pop_crossover_method: hux
+    patience: 60
+
+    progressive_stages:
+        - {gen_start: 0, num_nodes: 4, num_ops: 11}
+        - {gen_start: 1, num_nodes: 6, num_ops: 6}
+
+    params_ranges:
+        decay: 0.9
+        learning_rate: 0.001
+        momentum: 0.0
+        weight_decay: 1.0e-4
+
+    function_dict:  {'conv_1_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 32}, 'prob': 1.0/2.0/10.0},
+                     'conv_1_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 64}, 'prob': 1.0/2.0/10.0},
+                     'conv_3_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 32}, 'prob': 1.0/2.0/10.0},
+                     'conv_3_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 64}, 'prob': 1.0/2.0/10.0},
+                     'mbconv_3_1_32':  {'function': 'MBConv', 'params': {'kernel': 3, 'strides': 1,  'filters': 32}, 'prob': 1.0/2.0/10.0},
+                     'mbconv_3_1_64':  {'function': 'MBConv', 'params': {'kernel': 3, 'strides': 1,  'filters': 64}, 'prob': 1.0/2.0/10.0},
+                     'mbconv_3_1_128': {'function': 'MBConv', 'params': {'kernel': 3, 'strides': 1,  'filters': 128}, 'prob': 1.0/2.0/10.0},
+                     'mbconv_3_1_256': {'function': 'MBConv', 'params': {'kernel': 3, 'strides': 1,  'filters': 256}, 'prob': 1.0/2.0/10.0},
+                     'mbconv_5_1_32':  {'function': 'MBConv', 'params': {'kernel': 5, 'strides': 1,  'filters': 32}, 'prob': 1.0/2.0/10.0},
+                     'mbconv_5_1_64':  {'function': 'MBConv', 'params': {'kernel': 5, 'strides': 1,  'filters': 64}, 'prob': 1.0/2.0/10.0},
+                     'no_op':        {'function': 'NoOp', 'params': {}, 'prob': 1.0/2.0}}
+
+train:
+    batch_size: 32
+    eval_batch_size: 32
+    max_epochs: 2
+    epochs_to_eval: 1
+    optimizer: AdamW
+    fitness_metric: best_loss
+    mo_metric_base: loss
+    mixed_precision: True
+    available_gpus: [0]
+    device: cuda:0
+
+    # Dataset
+    dataset: Cifar10
+    data_augmentation: False
+    subtract_mean: True
+    limit_data: True
+    limit_data_value: 512
+    num_workers: 2
+    network_config: default
+    network_gap: False
+
+    save_checkpoints_epochs: 1
+    save_summary_epochs: 1.0
+    threads: 1
+
+    weight_reuse_enabled: True
+
+    max_params: 1300000
+    max_inference_time: 6400

@@ -280,26 +280,13 @@ class QPopulationNetwork(QPopulation):
         self.probabilities[mask] = self._update(self.probabilities[mask], best_classic[mask],
                                                 update_value)
 
-    # ------------------------------------------------------------------
-    # MixedOp mode: PDF (alpha logits) representation
-    # ------------------------------------------------------------------
-
-    def initialize_alpha_logits(self):
-        """Initialize quantum representation as real-valued alpha logits (all zeros →
-        uniform softmax). Shape: [num_ind, num_nodes, num_functions].
-        """
-        self.alpha_logits = np.zeros(
-            (self.num_ind, self.chromosome.num_genes, self.chromosome.num_functions),
-            dtype=np.float64,
-        )
-
-    def grow_and_prune(self, new_num_nodes: int, new_fn_list: list):
-        """Resize the quantum alpha_logits for a P-DARTS-style progressive stage transition.
-
-        Grows the node axis (new nodes start at zero logits → uniform softmax, matching
-        initialize_alpha_logits's convention) and prunes the op axis down to *new_fn_list*
-        (ops dropped from fn_list are simply removed; kept ops carry their trained logits
-        over, matched by name since pruning can reorder indices).
+    def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list):
+        """Resize *self.probabilities* (the quantum PMF) for a P-DARTS-style progressive
+        stage transition: grow the node axis (new nodes start uniform over *new_fn_list*)
+        and prune the op axis to *new_fn_list* (kept ops carry over their probability
+        mass, matched by name since pruning can reorder indices; each node's row is
+        renormalized afterwards so it still sums to 1, as required by
+        generate_classical()'s np.random.choice(..., p=...)).
 
         Args:
             new_num_nodes: new depth (>= current depth).
@@ -310,77 +297,29 @@ class QPopulationNetwork(QPopulation):
         old_op_idx = {name: i for i, name in enumerate(old_fn_list)}
         new_op_idx = {name: i for i, name in enumerate(new_fn_list)}
         shared_ops = set(old_fn_list) & set(new_fn_list)
-
-        new_alpha_logits = np.zeros(
-            (self.num_ind, new_num_nodes, len(new_fn_list)), dtype=np.float64,
-        )
         carry_over_nodes = min(old_num_nodes, new_num_nodes)
-        for op_name in shared_ops:
-            old_i, new_i = old_op_idx[op_name], new_op_idx[op_name]
-            new_alpha_logits[:, :carry_over_nodes, new_i] = \
-                self.alpha_logits[:, :carry_over_nodes, old_i]
 
-        self.alpha_logits = new_alpha_logits
+        new_probabilities = np.full(
+            (self.num_ind, new_num_nodes, len(new_fn_list)),
+            1.0 / len(new_fn_list),
+            dtype=self.dtype,
+        )
 
-        # self.probabilities (discrete-mode PMF) isn't used for individual generation in
-        # mixedop mode, but save_data()/load_qnas_data() serialize it unconditionally -
-        # keep its shape consistent with the new node/op counts too.
-        new_probabilities = np.tile(
-            np.full(len(new_fn_list), 1.0 / len(new_fn_list)),
-            (self.num_ind, new_num_nodes, 1),
+        carried = np.zeros(
+            (self.num_ind, carry_over_nodes, len(new_fn_list)), dtype=self.dtype,
         )
         for op_name in shared_ops:
             old_i, new_i = old_op_idx[op_name], new_op_idx[op_name]
-            new_probabilities[:, :carry_over_nodes, new_i] = \
-                self.probabilities[:, :carry_over_nodes, old_i]
-        self.probabilities = new_probabilities
+            carried[:, :, new_i] = self.probabilities[:, :carry_over_nodes, old_i]
 
+        row_sums = carried.sum(axis=-1, keepdims=True)
+        safe_sums = np.where(row_sums > 1e-12, row_sums, 1.0)
+        carried_normalized = np.where(
+            row_sums > 1e-12, carried / safe_sums, 1.0 / len(new_fn_list),
+        )
+        new_probabilities[:, :carry_over_nodes, :] = carried_normalized
+
+        self.probabilities = new_probabilities
         self.chromosome.fn_list = new_fn_list
         self.chromosome.num_functions = len(new_fn_list)
         self.chromosome.set_num_genes(new_num_nodes)
-
-    def generate_classical_mixedop(self, sigma: float = 0.1) -> np.ndarray:
-        """Generate classical individuals as alpha logit matrices (PDF mode).
-
-        Each classical individual = quantum alpha_logits + N(0, sigma) noise.
-
-        Args:
-            sigma: std of Gaussian noise added to alpha_logits for diversification.
-
-        Returns:
-            np.ndarray of shape [num_ind * repetition, num_nodes, num_functions].
-        """
-        # Tile quantum logits for each repetition
-        tiled = np.tile(self.alpha_logits, (self.repetition, 1, 1))
-        noise = np.random.normal(0.0, sigma, size=tiled.shape)
-        return tiled + noise
-
-    def update_quantum_from_alpha(self, trained_alphas: np.ndarray,
-                                   best_indices: np.ndarray,
-                                   intensity: float):
-        """Update alpha_logits using trained alpha values from MixedOp training.
-
-        For each quantum individual i, blends its alpha_logits toward the trained
-        alpha of the best-ranked classical individual associated with it.
-
-        Args:
-            trained_alphas: np.ndarray [total_ind, num_nodes, num_functions].
-            best_indices: ordered indices of classical individuals (best first).
-            intensity: blending weight in [0, 1].
-        """
-        random = np.random.rand(self.num_ind, self.chromosome.num_genes)
-        mask_ind, mask_node = np.where(random <= self.update_quantum_rate)
-
-        for q_idx in range(self.num_ind):
-            # Best classical individual for this quantum individual
-            ind_idx = best_indices[q_idx] if q_idx < len(best_indices) else q_idx
-            if ind_idx >= len(trained_alphas):
-                continue
-            trained_alpha = trained_alphas[ind_idx]  # [num_nodes, num_functions]
-
-            # Select nodes that pass the stochastic gate for this quantum individual
-            nodes_to_update = mask_node[mask_ind == q_idx]
-            for node in nodes_to_update:
-                # EMA: shift alpha_logits toward trained alpha logits
-                diff = trained_alpha[node] - self.alpha_logits[q_idx, node]
-                self.alpha_logits[q_idx, node] += intensity * diff

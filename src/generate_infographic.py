@@ -1,12 +1,14 @@
 """ Generate a single-page infographic summarizing a Q-NAS search (and, if present,
     a retrain phase) run: fitness over generations, the best network found, and
-    weight-bank / transfer-learning reuse rates.
+    architecture-cache reuse rates.
 """
 
 import argparse
 import glob
 import json
 import os
+import re
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,6 +17,9 @@ from matplotlib import gridspec
 from matplotlib.patches import FancyBboxPatch
 
 from util import load_pkl, load_yaml
+
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+")
+_HHMM_RE = re.compile(r"(\d+)h:?(\d+)m")
 
 # --- palette -----------------------------------------------------------
 BG = "#0f172a"
@@ -60,11 +65,30 @@ def load_generation_data(experiment_path):
     return load_pkl(data_path)
 
 
-def load_best_network(experiment_path):
-    best_path = os.path.join(experiment_path, "best_network_collapsed.pkl")
-    if not os.path.exists(best_path):
+def load_best_network(experiment_path, gen_data):
+    """ The best individual is already a concrete, discrete network (no MixedOp
+    "collapsing" step needed) - its net_list lives in its own training_params.txt,
+    at the folder pointed to by the last generation's best_so_far_id.
+    """
+    if not gen_data:
         return None
-    return load_pkl(best_path)
+    last_gen = max(gen_data.keys())
+    best_so_far_id = gen_data[last_gen].get("best_so_far_id")
+    if not best_so_far_id:
+        return None
+    gen, idx = best_so_far_id
+    params_path = os.path.join(experiment_path, f"{gen}_{idx}", "training_params.txt")
+    if not os.path.exists(params_path):
+        return None
+    params = load_yaml(params_path)
+    net_list = params.get("net_list")
+    if not net_list:
+        return None
+    return {
+        "net_list": net_list,
+        "best_so_far": gen_data[last_gen].get("best_so_far"),
+        "best_so_far_id": best_so_far_id,
+    }
 
 
 def load_individuals(experiment_path):
@@ -88,14 +112,6 @@ def load_individuals(experiment_path):
     return pd.DataFrame(rows)
 
 
-def load_weight_bank(experiment_path):
-    index_path = os.path.join(experiment_path, "weight_bank", "index.json")
-    if not os.path.exists(index_path):
-        return None
-    with open(index_path) as f:
-        return json.load(f)
-
-
 def load_retrain_results(experiment_path):
     for path in glob.glob(os.path.join(experiment_path, "retrain_results_*.txt")):
         with open(path) as f:
@@ -104,6 +120,117 @@ def load_retrain_results(experiment_path):
             except Exception:
                 continue
     return None
+
+
+def _parse_hhmm_seconds(time_str):
+    if not time_str:
+        return None
+    m = _HHMM_RE.match(time_str)
+    if not m:
+        return None
+    hours, minutes = int(m.group(1)), int(m.group(2))
+    return hours * 3600 + minutes * 60
+
+
+def search_wall_time_seconds(experiment_path, gen_data):
+    """Real wall-clock duration of the search, from the first log line's
+    timestamp to the last generation's recorded time (both in log_QNAS.txt /
+    data_QNAS.pkl). Falls back to first-generation-to-last-generation if the
+    log file is missing, since that's still an observed timestamp span.
+    """
+    if not gen_data:
+        return None
+
+    start_dt = None
+    log_path = os.path.join(experiment_path, "log_QNAS.txt")
+    if os.path.exists(log_path):
+        try:
+            with open(log_path) as f:
+                first_line = f.readline()
+            m = _TIMESTAMP_RE.search(first_line)
+            if m:
+                start_dt = datetime.fromisoformat(m.group(0))
+        except Exception:
+            start_dt = None
+
+    last_gen = max(gen_data.keys())
+    end_str = gen_data[last_gen].get("time")
+    if not end_str:
+        return None
+    try:
+        end_dt = datetime.fromisoformat(end_str)
+    except Exception:
+        return None
+
+    if start_dt is None:
+        first_gen = min(gen_data.keys())
+        first_str = gen_data[first_gen].get("time")
+        if not first_str:
+            return None
+        try:
+            start_dt = datetime.fromisoformat(first_str)
+        except Exception:
+            return None
+
+    return (end_dt - start_dt).total_seconds()
+
+
+def load_retrain_runs(experiment_path):
+    """Per-repetition retrain accuracy/duration, read from retrain_*/ dirs
+    (best_accuracy.txt + retraining_params.txt's t0/t1). Falls back to the
+    legacy aggregate retrain_results_*.txt format if no per-run dirs exist.
+    """
+    runs = []
+    for acc_path in sorted(glob.glob(os.path.join(experiment_path, "retrain_*", "best_accuracy.txt"))):
+        run_dir = os.path.dirname(acc_path)
+        try:
+            accuracy = load_yaml(acc_path).get("best_accuracy")
+        except Exception:
+            accuracy = None
+        if accuracy is None:
+            continue
+
+        duration_s = None
+        params_path = os.path.join(run_dir, "retraining_params.txt")
+        if os.path.exists(params_path):
+            try:
+                params = load_yaml(params_path)
+                t0, t1 = params.get("t0"), params.get("t1")
+                if t0 is not None and t1 is not None:
+                    duration_s = float(t1) - float(t0)
+            except Exception:
+                duration_s = None
+
+        runs.append({
+            "label": os.path.basename(run_dir),
+            "accuracy": float(accuracy),
+            "duration_s": duration_s,
+        })
+
+    if runs:
+        return runs
+
+    aggregate = load_retrain_results(experiment_path)
+    if not aggregate:
+        return []
+    for run_name, res in aggregate.items():
+        acc = res.get("test_accuracy", res.get("best_accuracy"))
+        if acc is None:
+            continue
+        runs.append({
+            "label": run_name,
+            "accuracy": float(acc),
+            "duration_s": _parse_hhmm_seconds(res.get("time")),
+        })
+    return runs
+
+
+def _format_hours(seconds):
+    if seconds is None or seconds != seconds:
+        return "—"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
 
 
 def load_run_config(experiment_path):
@@ -130,30 +257,29 @@ def _total_individuals_evaluated(gen_data):
     return int(gen_data[last_gen].get("total_eval", 0))
 
 
-def draw_header(fig, gs_row, experiment_path, gen_data, indiv_df, run_config):
+def draw_header(fig, gs_row, experiment_path, gen_data, indiv_df, run_config, search_time_s):
     ax = fig.add_subplot(gs_row)
     ax.set_facecolor(BG)
     ax.axis("off")
 
     name = os.path.basename(os.path.normpath(experiment_path))
-    qnas_cfg = run_config.get("QNAS", {})
-    mixedop = qnas_cfg.get("mixedop_mode", False)
     n_generations = len(gen_data) if gen_data else 0
     n_individuals = _total_individuals_evaluated(gen_data) or len(indiv_df)
 
-    avg_time = indiv_df["training_time"].mean() if not indiv_df.empty else np.nan
-    if avg_time == avg_time and n_individuals:
-        # Per-individual dirs may have been pruned from disk (e.g. weight reuse
-        # cleanup), so scale the observed average up to the full evaluated count.
-        total_time_h = avg_time * n_individuals / 3600
-        time_label = f"~{total_time_h:.1f}h (estimated)"
+    if search_time_s is not None:
+        time_label = _format_hours(search_time_s)
     else:
-        time_label = "—"
+        avg_time = indiv_df["training_time"].mean() if not indiv_df.empty else np.nan
+        if avg_time == avg_time and n_individuals:
+            # Per-individual dirs may have been pruned from disk (e.g. weight reuse
+            # cleanup), so scale the observed average up to the full evaluated count.
+            time_label = f"~{_format_hours(avg_time * n_individuals)} (estimated)"
+        else:
+            time_label = "—"
 
     ax.text(0, 0.75, f"Q-NAS Search Report — {name}", color=INK, fontsize=22,
             fontweight="bold", transform=ax.transAxes, va="top")
-    mode_label = "MixedOperation (DARTS-style)" if mixedop else "Discrete"
-    subtitle = f"Mode: {mode_label}   |   Generations: {n_generations}   |   Individuals evaluated: {n_individuals}   |   Total training time: {time_label}"
+    subtitle = f"Generations: {n_generations}   |   Individuals evaluated: {n_individuals}   |   Search time: {time_label}"
     ax.text(0, 0.25, subtitle, color=MUTED, fontsize=11, transform=ax.transAxes, va="top")
 
 
@@ -195,9 +321,8 @@ def draw_pareto_scatter(fig, gs_cell, indiv_df):
 
     df = indiv_df.dropna(subset=["total_trainable_params", "best_accuracy"])
     sizes = 40 + 200 * (df["cuda_inference_time"].fillna(0) / max(df["cuda_inference_time"].max(), 1))
-    colors = [ACCENT_2 if reused else ACCENT for reused in df["weight_reuse_applied"]]
     ax.scatter(df["total_trainable_params"] / 1e6, df["best_accuracy"], s=sizes,
-               c=colors, alpha=0.75, edgecolors=BG, linewidths=0.5)
+               c=ACCENT, alpha=0.75, edgecolors=BG, linewidths=0.5)
     ax.set_xlabel("params (M)", color=MUTED, fontsize=9)
     ax.set_ylabel("best accuracy / fitness", color=MUTED, fontsize=9)
 
@@ -208,7 +333,7 @@ def draw_genome_strip(fig, gs_cell, best_net):
     ax.set_xticks([])
     ax.set_yticks([])
     if not best_net or not best_net.get("net_list"):
-        ax.text(0.5, 0.5, "no best_network_collapsed.pkl found", color=MUTED,
+        ax.text(0.5, 0.5, "no best network found", color=MUTED,
                 ha="center", va="center", transform=ax.transAxes)
         return
 
@@ -233,92 +358,80 @@ def draw_genome_strip(fig, gs_cell, best_net):
             fontsize=9, color=MUTED)
 
 
-def draw_weight_reuse_panel(fig, gs_cell, indiv_df, weight_bank):
+def draw_timing_panel(fig, gs_cell, search_time_s, retrain_runs):
     ax = fig.add_subplot(gs_cell)
-    _style_axes(ax, "Weight reuse / transfer learning")
-    ax.set_xticks([])
-    ax.set_yticks([])
+    _style_axes(ax, "Search vs. retrain time")
 
-    if indiv_df.empty:
-        ax.text(0.5, 0.5, "no per-individual data found", color=MUTED, ha="center", va="center",
+    durations = [r["duration_s"] for r in retrain_runs if r.get("duration_s") is not None]
+    mean_retrain_s = float(np.mean(durations)) if durations else None
+
+    if search_time_s is None and mean_retrain_s is None:
+        ax.text(0.5, 0.5, "no timing data found", color=MUTED, ha="center", va="center",
                 transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
         return
 
-    n_total = len(indiv_df)
-    n_reused = int(indiv_df["weight_reuse_applied"].sum())
-    hit_rate = n_reused / n_total if n_total else 0.0
+    labels, values_h, colors = [], [], []
+    if search_time_s is not None:
+        labels.append("search")
+        values_h.append(search_time_s / 3600)
+        colors.append(ACCENT)
+    if mean_retrain_s is not None:
+        labels.append(f"retrain (n={len(durations)})")
+        values_h.append(mean_retrain_s / 3600)
+        colors.append(ACCENT_2)
 
-    # Use explicit data coordinates for both the pie and the text so they share
-    # one coordinate system (ax.pie's `center`/`radius` are data coords, not axes
-    # fractions - mixing the two caused the pie and text to overlap previously).
-    ax.set_xlim(-1.3, 2.6)
-    ax.set_ylim(-1.3, 1.3)
-    ax.set_aspect("equal")
-
-    wedge_colors = [ACCENT_2, GRID] if n_reused else [GRID]
-    wedge_values = [n_reused, n_total - n_reused] if n_reused else [1]
-    ax.pie(wedge_values, colors=wedge_colors, startangle=90,
-           wedgeprops=dict(width=0.38, edgecolor=BG, linewidth=2),
-           radius=1.15, center=(0, 0))
-    ax.text(0, 0, f"{hit_rate*100:.0f}%", ha="center", va="center", fontsize=15,
-            color=INK, fontweight="bold")
-
-    bank_size = len(weight_bank) if weight_bank else 0
-    reused_time = indiv_df.loc[indiv_df["weight_reuse_applied"], "training_time"].mean()
-    scratch_time = indiv_df.loc[~indiv_df["weight_reuse_applied"], "training_time"].mean()
-    lines = [f"{n_reused}/{n_total} individuals reused weights", f"weight bank size: {bank_size}"]
-    if reused_time == reused_time and scratch_time == scratch_time:
-        lines.append(f"avg train time — reused: {reused_time:.0f}s, scratch: {scratch_time:.0f}s")
-    elif reused_time == reused_time:
-        lines.append(f"avg train time (reused): {reused_time:.0f}s")
-    elif scratch_time == scratch_time:
-        lines.append(f"avg train time (scratch): {scratch_time:.0f}s")
-
-    ax.text(1.5, 0.4, "\n\n".join(lines), ha="left", va="top", fontsize=9, color=MUTED)
+    bars = ax.barh(labels, values_h, color=colors, height=0.5)
+    ax.set_xlabel("hours", color=MUTED, fontsize=9)
+    ax.tick_params(axis="y", colors=INK, labelsize=9)
+    # Widen the left margin within this panel's own cell so long y-tick labels
+    # (e.g. "retrain (n=2)") aren't clipped by the figure edge.
+    pos = ax.get_position()
+    ax.set_position([pos.x0 + 0.035, pos.y0, pos.width - 0.035, pos.height])
+    for bar, val in zip(bars, values_h):
+        ax.text(val, bar.get_y() + bar.get_height() / 2, f"  {val:.2f}h", va="center",
+                ha="left", color=INK, fontsize=9)
 
 
-def draw_alpha_trend(fig, gs_cell, gen_data):
+def draw_stage_timeline(fig, gs_cell, gen_data):
+    """Plot progressive-stage growth over the search: node count and op-menu size per
+    generation (only populated when the run used QNAS.progressive_stages).
+    """
     ax = fig.add_subplot(gs_cell)
-    _style_axes(ax, "Alpha confidence (MixedOp)")
+    _style_axes(ax, "Progressive stage growth")
 
     gens = sorted(gen_data.keys()) if gen_data else []
-    gens_with_alpha = [g for g in gens if "alpha_logits" in gen_data[g]]
-    if not gens_with_alpha:
-        ax.text(0.5, 0.5, "discrete-mode run — no alpha logits", color=MUTED,
+    gens_with_stage = [g for g in gens if "fn_list" in gen_data[g]]
+    if not gens_with_stage:
+        ax.text(0.5, 0.5, "no progressive_stages configured", color=MUTED,
                 ha="center", va="center", transform=ax.transAxes)
         ax.set_xticks([])
         ax.set_yticks([])
         return
 
-    mean_conf, max_conf = [], []
-    for g in gens_with_alpha:
-        alphas = np.asarray(gen_data[g]["alpha_logits"], dtype=float)  # [pop, nodes, ops]
-        exp = np.exp(alphas - alphas.max(axis=-1, keepdims=True))
-        softmax = exp / exp.sum(axis=-1, keepdims=True)
-        max_conf.append(softmax.max(axis=-1).mean())
-        entropy = -(softmax * np.log(softmax + 1e-12)).sum(axis=-1)
-        mean_conf.append(entropy.mean())
+    num_nodes = [gen_data[g]["num_net_nodes"] for g in gens_with_stage]
+    num_ops = [len(gen_data[g]["fn_list"]) for g in gens_with_stage]
 
     ax2 = ax.twinx()
     ax2.tick_params(colors=MUTED, labelsize=8)
     for spine in ax2.spines.values():
         spine.set_visible(False)
 
-    ax.plot(gens_with_alpha, max_conf, color=ACCENT_3, marker="o", markersize=5,
-            linewidth=2.2, label="mean max-softmax")
-    ax2.plot(gens_with_alpha, mean_conf, color=ACCENT, marker="s", markersize=4,
-            linewidth=1.6, linestyle="--", label="mean entropy")
+    ax.plot(gens_with_stage, num_nodes, color=ACCENT_3, marker="o", markersize=5,
+            linewidth=2.2, label="num nodes")
+    ax2.plot(gens_with_stage, num_ops, color=ACCENT, marker="s", markersize=4,
+            linewidth=1.6, linestyle="--", label="num ops")
     ax.set_xlabel("generation", color=MUTED, fontsize=9)
-    ax.set_ylabel("confidence", color=ACCENT_3, fontsize=9)
-    ax2.set_ylabel("entropy", color=ACCENT, fontsize=9)
-    ax.set_xticks(gens_with_alpha)
+    ax.set_ylabel("num nodes", color=ACCENT_3, fontsize=9)
+    ax2.set_ylabel("num ops", color=ACCENT, fontsize=9)
 
 
-def draw_retrain_panel(fig, gs_cell, retrain_results, indiv_df):
+def draw_retrain_panel(fig, gs_cell, retrain_runs, indiv_df):
     ax = fig.add_subplot(gs_cell)
-    _style_axes(ax, "Retrain comparison")
+    _style_axes(ax, "Accuracy: search vs. retrain")
     ax.set_xticks([])
-    if not retrain_results:
+    if not retrain_runs:
         ax.text(0.5, 0.5, "no retrain results found", color=MUTED, ha="center", va="center",
                 transform=ax.transAxes)
         ax.set_yticks([])
@@ -328,17 +441,11 @@ def draw_retrain_panel(fig, gs_cell, retrain_results, indiv_df):
     search_best_params = indiv_df.loc[indiv_df["best_accuracy"].idxmax(), "total_trainable_params"] \
         if not indiv_df.empty and indiv_df["best_accuracy"].notna().any() else None
 
-    retrain_accs = []
-    retrain_params = []
-    for run_name, res in retrain_results.items():
-        acc = res.get("test_accuracy", res.get("best_accuracy"))
-        if acc is not None:
-            retrain_accs.append(acc)
-            retrain_params.append(res.get("total_trainable_params"))
+    retrain_accs = [r["accuracy"] for r in retrain_runs]
 
     labels = ["best in search"] + [f"retrain {i+1}" for i in range(len(retrain_accs))]
     values = [search_best] + retrain_accs
-    params_labels = [search_best_params] + retrain_params
+    params_labels = [search_best_params] + [None] * len(retrain_accs)
     colors = [ACCENT] + [ACCENT_2] * len(retrain_accs)
     bars = ax.bar(labels, values, color=colors, width=0.5)
     ax.set_ylabel("accuracy", color=MUTED, fontsize=9)
@@ -354,7 +461,7 @@ def draw_retrain_panel(fig, gs_cell, retrain_results, indiv_df):
                     color=BG, fontsize=7.5, fontweight="bold")
 
 
-def draw_stat_tiles(fig, gs_row, indiv_df, weight_bank, gen_data):
+def draw_stat_tiles(fig, gs_row, indiv_df, gen_data, search_time_s, retrain_runs, num_gpus):
     ax = fig.add_subplot(gs_row)
     ax.set_facecolor(BG)
     ax.axis("off")
@@ -362,23 +469,26 @@ def draw_stat_tiles(fig, gs_row, indiv_df, weight_bank, gen_data):
     best_acc = indiv_df["best_accuracy"].max() if not indiv_df.empty else None
     best_params = indiv_df.loc[indiv_df["best_accuracy"].idxmax(), "total_trainable_params"] \
         if not indiv_df.empty and indiv_df["best_accuracy"].notna().any() else None
-    n_individuals = _total_individuals_evaluated(gen_data) or len(indiv_df)
-    avg_time = indiv_df["training_time"].mean() if not indiv_df.empty else np.nan
-    # Single-GPU-equivalent compute time: sum of each individual's own training
-    # time, regardless of how many ran in parallel (threads) - the standard
-    # "GPU-days" accounting used to report NAS search cost.
-    total_time_s = avg_time * n_individuals if avg_time == avg_time and n_individuals else 0
-    total_time_h = total_time_s / 3600
-    gpu_days = total_time_s / 86400
-    hit_rate = indiv_df["weight_reuse_applied"].mean() * 100 if not indiv_df.empty else 0
     n_generations = len(gen_data) if gen_data else 0
+    # GPU-days = wall-clock search time * number of physical GPUs used. Threads
+    # sharing one GPU don't add throughput, so this is wall time * len(available_gpus),
+    # not a sum of per-individual durations (those threads contend for the same
+    # GPU(s), and only a handful of individual dirs typically survive on disk to
+    # average over, making a per-individual extrapolation unreliable).
+    gpu_days = (search_time_s * num_gpus / 86400) if search_time_s is not None else None
+
+    retrain_accs = [r["accuracy"] for r in retrain_runs]
+    retrain_durations = [r["duration_s"] for r in retrain_runs if r.get("duration_s") is not None]
+    mean_retrain_acc = float(np.mean(retrain_accs)) if retrain_accs else None
+    mean_retrain_time_s = float(np.mean(retrain_durations)) if retrain_durations else None
 
     tiles = [
-        ("Best fitness", f"{best_acc:.2f}" if best_acc is not None else "—"),
+        ("Best acc (search)", f"{best_acc:.2f}" if best_acc is not None else "—"),
+        ("Mean acc (retrain)", f"{mean_retrain_acc:.2f}" if mean_retrain_acc is not None else "—"),
         ("Best model size", f"{best_params/1e6:.2f}M" if best_params else "—"),
-        ("Total train time", f"{total_time_h:.1f}h"),
-        ("GPU-days", f"{gpu_days:.2f}"),
-        ("Weight-reuse hit rate", f"{hit_rate:.0f}%"),
+        ("Search time", _format_hours(search_time_s)),
+        ("Mean retrain time", _format_hours(mean_retrain_time_s)),
+        ("GPU-days (search)", f"{gpu_days:.2f}" if gpu_days is not None else "—"),
         ("Generations run", f"{n_generations}"),
     ]
 
@@ -398,11 +508,12 @@ def draw_stat_tiles(fig, gs_row, indiv_df, weight_bank, gen_data):
 
 def generate_infographic(experiment_path, output_path):
     gen_data = load_generation_data(experiment_path)
-    best_net = load_best_network(experiment_path)
+    best_net = load_best_network(experiment_path, gen_data)
     indiv_df = load_individuals(experiment_path)
-    weight_bank = load_weight_bank(experiment_path)
-    retrain_results = load_retrain_results(experiment_path)
+    retrain_runs = load_retrain_runs(experiment_path)
     run_config = load_run_config(experiment_path)
+    search_time_s = search_wall_time_seconds(experiment_path, gen_data)
+    num_gpus = len(run_config.get("train", {}).get("available_gpus") or [1])
 
     plt.rcParams["font.family"] = "sans-serif"
     fig = plt.figure(figsize=(16, 18), facecolor=BG)
@@ -413,14 +524,14 @@ def generate_infographic(experiment_path, output_path):
         left=0.05, right=0.94, top=0.97, bottom=0.03,
     )
 
-    draw_header(fig, gs[0, :], experiment_path, gen_data, indiv_df, run_config)
+    draw_header(fig, gs[0, :], experiment_path, gen_data, indiv_df, run_config, search_time_s)
     draw_fitness_curve(fig, gs[1, 0], gen_data)
     draw_pareto_scatter(fig, gs[1, 1], indiv_df)
     draw_genome_strip(fig, gs[2, :], best_net)
-    draw_weight_reuse_panel(fig, gs[3, 0], indiv_df, weight_bank)
-    draw_alpha_trend(fig, gs[3, 1], gen_data)
-    draw_retrain_panel(fig, gs[4, :], retrain_results, indiv_df)
-    draw_stat_tiles(fig, gs[5, :], indiv_df, weight_bank, gen_data)
+    draw_timing_panel(fig, gs[3, 0], search_time_s, retrain_runs)
+    draw_stage_timeline(fig, gs[3, 1], gen_data)
+    draw_retrain_panel(fig, gs[4, :], retrain_runs, indiv_df)
+    draw_stat_tiles(fig, gs[5, :], indiv_df, gen_data, search_time_s, retrain_runs, num_gpus)
 
     fig.savefig(output_path, dpi=180, facecolor=BG)
     plt.close(fig)

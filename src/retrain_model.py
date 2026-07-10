@@ -14,10 +14,16 @@ import time
 
 def main(**args):
 
-    logger = init_log(args['log_level'], name=__name__)
     # Check if *experiment_path* contains all the necessary files to retrain an evolved model
     experiment_path = args['experiment_path']
     check_files(args['experiment_path'])
+
+    # retrain.log lands directly in experiment_path, alongside train.log and the
+    # search's other artifacts - same file cnn/train_detailed.py's LOGGER writes to
+    # (via experiment_path_root below), so this module's own top-level messages
+    # ("Retraining evolved model...", "Saving results...", etc.) end up there too.
+    logger = init_log(args['log_level'], name=__name__,
+                      file_path=os.path.join(experiment_path, 'retrain.log'))
     
     config_code = args['config_code']
 

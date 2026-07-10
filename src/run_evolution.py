@@ -36,7 +36,6 @@ def main(**args):
     status_message = "Dataset is already downloaded." if dataset_status else "Dataset downloaded successfully."
     logger.info(status_message)
     
-    mixedop_mode = config.QNAS_spec.get('mixedop_mode', False)
     weight_reuse_enabled = config.train_spec.get('weight_reuse_enabled', False)
     fn_list = config.QNAS_spec.get('fn_list', [])
 
@@ -44,7 +43,6 @@ def main(**args):
         params=config.train_spec,
         fn_dict=config.fn_dict,
         log_level=config.train_spec['log_level'],
-        mixedop_mode=mixedop_mode,
         fn_list=fn_list,
         weight_reuse_enabled=weight_reuse_enabled,
     )
@@ -53,7 +51,6 @@ def main(**args):
                         log_file=config.files_spec['log_file'],
                         log_level=config.train_spec['log_level'],
                         data_file=config.files_spec['data_file'])
-    qnas_cnn.weight_reuse_enabled = weight_reuse_enabled
 
     qnas_cnn.initialize_qnas(**config.QNAS_spec)
 
@@ -104,23 +101,12 @@ if __name__ == '__main__':
                         help='Network structure configuration.', default='default',
                         choices=['default', 'dense'])
 
-    # MixedOp (DARTS-style) mode
-    parser.add_argument('--mixedop_mode', action='store_true',
-                        help='Enable MixedOperation mode (DARTS-style PDF quantum representation). '
-                             'Default = False.')
-    parser.add_argument('--alpha_noise_std', type=float, default=0.1,
-                        help='Std of Gaussian noise added to alpha_logits when generating '
-                             'classical individuals in mixedop_mode. Default = 0.1.')
-
-    # Fitness cache (reuse cached fitness for architectures with close alpha weights,
-    # skipping training entirely on a cache hit)
+    # Fitness cache (reuse a classical individual's cached fitness when the exact same
+    # architecture reappears, e.g. carried forward by elitism, skipping training entirely).
+    # Stored in a single experiment_path/cache.json, shared across all progressive stages.
     parser.add_argument('--weight_reuse_enabled', action='store_true',
-                        help='Enable the fitness cache for architectures with close alpha '
-                             'weights. Default = False.')
-    parser.add_argument('--weight_bank_dir', type=str, default='',
-                        help='Directory for the fitness cache (defaults to experiment_path/weight_bank).')
-    parser.add_argument('--cosine_threshold', type=float, default=0.05,
-                        help='Max cosine distance for a cache hit. Default = 0.05.')
+                        help='Enable the fitness cache for repeated architectures. '
+                             'Default = False.')
 
     arguments = parser.parse_args()
 

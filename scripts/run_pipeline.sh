@@ -3,8 +3,8 @@
 # Each step only runs if the previous one succeeded.
 #
 # Usage:
-#   scripts/run_pipeline.sh -e experiment_cifar10_mixedop/exp1 \
-#       -c configs/config_files_cifar/config_mixedop.yml -d cifar10
+#   scripts/run_pipeline.sh -e experiment_cifar10_progressive/exp1 \
+#       -c configs/config_files_cifar/config_progressive.yml -d cifar10
 #
 # Required:
 #   -e  experiment_path (also used for retrain and infographic)

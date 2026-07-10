@@ -157,23 +157,6 @@ class ConfigParameters(object):
         self.QNAS_spec['early_stopping'] = self.args['early_stopping']
         self.QNAS_spec['en_pop_crossover'] = self.args['en_pop_crossover']
 
-        # MixedOp mode parameters (optional, with defaults).
-        # store_true CLI flags always populate self.args, so `.get(key, fallback)`
-        # never falls through to the config file value - OR them together instead.
-        self.QNAS_spec['mixedop_mode'] = (
-            self.args.get('mixedop_mode', False)
-            or config_file.get('QNAS', {}).get('mixedop_mode', False)
-        )
-        self.QNAS_spec['alpha_noise_std'] = self.args.get(
-            'alpha_noise_std', config_file.get('QNAS', {}).get('alpha_noise_std', 0.1)
-        )
-        # Cap on MixedOp's canonical channel width (see MixedOp docstring in
-        # cnn/mixed_model.py). No CLI flag - config-file only, so there's no
-        # args.get/argparse-default collision to worry about.
-        self.train_spec['mixedop_max_channels'] = config_file.get('train', {}).get(
-            'mixedop_max_channels', None
-        )
-
         # P-DARTS-style progressive depth growth + operation pruning (optional).
         # List of {gen_start, num_nodes, num_ops} stages, sorted by gen_start.
         # Config-file only, no CLI flag.
@@ -184,16 +167,10 @@ class ConfigParameters(object):
                 raise ValueError("progressive_stages must include a stage starting at gen_start=0")
         self.QNAS_spec['progressive_stages'] = stages
 
-        # Weight reuse parameters (optional, with defaults)
+        # Fitness cache (optional, default off) - see src/architecture_cache.py
         self.train_spec['weight_reuse_enabled'] = (
             self.args.get('weight_reuse_enabled', False)
             or config_file.get('train', {}).get('weight_reuse_enabled', False)
-        )
-        self.train_spec['weight_bank_dir'] = self.args.get(
-            'weight_bank_dir', config_file.get('train', {}).get('weight_bank_dir', '')
-        )
-        self.train_spec['cosine_threshold'] = self.args.get(
-            'cosine_threshold', config_file.get('train', {}).get('cosine_threshold', 0.05)
         )
 
         # Per-individual training early stopping (optional, config-file only). Distinct
@@ -420,17 +397,6 @@ class ConfigParameters(object):
         generation = best_individual_info.get('generation', 0)
         individual = best_individual_info.get('individual', 0)
 
-        if not net_list:
-                # MixedOp mode individuals have no discrete net_list in training_params.txt
-                # (they train via alpha logits, not a fixed op-per-node chain) - fall back
-                # to the collapsed network saved by QNAS.collapse_best_network() at the end
-                # of a mixedop_mode run.
-                collapsed_path = os.path.join(experiment_path, 'best_network_collapsed.pkl')
-                if os.path.exists(collapsed_path):
-                        collapsed = load_pkl(collapsed_path)
-                        net_list = collapsed['net_list']
-                        generation, individual = collapsed['best_so_far_id']
-        
         if generation == 0 and individual == 0: # only for old format
                 matches = re.search(r'(\d+)_(\d+)$', best_result_folder)
                 generation = int(matches.group(1))

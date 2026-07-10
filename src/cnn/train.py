@@ -12,17 +12,14 @@ Documentation:
 """
 import logging
 import os
-import shutil
 import time
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Union, Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler
 
 from cnn import model, input, metrics, fitness_utils
-from cnn.mixed_model import MixedNetworkGraph, transfer_weights
 from util import create_info_file, init_log, load_yaml
 
 
@@ -284,8 +281,7 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
                         train_loader: torch.utils.data.DataLoader,
                         val_loader: torch.utils.data.DataLoader,
                         return_val, debug: bool = False,
-                        weight_bank=None,
-                        alpha_vec: Optional[np.ndarray] = None) -> None:
+                        architecture_cache=None) -> None:
     """Train and evaluate a model using evolved hyperparameters.
 
     This function trains and evaluates a convolutional neural network model using the specified
@@ -335,10 +331,13 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     params['num_classes'] = dataset_info['num_classes']
     params['task'] = dataset_info['task']
 
-    # Fitness cache: check BEFORE building any model, so a hit skips model
-    # construction and the warm-up forward pass too, not just training.
-    if weight_bank is not None and alpha_vec is not None:
-        cache_hit = weight_bank.find_cached_result(alpha_vec)
+    # Fitness cache: an architecture (net_list) that was already evaluated - by this
+    # or an earlier generation, e.g. via elitism - reuses its cached fitness instead of
+    # retraining. No weights are stored or reused, only the fitness/params/inference
+    # time values. Checked BEFORE building any model, so a hit skips model construction
+    # and the warm-up forward pass too, not just training.
+    if architecture_cache is not None:
+        cache_hit = architecture_cache.find_cached_result(net_list)
         if cache_hit is not None:
             return_val[0] = cache_hit['fitness']
             return_val[1] = cache_hit['params_m']
@@ -348,12 +347,9 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
             params['training_time'] = 0.0
             params['total_trainable_params'] = cache_hit['params_m'] * 1e6
             params['cuda_inference_time'] = cache_hit['inference_us']
+            params['cache_hit_count'] = cache_hit.get('hit_count', 0)
             LOGGER.info(f"Cache hit for {id_num}: reusing fitness {cache_hit['fitness']:.3f} "
-                        f"from {cache_hit['weights_path']}")
-            try:
-                shutil.copy(cache_hit['weights_path'], os.path.join(model_path, 'best_model.pth'))
-            except OSError:
-                pass
+                        f"for architecture {net_list} (hit #{cache_hit.get('hit_count', 0)})")
             create_info_file(model_path, params, 'training_params.txt')
             return
 
@@ -414,13 +410,21 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
 
         LOGGER.info(f"Training of model {id_num} finished, best {params['fitness_metric']}: {round(return_val[0], 2)}")
 
-        # Save weights and alpha signature for weight bank registration (main process reads these)
+        # Save weights (used by the retrain step / infographic, not by the fitness cache)
         best_model_path = os.path.join(model_path, 'best_model.pth')
         torch.save(model_net.state_dict(), best_model_path)
-        with open(os.path.join(model_path, 'weights_path.txt'), 'w') as _f:
-            _f.write(best_model_path)
-        if alpha_vec is not None:
-            np.save(os.path.join(model_path, 'alpha_signature.npy'), alpha_vec)
+
+        # Update the fitness cache immediately, right after this individual finishes -
+        # not batched at the end of the generation - so any other individual (in this
+        # or a later generation) with the exact same architecture can hit the cache
+        # right away. Safe under concurrent workers: ArchitectureCache.register() does
+        # a locked read-modify-write of cache.json (see architecture_cache.py).
+        if architecture_cache is not None:
+            architecture_cache.register(
+                net_list, fitness=return_val[0],
+                params_m=results_dict['total_trainable_params'],  # already in millions
+                inference_us=results_dict['cuda_inference_time'],
+            )
 
     except (TimeoutError, MemoryError) as e:
         LOGGER.error(f"Exception: {e}")
@@ -431,179 +435,5 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
             return_val[:] = [0.0, 0.0, 0.0]
         else:
             LOGGER.error(f"Exception: {e}")
-            return_val[:] = [0.0, 0.0, 0.0]
-        raise e
-
-
-def fitness_calculation_mixedop(
-    id_num: str,
-    params: Dict[str, Any],
-    fn_dict: Dict[str, Any],
-    fn_list: List[str],
-    alpha_matrix: np.ndarray,
-    train_loader: torch.utils.data.DataLoader,
-    val_loader: torch.utils.data.DataLoader,
-    return_val,
-    debug: bool = False,
-    weight_bank=None,
-    warm_start_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Train and evaluate a MixedNetworkGraph (DARTS-style) individual.
-
-    Each node runs all candidate operations in parallel, combined via softmax(alpha)
-    weights. Alpha is an nn.Parameter updated by gradient descent alongside the network
-    weights. After training, the trained alpha matrix is saved to disk so the main
-    process can update the quantum alpha_logits.
-
-    Args:
-        id_num: "{generation}_{individual}" identifier string.
-        params: training parameters dict.
-        fn_dict: full operation config dict.
-        fn_list: ordered list of operation names (defines alpha column order).
-        alpha_matrix: np.ndarray of shape [num_nodes, num_ops], initial alpha logits
-                      derived from quantum alpha_logits for this individual.
-        train_loader / val_loader: data loaders.
-        return_val: mp.Array('f', 3) for returning (fitness, params_M, infer_us).
-        weight_bank: optional WeightBank snapshot for weight reuse lookup.
-        warm_start_info: optional dict {'state_dict_path', 'old_fn_list', 'old_num_nodes'}
-            set only for the first generation of a new progressive-growth stage - warm-
-            starts this individual from the previous stage's best model instead of the
-            normal (stage-scoped, and at this point still-empty) weight bank lookup.
-    """
-    # Fixed input/batch shape per run - let cudnn autotune the fastest conv algorithms.
-    torch.backends.cudnn.benchmark = True
-
-    _attach_experiment_log_file(params['experiment_path'])
-
-    device = params['device']
-    model_path = os.path.join(params['experiment_path'], id_num)
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
-
-    params['model_path'] = model_path
-    params['generation'] = id_num.split('_')[0]
-    params['individual'] = id_num.split('_')[1]
-
-    LOGGER.info(f"Training MixedOp model {id_num} on device {device} ...")
-
-    if params['dataset'].lower() in input.available_datasets:
-        dataset_info = input.available_datasets[params['dataset'].lower()]
-    else:
-        dataset_info = load_yaml(os.path.join(params['data_path'], 'data_info.txt'))
-
-    params['num_classes'] = dataset_info['num_classes']
-    params['task'] = dataset_info['task']
-
-    # Fitness cache: check BEFORE building any model, so a hit skips model
-    # construction and the warm-up forward pass too, not just training. Progressive
-    # warm-start (below) always applies on its transition generation regardless of
-    # cache state, so the cache is only consulted when there's no warm-start in play.
-    if warm_start_info is None and weight_bank is not None:
-        cache_hit = weight_bank.find_cached_result(alpha_matrix.flatten())
-        if cache_hit is not None:
-            return_val[0] = cache_hit['fitness']
-            return_val[1] = cache_hit['params_m']
-            return_val[2] = cache_hit['inference_us']
-            params['weight_reuse_applied'] = True
-            params['cache_hit'] = True
-            params['training_time'] = 0.0
-            params['total_trainable_params'] = cache_hit['params_m'] * 1e6
-            params['cuda_inference_time'] = cache_hit['inference_us']
-            LOGGER.info(f"Cache hit for {id_num}: reusing fitness {cache_hit['fitness']:.3f} "
-                        f"from {cache_hit['weights_path']}")
-            try:
-                shutil.copy(cache_hit['weights_path'], os.path.join(model_path, 'best_model.pth'))
-            except OSError:
-                pass
-            create_info_file(model_path, params, 'training_params.txt')
-            return
-
-    # Build MixedNetworkGraph
-    model_net = MixedNetworkGraph(
-        num_classes=dataset_info['num_classes'],
-        in_channels=dataset_info['shape'][0],
-        network_gap=params.get('network_gap', False),
-    )
-    model_net.create_mixed_ops(fn_dict=fn_dict, fn_list=fn_list, alpha_matrix=alpha_matrix,
-                                max_channels=params.get('mixedop_max_channels'))
-
-    # Warm-up forward pass to initialise fc layer
-    input_shape = [params['batch_size']] + dataset_info['shape']
-    with torch.no_grad():
-        _ = model_net(torch.randn(input_shape))
-    model_net.to(device)
-    params['input_shape'] = input_shape
-
-    if warm_start_info is not None and os.path.exists(warm_start_info.get('state_dict_path', '')):
-        # Progressive-growth stage transition: warm-start from the previous (shallower/
-        # wider op-set) stage's best model instead of the (still-empty) stage-scoped
-        # weight bank.
-        old_state_dict = torch.load(warm_start_info['state_dict_path'], map_location=device)
-        model_net = transfer_weights(
-            old_state_dict, model_net,
-            old_fn_list=warm_start_info['old_fn_list'],
-            new_fn_list=fn_list,
-            old_num_nodes=warm_start_info['old_num_nodes'],
-        )
-        params['weight_reuse_applied'] = True
-        params['progressive_warm_start'] = True
-        LOGGER.info(f"Progressive warm-start applied for {id_num} from "
-                    f"{warm_start_info['state_dict_path']}")
-
-    criterion = nn.CrossEntropyLoss()
-
-    # Optimizer covers ALL parameters including alpha (registered as nn.Parameter)
-    if params['optimizer'] == 'RMSProp':
-        optimizer = torch.optim.RMSprop(model_net.parameters())
-    elif params['optimizer'] == 'Adam':
-        optimizer = torch.optim.Adam(model_net.parameters())
-    elif params['optimizer'] == 'AdamW':
-        optimizer = torch.optim.AdamW(model_net.parameters())
-    else:
-        optimizer = torch.optim.SGD(model_net.parameters(), lr=params['learning_rate'])
-
-    params['t0'] = time.time()
-
-    try:
-        results_dict = train(model_net, criterion, optimizer, train_loader, val_loader, params, debug)
-        if debug:
-            return results_dict
-
-        if params['fitness_metric'] == 'best_accuracy':
-            return_val[0] = results_dict['best_accuracy']
-        elif params['fitness_metric'] == 'best_loss':
-            return_val[0] = results_dict['fitness_val_loss']
-        elif params['fitness_metric'] == 'scalar_multi_objective':
-            return_val[0] = results_dict['scalar_multi_objective']
-        else:
-            raise ValueError(f"Invalid fitness metric: {params['fitness_metric']}")
-        return_val[1] = results_dict['total_trainable_params']
-        return_val[2] = results_dict['cuda_inference_time']
-
-        LOGGER.info(f"MixedOp model {id_num} finished, best {params['fitness_metric']}: {round(return_val[0], 2)}")
-
-        # Save trained alpha for quantum update feedback (main process reads this)
-        trained_alpha = model_net.get_trained_alpha()
-        np.save(os.path.join(model_path, 'trained_alpha.npy'), trained_alpha)
-
-        # Save weights and alpha signature for weight bank registration
-        best_model_path = os.path.join(model_path, 'best_model.pth')
-        torch.save(model_net.state_dict(), best_model_path)
-        with open(os.path.join(model_path, 'weights_path.txt'), 'w') as _f:
-            _f.write(best_model_path)
-        # Use trained softmax weights (not logits) as the bank signature
-        alpha_t = torch.tensor(trained_alpha, dtype=torch.float32)
-        trained_probs = torch.softmax(alpha_t, dim=-1).numpy()
-        np.save(os.path.join(model_path, 'alpha_signature.npy'), trained_probs.flatten())
-
-    except (TimeoutError, MemoryError) as e:
-        LOGGER.error(f"Exception: {e}")
-        return_val[:] = [0.0, 0.0, 0.0]
-    except Exception as e:
-        if "out of memory" in str(e):
-            LOGGER.error(f"CUDA out of memory exception for {id_num}: {e}")
-            return_val[:] = [0.0, 0.0, 0.0]
-        else:
-            LOGGER.error(f"Exception for {id_num}: {e}")
             return_val[:] = [0.0, 0.0, 0.0]
         raise e
