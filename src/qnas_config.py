@@ -167,12 +167,6 @@ class ConfigParameters(object):
                 raise ValueError("progressive_stages must include a stage starting at gen_start=0")
         self.QNAS_spec['progressive_stages'] = stages
 
-        # Fitness cache (optional, default off) - see src/architecture_cache.py
-        self.train_spec['weight_reuse_enabled'] = (
-            self.args.get('weight_reuse_enabled', False)
-            or config_file.get('train', {}).get('weight_reuse_enabled', False)
-        )
-
         # Per-individual training early stopping (optional, config-file only). Distinct
         # from the QNAS-level early_stopping/patience above, which stops the whole
         # generational search instead of one individual's training loop.

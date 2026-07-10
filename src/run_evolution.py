@@ -7,12 +7,23 @@ import evaluation
 from util import check_files, init_log, download_dataset
 
 def main(**args):
-    
+
     logger = init_log(args['log_level'], name=__name__)
 
-    if not os.path.exists(args['experiment_path']):
-        logger.info(f"Creating {args['experiment_path']} ...")
-        os.makedirs(args['experiment_path'])
+    experiment_path = args['experiment_path']
+    log_params_path = os.path.join(experiment_path, 'log_params_evolution.txt')
+
+    if not os.path.exists(experiment_path):
+        logger.info(f"Creating {experiment_path} ...")
+        os.makedirs(experiment_path)
+    elif not args['continue_path'] and os.path.exists(log_params_path) \
+            and os.stat(log_params_path).st_size > 0:
+        # experiment_path already holds a checkpoint from a previous run (e.g. this
+        # is a re-run of the same command after a crash, or the pipeline was invoked
+        # twice against the same -e path) - resume it automatically instead of
+        # silently starting over and overwriting it.
+        logger.info(f"{experiment_path} already has a checkpoint - resuming automatically ...")
+        args['continue_path'] = experiment_path
 
     # Evolution or continue previous evolution
     if not args['continue_path']:
@@ -36,7 +47,6 @@ def main(**args):
     status_message = "Dataset is already downloaded." if dataset_status else "Dataset downloaded successfully."
     logger.info(status_message)
     
-    weight_reuse_enabled = config.train_spec.get('weight_reuse_enabled', False)
     fn_list = config.QNAS_spec.get('fn_list', [])
 
     eval_pop = evaluation.EvalPopulation(
@@ -44,7 +54,6 @@ def main(**args):
         fn_dict=config.fn_dict,
         log_level=config.train_spec['log_level'],
         fn_list=fn_list,
-        weight_reuse_enabled=weight_reuse_enabled,
     )
 
     qnas_cnn = qnas.QNAS(eval_pop, config.train_spec['experiment_path'],
@@ -100,13 +109,6 @@ if __name__ == '__main__':
     parser.add_argument('--network_config', type=str, required=True,
                         help='Network structure configuration.', default='default',
                         choices=['default', 'dense'])
-
-    # Fitness cache (reuse a classical individual's cached fitness when the exact same
-    # architecture reappears, e.g. carried forward by elitism, skipping training entirely).
-    # Stored in a single experiment_path/cache.json, shared across all progressive stages.
-    parser.add_argument('--weight_reuse_enabled', action='store_true',
-                        help='Enable the fitness cache for repeated architectures. '
-                             'Default = False.')
 
     arguments = parser.parse_args()
 

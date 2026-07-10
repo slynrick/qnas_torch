@@ -342,6 +342,7 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
             return_val[0] = cache_hit['fitness']
             return_val[1] = cache_hit['params_m']
             return_val[2] = cache_hit['inference_us']
+            return_val[3] = 1.0  # cache hit - NOT a new architecture this generation
             params['weight_reuse_applied'] = True
             params['cache_hit'] = True
             params['training_time'] = 0.0
@@ -407,6 +408,7 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
                 return_val[2] = results_dict['cuda_inference_time']
             else:
                 raise ValueError(f"Invalid fitness metric: {params['fitness_metric']}")
+            return_val[3] = 0.0  # actually trained - a new architecture this generation
 
         LOGGER.info(f"Training of model {id_num} finished, best {params['fitness_metric']}: {round(return_val[0], 2)}")
 
@@ -428,12 +430,12 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
 
     except (TimeoutError, MemoryError) as e:
         LOGGER.error(f"Exception: {e}")
-        return_val[:] = [0.0, 0.0, 0.0]
+        return_val[:] = [0.0, 0.0, 0.0, 0.0]
     except Exception as e:
         if "out of memory" in str(e):
             LOGGER.error(f"CUDA out of memory exception, error: {e}")
-            return_val[:] = [0.0, 0.0, 0.0]
+            return_val[:] = [0.0, 0.0, 0.0, 0.0]
         else:
             LOGGER.error(f"Exception: {e}")
-            return_val[:] = [0.0, 0.0, 0.0]
+            return_val[:] = [0.0, 0.0, 0.0, 0.0]
         raise e

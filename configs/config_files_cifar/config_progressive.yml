@@ -8,7 +8,7 @@ QNAS:
     max_num_nodes: 20
     num_quantum_ind: 5
     penalize_number: 3
-    repetition: 1
+    repetition: 4
     replace_method: best
     update_quantum_gen: 5
     update_quantum_rate: 0.1
@@ -23,8 +23,8 @@ QNAS:
     # Op pruning between stages ranks ops by mean quantum probability mass.
     progressive_stages:
         - {gen_start: 0,   num_nodes: 7,  num_ops: 11}
-        - {gen_start: 50, num_nodes: 13, num_ops: 7}
-        - {gen_start: 100, num_nodes: 20, num_ops: 4}
+        - {gen_start: 33, num_nodes: 13, num_ops: 7}
+        - {gen_start: 66, num_nodes: 20, num_ops: 4}
 
     params_ranges:
         decay: 0.9
@@ -69,7 +69,14 @@ train:
     # Tensorflow
     save_checkpoints_epochs: 5
     save_summary_epochs: 0.25
-    threads: 1
+    threads: 2
+
+    # Per-individual training early stopping: stop one candidate's brief training
+    # early once its validation loss plateaus, instead of always running the full
+    # max_epochs. Distinct from QNAS.patience above, which stops the whole search.
+    early_stopping_enabled: True
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.005
 
     # penalization parameters - scalarized fitness
     max_params: 1300000 # 1.3M

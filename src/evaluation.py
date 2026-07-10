@@ -54,8 +54,7 @@ class EvalPopulation(object):
     
     """
     def __init__(self, params: dict, fn_dict: dict, log_level: str = 'INFO',
-                 fn_list: Optional[List[str]] = None,
-                 weight_reuse_enabled: bool = False):
+                 fn_list: Optional[List[str]] = None):
         """
         Initialize the EvalPopulation object.
 
@@ -68,13 +67,10 @@ class EvalPopulation(object):
             The logging level for the internal logger (default is 'INFO').
         fn_list : list, optional
             Ordered list of operation names for the current progressive stage.
-        weight_reuse_enabled : bool
-            If True, use an ArchitectureCache fitness cache keyed by exact architecture.
         """
         self.train_params = params
         self.fn_dict = fn_dict
         self.fn_list = fn_list or []
-        self.weight_reuse_enabled = weight_reuse_enabled
         # Same train.log that cnn/train.py's fitness_calculation writes to (via
         # _attach_experiment_log_file), so per-generation/per-individual messages
         # logged here (e.g. "Starting Generation N ...", "Individual X: Best Metric=
@@ -92,17 +88,13 @@ class EvalPopulation(object):
         # to every worker process - each one reads/writes the shared file under a lock
         # (see architecture_cache.py), updating it live as soon as an individual
         # finishes rather than batching updates until the whole generation completes.
-        self.architecture_cache: Optional[ArchitectureCache] = None
-        if weight_reuse_enabled:
-            cache_path = os.path.join(params['experiment_path'], 'cache.json')
-            self.architecture_cache = ArchitectureCache(cache_path=cache_path)
+        cache_path = os.path.join(params['experiment_path'], 'cache.json')
+        self.architecture_cache = ArchitectureCache(cache_path=cache_path)
 
-        self.logger.info(
-            f"Evaluation process initialized with {len(self.gpus)} GPUs, "
-            f"weight_reuse={weight_reuse_enabled}"
-        )
+        self.logger.info(f"Evaluation process initialized with {len(self.gpus)} GPUs")
 
-    def __call__(self, decoded_params: list, decoded_nets: list, generation: int) -> np.ndarray:
+    def __call__(self, decoded_params: list, decoded_nets: list, generation: int
+                 ) -> "tuple[np.ndarray, np.ndarray]":
         """
         Evaluate the population.
 
@@ -118,10 +110,15 @@ class EvalPopulation(object):
         Returns
         -------
         evaluations : np.ndarray, shape [pop_size]
+        cache_hits : np.ndarray of bool, shape [pop_size]
+            True for individuals whose fitness was reused from the architecture
+            cache (§9) instead of actually being trained this generation.
         """
         pop_size = len(decoded_nets)
         evaluations = np.empty(shape=(pop_size,))
-        variables = [mp.Array('f', 3) for _ in range(pop_size)]
+        # 4th slot: 1.0 if this individual was a cache hit, 0.0 if it was actually
+        # trained - written by cnn/train.py's fitness_calculation.
+        variables = [mp.Array('f', 4) for _ in range(pop_size)]
 
         # Distribute individuals across threads
         selected_thread = 0
@@ -151,8 +148,10 @@ class EvalPopulation(object):
         for p in processes:
             p.join()
 
+        cache_hits = np.empty(shape=(pop_size,), dtype=bool)
         for idx, val in enumerate(variables):
             evaluations[idx] = val[0]
+            cache_hits[idx] = bool(val[3])
 
         evol_end = time.perf_counter()
         elapsed_min = (evol_end - evol_time_start) / 60
@@ -161,7 +160,7 @@ class EvalPopulation(object):
             f"Time elapsed for {pop_size} individuals: {elapsed_min:.0f}m {elapsed_sec:.0f}s"
         )
 
-        return evaluations
+        return evaluations, cache_hits
 
 
     def run_individuals(self, generation, train_params, fn_dict, fn_list,
@@ -176,9 +175,10 @@ class EvalPopulation(object):
                 train_loader, val_loader, return_val,
                 architecture_cache=architecture_cache,
             )
+            cache_hit_note = " (cache hit)" if return_val[3] else ""
             self.logger.info(
                 f"Individual {individual} on thread {selected_thread}: "
                 f"Best Metric={round(return_val[0], 3)}, "
                 f"Params={round(return_val[1], 2)}M, "
-                f"Inference Time={round(return_val[2], 3)}uS"
+                f"Inference Time={round(return_val[2], 3)}uS{cache_hit_note}"
             )

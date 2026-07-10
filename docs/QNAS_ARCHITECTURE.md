@@ -177,19 +177,18 @@ generation:
 
 ```mermaid
 sequenceDiagram
-    participant Loop as QNAS.evolve()
+    participant Main as QNAS.evolve()
     participant QNet as QPopulationNetwork
     participant QParams as QPopulationParams
     participant Eval as EvalPopulation.__call__
     participant Worker as fitness_calculation (worker process)
 
-    Loop->>QParams: generate_classical()
-    Loop->>QNet: generate_classical()  (sample the PMF)
-    QNet-->>Loop: classical net population (op INDICES)
-    Loop->>Loop: decode_pop() -> net_list per individual
-    Loop->>Loop: track new-vs-already-seen architectures
+    Main->>QParams: generate_classical()
+    Main->>QNet: generate_classical()  (sample the PMF)
+    QNet-->>Main: classical net population (op INDICES)
+    Main->>Main: decode_pop() -> net_list per individual
 
-    Loop->>Eval: __call__(decoded_params, decoded_nets, generation)
+    Main->>Eval: __call__(decoded_params, decoded_nets, generation)
     Eval->>Worker: spawn one process per "thread" (config: train.threads)
     Worker->>Worker: ArchitectureCache.find_cached_result(net_list)
     alt cache hit (architecture already trained before)
@@ -199,12 +198,13 @@ sequenceDiagram
         Worker->>Worker: ArchitectureCache.register(net_list, fitness, ...)
         Worker-->>Eval: fitness / params / inference time
     end
-    Eval-->>Loop: fitnesses array (one per individual)
+    Eval-->>Main: fitnesses array + per-individual cache-hit flags
 
-    Loop->>Loop: replace_pop() - elitism/best selection vs. previous generation
-    Loop->>QNet: update_quantum() - nudge probabilities toward best individuals
-    Loop->>QParams: update_quantum()
-    Loop->>Loop: go_next_gen() - save_data(), log_data(), delete_old_dirs()
+    Main->>Main: new_architectures_count = individuals that were NOT cache hits
+    Main->>Main: replace_pop() - elitism/best selection vs. previous generation
+    Main->>QNet: update_quantum() - nudge probabilities toward best individuals
+    Main->>QParams: update_quantum()
+    Main->>Main: go_next_gen() - save_data(), log_data(), delete_old_dirs()
 ```
 
 Key methods, and where to find them:
@@ -213,8 +213,10 @@ Key methods, and where to find them:
   from the quantum probability tables, applies optional crossover, and
   triggers evaluation.
 - **`decode_pop` / `eval_pop`** (`qnas.py`) — turns raw numeric chromosomes
-  into `net_list`s and hyperparameter dicts, and hands them to
-  `EvalPopulation`.
+  into `net_list`s and hyperparameter dicts, hands them to
+  `EvalPopulation`, and — once fitnesses and per-individual cache-hit flags
+  come back — sets `new_architectures_count` to how many individuals were
+  **not** cache hits this generation (see §9, §10).
 - **`EvalPopulation.__call__`** (`evaluation.py`) — the parallel dispatcher;
   see §7.
 - **`fitness_calculation`** (`cnn/train.py`) — trains and scores exactly one
@@ -223,8 +225,7 @@ Key methods, and where to find them:
   next generation: `elitism` keeps only the single best individual from the
   old population and replaces everyone else; `best` keeps the best-N of the
   *union* of old and new populations. Also tracks `best_so_far` /
-  `best_so_far_id`, and (new architecture tracking, see §10) how many of
-  this generation's individuals were never seen in any prior generation.
+  `best_so_far_id`.
 - **`update_quantum`** (`qnas.py` → `population.py`) — every
   `update_quantum_gen` generations, shifts each probability table's mass
   toward the op choices of its best classical individuals (and shrinks the
@@ -310,11 +311,12 @@ all** — reusing weights was deliberately dropped in favor of just reusing
 the scalar result, since re-loading/fine-tuning weights would be far more
 complex for comparatively little benefit here.
 
-It's optional (`train.weight_reuse_enabled: True` in the config) and, when
-enabled, lives in a single `experiment_path/cache.json`, shared across the
-*entire* run (all progressive-growth stages included — see the Appendix;
-different stages naturally produce differently-shaped/differently-named
-architectures, so their cache keys never collide).
+It is always on (`EvalPopulation` creates it unconditionally - there is no
+config flag to disable it) and lives in a single `experiment_path/cache.json`,
+shared across the *entire* run (all progressive-growth stages included —
+see the Appendix; different stages naturally produce
+differently-shaped/differently-named architectures, so their cache keys
+never collide).
 
 **Concurrency**: because multiple worker *processes* train individuals at
 the same time (§7), and any of them might hit or update the same cache
@@ -362,7 +364,7 @@ passed to `run_pipeline.sh`):
 | `log_params_evolution.txt` | `qnas_config.py` | A dump of the exact config used for this run (for reproducibility). |
 | `train.log` | `cnn/train.py` + `evaluation.py` | Every training-phase log line (per-individual progress, per-generation timing) — see note below. |
 | `retrain.log` | `retrain_model.py` + `cnn/train_detailed.py` | Every retrain-phase log line. |
-| `cache.json` | `architecture_cache.py` | The fitness cache (§9), if `weight_reuse_enabled`. |
+| `cache.json` | `architecture_cache.py` | The fitness cache (§9), always created. |
 | `{gen}_{ind}/` | `cnn/train.py` | One folder per individual trained (search phase) — `best_model.pth`, `training_params.txt`, `best_accuracy.txt`. Deleted at the end of each generation for everyone except the current best (`util.delete_old_dirs`), to bound disk usage. |
 | `retrain_{code}_{n}/` | `cnn/train_detailed.py` | One folder per retrain repetition — `best_model.pth`, `training_params.txt`. |
 | `retrain_results_{code}.txt` | `retrain_model.py` | Aggregated retrain metrics across repetitions. |
@@ -374,15 +376,13 @@ they belong to instead of some fixed, repo-wide location — important since
 many experiments can exist side by side, and a worker process may be
 re-used across a run's whole lifetime.
 
-The **new-architectures-discovered** count (`log_QNAS.txt`) is tracked
-independently of the fitness cache (it works even with
-`weight_reuse_enabled: False`): `QNAS` keeps an in-memory set of every
-`net_list` (as a tuple) it has ever decoded, and each generation counts how
-many of that generation's individuals are not already in the set before
-adding them. It resets if a run is resumed from scratch rather than
-continued (i.e. it does not survive a `--continue_path` restart) — a
-deliberate simplicity trade-off, since it's a reporting metric rather than
-something the algorithm depends on.
+The **new-architectures-discovered** count (`log_QNAS.txt`) is derived
+directly from the architecture cache's real hit/miss outcome for each
+individual, not a separate approximation: `cnn/train.py`'s
+`fitness_calculation` reports whether each individual was a cache hit back
+through `EvalPopulation.__call__`, and `QNAS.eval_pop` counts how many
+individuals in the generation were **not** cache hits (i.e. were actually
+trained this generation) - see §9.
 
 ---
 
@@ -525,8 +525,15 @@ flowchart LR
         A1["13 nodes x 7 ops"]
     end
     B1 -- "for the first 7 (surviving) nodes:\ncarry over the KEPT ops' probability mass,\nmatched by name, then renormalize each\nnode's row back to sum-to-1" --> A1
-    B1 -. "for the 6 NEW nodes (8-13):\nstart uniform over the pruned\n7-op menu" .-> A1
+    B1 -. "for the 6 NEW nodes (8-13):\nseed with the MEAN of the 7 surviving\nnodes' renormalized distributions,\nper quantum individual" .-> A1
 ```
+
+New nodes are deliberately not seeded uniformly: averaging the surviving
+nodes' distributions carries forward "what has worked at the nodes that
+survived the transition" as a prior for the newly added depth, instead of
+discarding that signal and starting from scratch. Averaging
+already-normalized rows keeps the result summing to 1 with no extra
+renormalization needed.
 
 Renormalizing after dropping ops matters: `generate_classical()` samples
 each node with `np.random.choice(..., p=probabilities[...])`, which

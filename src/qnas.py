@@ -62,10 +62,8 @@ class QNAS(object):
                                           # transition, when current_pop's chromosome
                                           # length no longer matches the old population
 
-        # Tracks every distinct architecture (net_list) evaluated so far this run, to
-        # report how many of each generation's individuals are genuinely new versus
-        # already-seen (e.g. carried forward by elitism, or converged duplicates).
-        self._seen_architectures = set()
+        # How many of the current generation's individuals were actually trained
+        # (i.e. did NOT hit the architecture cache) - see eval_pop().
         self.new_architectures_count = 0
 
     def initialize_qnas(self, num_quantum_ind, params_ranges, repetition, max_generations,
@@ -335,19 +333,14 @@ class QNAS(object):
         """
         decoded_params, decoded_nets = self.decode_pop(pop_params, pop_net)
 
-        new_count = 0
-        for net in decoded_nets:
-            key = tuple(net)
-            if key not in self._seen_architectures:
-                new_count += 1
-                self._seen_architectures.add(key)
-        self.new_architectures_count = new_count
-
         self.logger.info('Evaluating new population ...')
-        fitnesses = self.eval_func(
+        fitnesses, cache_hits = self.eval_func(
             decoded_params, decoded_nets,
             generation=self.current_gen,
         )
+        # "New architecture discovered" = did NOT hit the fitness cache this
+        # generation, i.e. it was actually trained (see architecture_cache.py).
+        self.new_architectures_count = int(np.sum(~cache_hits))
         penalized_fitnesses = np.copy(fitnesses)
 
         if self.penalize_number:

@@ -282,11 +282,15 @@ class QPopulationNetwork(QPopulation):
 
     def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list):
         """Resize *self.probabilities* (the quantum PMF) for a P-DARTS-style progressive
-        stage transition: grow the node axis (new nodes start uniform over *new_fn_list*)
-        and prune the op axis to *new_fn_list* (kept ops carry over their probability
-        mass, matched by name since pruning can reorder indices; each node's row is
-        renormalized afterwards so it still sums to 1, as required by
-        generate_classical()'s np.random.choice(..., p=...)).
+        stage transition: grow the node axis and prune the op axis to *new_fn_list*
+        (kept ops carry over their probability mass, matched by name since pruning can
+        reorder indices; each node's row is renormalized afterwards so it still sums to
+        1, as required by generate_classical()'s np.random.choice(..., p=...)).
+
+        New nodes (positions beyond the old depth) do NOT start uniform: they're
+        seeded with the average of the surviving nodes' (renormalized) distributions,
+        per quantum individual - i.e. the combined op preferences of every node that
+        survived the transition, rather than throwing that signal away.
 
         Args:
             new_num_nodes: new depth (>= current depth).
@@ -298,12 +302,6 @@ class QPopulationNetwork(QPopulation):
         new_op_idx = {name: i for i, name in enumerate(new_fn_list)}
         shared_ops = set(old_fn_list) & set(new_fn_list)
         carry_over_nodes = min(old_num_nodes, new_num_nodes)
-
-        new_probabilities = np.full(
-            (self.num_ind, new_num_nodes, len(new_fn_list)),
-            1.0 / len(new_fn_list),
-            dtype=self.dtype,
-        )
 
         carried = np.zeros(
             (self.num_ind, carry_over_nodes, len(new_fn_list)), dtype=self.dtype,
@@ -317,7 +315,18 @@ class QPopulationNetwork(QPopulation):
         carried_normalized = np.where(
             row_sums > 1e-12, carried / safe_sums, 1.0 / len(new_fn_list),
         )
+
+        # Aggregate the surviving nodes' distributions (per quantum individual) into a
+        # single "what has worked across the survived nodes" prior - averaging
+        # already-normalized rows keeps the result summing to 1, no renormalization
+        # needed. Used to seed every new node below.
+        aggregated = carried_normalized.mean(axis=1)  # [num_ind, num_new_ops]
+
+        new_probabilities = np.empty(
+            (self.num_ind, new_num_nodes, len(new_fn_list)), dtype=self.dtype,
+        )
         new_probabilities[:, :carry_over_nodes, :] = carried_normalized
+        new_probabilities[:, carry_over_nodes:, :] = aggregated[:, None, :]
 
         self.probabilities = new_probabilities
         self.chromosome.fn_list = new_fn_list
