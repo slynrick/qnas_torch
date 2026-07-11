@@ -108,8 +108,72 @@ def load_individuals(experiment_path):
             "cuda_inference_time": params.get("cuda_inference_time"),
             "training_time": params.get("training_time"),
             "weight_reuse_applied": bool(params.get("weight_reuse_applied", False)),
+            "net_list": params.get("net_list"),
         })
     return pd.DataFrame(rows)
+
+
+def stage_generation_ranges(gen_data):
+    """ [(stage_idx, gen_start, gen_end_inclusive), ...] derived from each generation's
+    recorded current_stage_idx (only present when the run used QNAS.progressive_stages).
+    """
+    if not gen_data:
+        return []
+    gens = sorted(gen_data.keys())
+    stage_of_gen = [(g, gen_data[g].get("current_stage_idx")) for g in gens]
+    if any(s is None for _, s in stage_of_gen):
+        return []
+
+    ranges = []
+    start_gen, start_stage = stage_of_gen[0]
+    for (g, stage), (prev_g, _) in zip(stage_of_gen[1:], stage_of_gen[:-1]):
+        if stage != start_stage:
+            ranges.append((start_stage, start_gen, prev_g))
+            start_gen, start_stage = g, stage
+    ranges.append((start_stage, start_gen, gens[-1]))
+    return ranges
+
+
+def load_best_networks_per_stage(gen_data, stage_ranges):
+    """ Best individual's net_list within each progressive stage's generation range,
+    decoded straight from data_QNAS.pkl's per-generation net_pop/fitnesses.
+
+    Per-individual directories on disk get pruned as the search progresses (only the
+    dirs needed for weight reuse/best-so-far survive), so by the end of the run most
+    generations - especially early ones - no longer have a training_params.txt for
+    their best individual. net_pop is saved every generation and never pruned, and
+    each generation's population is already sorted by fitness descending (order_pop),
+    so net_pop[g][0] paired with fn_list[g] reconstructs that generation's best network
+    exactly, without touching the filesystem.
+    """
+    stages = []
+    for stage_idx, gen_start, gen_end in stage_ranges:
+        best_gen, best_fitness = None, -np.inf
+        for g in range(gen_start, gen_end + 1):
+            if g not in gen_data:
+                continue
+            fitness = float(np.max(gen_data[g]["fitnesses"]))
+            if fitness > best_fitness:
+                best_fitness, best_gen = fitness, g
+        if best_gen is None:
+            continue
+
+        fn_list = gen_data[best_gen].get("fn_list")
+        if not fn_list:
+            continue
+        chromosome = gen_data[best_gen]["net_pop"][0]
+        net_list = [fn_list[i] for i in chromosome if i >= 0]
+
+        stages.append({
+            "stage_idx": stage_idx,
+            "gen_start": gen_start,
+            "gen_end": gen_end,
+            "net_list": net_list,
+            "best_accuracy": best_fitness,
+            "generation": best_gen,
+            "individual": 0,
+        })
+    return stages
 
 
 def load_retrain_results(experiment_path):
@@ -293,19 +357,36 @@ def draw_fitness_curve(fig, gs_cell, gen_data):
     _style_axes(ax, "Fitness over generations")
 
     gens = sorted(gen_data.keys())
-    best_so_far = [gen_data[g]["best_so_far"] for g in gens]
-
+    max_f, mean_f, min_f = [], [], []
     for g in gens:
         fitnesses = np.asarray(gen_data[g]["fitnesses"], dtype=float)
-        jitter = (np.random.rand(len(fitnesses)) - 0.5) * 0.3
-        ax.scatter(np.full_like(fitnesses, g) + jitter, fitnesses, color=ACCENT_2,
-                   alpha=0.5, s=22, zorder=2, label="population" if g == gens[0] else None)
+        max_f.append(fitnesses.max())
+        mean_f.append(fitnesses.mean())
+        min_f.append(fitnesses.min())
 
-    ax.plot(gens, best_so_far, color=ACCENT, linewidth=2.4, marker="o", markersize=5,
-            zorder=3, label="best so far")
+    ax.fill_between(gens, min_f, max_f, color=ACCENT, alpha=0.12, zorder=1)
+    ax.plot(gens, max_f, color=ACCENT, linewidth=2.2, marker="o", markersize=4,
+            zorder=3, label="max")
+    ax.plot(gens, mean_f, color=ACCENT_2, linewidth=1.8, linestyle="--", marker="o",
+            markersize=3, zorder=3, label="mean")
+    ax.plot(gens, min_f, color=ACCENT_3, linewidth=1.6, linestyle=":", marker="o",
+            markersize=3, zorder=3, label="min")
+
+    # Mark progressive-stage transitions, if the run used QNAS.progressive_stages.
+    stage_ranges = stage_generation_ranges(gen_data)
+    y_top = max(max_f)
+    for stage_idx, gen_start, _ in stage_ranges:
+        if stage_idx == stage_ranges[0][0]:
+            continue
+        ax.axvline(gen_start - 0.5, color=MUTED, linewidth=1, linestyle="--", alpha=0.6, zorder=2)
+        ax.text(gen_start - 0.5, y_top, f" stage {stage_idx}", color=MUTED, fontsize=7.5,
+                rotation=90, ha="left", va="top")
+
     ax.set_xlabel("generation", color=MUTED, fontsize=9)
     ax.set_ylabel("fitness", color=MUTED, fontsize=9)
-    ax.set_xticks(gens)
+    # A tick per generation is only readable for short runs; thin them out otherwise.
+    tick_step = max(1, len(gens) // 20)
+    ax.set_xticks(gens[::tick_step])
     legend = ax.legend(loc="lower right", fontsize=8, facecolor=PANEL_BG, edgecolor=GRID)
     for text in legend.get_texts():
         text.set_color(MUTED)
@@ -327,35 +408,56 @@ def draw_pareto_scatter(fig, gs_cell, indiv_df):
     ax.set_ylabel("best accuracy / fitness", color=MUTED, fontsize=9)
 
 
-def draw_genome_strip(fig, gs_cell, best_net):
+def _draw_genome_row(ax, y0, row_h, ops, label):
+    """Draw one horizontal strip of op boxes plus a caption, within [y0, y0+row_h]
+    of *ax*'s axes-fraction coordinates.
+    """
+    n = len(ops)
+    box_w = 1.0 / n
+    box_h = row_h * 0.5
+    box_y = y0 + row_h * 0.35
+    for i, op in enumerate(ops):
+        x0 = i * box_w
+        color = _op_color(op)
+        ax.add_patch(FancyBboxPatch((x0 + box_w * 0.06, box_y), box_w * 0.88, box_h,
+                                     boxstyle="round,pad=0.01,rounding_size=0.02",
+                                     transform=ax.transAxes, facecolor=color,
+                                     edgecolor=BG, linewidth=1.5))
+        text = op.replace("_", "\n")
+        ax.text(x0 + box_w / 2, box_y + box_h / 2, text, transform=ax.transAxes,
+                ha="center", va="center", fontsize=6.5, color=BG, fontweight="bold")
+
+    ax.text(0.5, y0 + row_h * 0.08, label, transform=ax.transAxes, ha="center", va="center",
+            fontsize=9, color=MUTED)
+
+
+def draw_genome_strip(fig, gs_cell, best_net, stage_nets):
     ax = fig.add_subplot(gs_cell)
-    _style_axes(ax, "Best network found")
     ax.set_xticks([])
     ax.set_yticks([])
+
+    if stage_nets:
+        _style_axes(ax, "Best network per stage")
+        n = len(stage_nets)
+        row_h = 1.0 / n
+        # Rows are drawn top-to-bottom, but axes y grows bottom-to-top.
+        for i, stage in enumerate(stage_nets):
+            y0 = 1.0 - (i + 1) * row_h
+            label = (f"stage {stage['stage_idx']} (gens {stage['gen_start']}-{stage['gen_end']}) — "
+                     f"best at gen {stage['generation']} — fitness {stage['best_accuracy']:.2f}")
+            _draw_genome_row(ax, y0, row_h, stage["net_list"], label)
+        return
+
+    _style_axes(ax, "Best network found")
     if not best_net or not best_net.get("net_list"):
         ax.text(0.5, 0.5, "no best network found", color=MUTED,
                 ha="center", va="center", transform=ax.transAxes)
         return
 
-    ops = best_net["net_list"]
-    n = len(ops)
-    box_w = 1.0 / n
-    for i, op in enumerate(ops):
-        x0 = i * box_w
-        color = _op_color(op)
-        ax.add_patch(FancyBboxPatch((x0 + box_w * 0.06, 0.25), box_w * 0.88, 0.5,
-                                     boxstyle="round,pad=0.01,rounding_size=0.02",
-                                     transform=ax.transAxes, facecolor=color,
-                                     edgecolor=BG, linewidth=1.5))
-        label = op.replace("_", "\n")
-        ax.text(x0 + box_w / 2, 0.5, label, transform=ax.transAxes, ha="center", va="center",
-                fontsize=6.5, color=BG, fontweight="bold")
-
     fitness = best_net.get("best_so_far")
     gen, idx = best_net.get("best_so_far_id", (None, None))
-    subtitle = f"gen {gen}, individual {idx} — fitness {fitness:.2f}" if fitness is not None else ""
-    ax.text(0.5, 0.05, subtitle, transform=ax.transAxes, ha="center", va="center",
-            fontsize=9, color=MUTED)
+    label = f"gen {gen}, individual {idx} — fitness {fitness:.2f}" if fitness is not None else ""
+    _draw_genome_row(ax, 0.0, 1.0, best_net["net_list"], label)
 
 
 def draw_timing_panel(fig, gs_cell, search_time_s, retrain_runs):
@@ -510,16 +612,21 @@ def generate_infographic(experiment_path, output_path):
     gen_data = load_generation_data(experiment_path)
     best_net = load_best_network(experiment_path, gen_data)
     indiv_df = load_individuals(experiment_path)
+    stage_ranges = stage_generation_ranges(gen_data)
+    stage_nets = load_best_networks_per_stage(gen_data, stage_ranges)
     retrain_runs = load_retrain_runs(experiment_path)
     run_config = load_run_config(experiment_path)
     search_time_s = search_wall_time_seconds(experiment_path, gen_data)
     num_gpus = len(run_config.get("train", {}).get("available_gpus") or [1])
 
+    # The genome panel needs more room the more progressive stages it stacks.
+    genome_row_h = 1.3 if not stage_nets else max(1.3, 0.75 * len(stage_nets))
+
     plt.rcParams["font.family"] = "sans-serif"
-    fig = plt.figure(figsize=(16, 18), facecolor=BG)
+    fig = plt.figure(figsize=(16, 18 + max(0, genome_row_h - 1.3)), facecolor=BG)
     gs = gridspec.GridSpec(
         6, 2, figure=fig,
-        height_ratios=[0.55, 1.3, 1.3, 1.3, 1.3, 0.5],
+        height_ratios=[0.55, 1.3, genome_row_h, 1.3, 1.3, 0.5],
         hspace=0.55, wspace=0.25,
         left=0.05, right=0.94, top=0.97, bottom=0.03,
     )
@@ -527,7 +634,7 @@ def generate_infographic(experiment_path, output_path):
     draw_header(fig, gs[0, :], experiment_path, gen_data, indiv_df, run_config, search_time_s)
     draw_fitness_curve(fig, gs[1, 0], gen_data)
     draw_pareto_scatter(fig, gs[1, 1], indiv_df)
-    draw_genome_strip(fig, gs[2, :], best_net)
+    draw_genome_strip(fig, gs[2, :], best_net, stage_nets)
     draw_timing_panel(fig, gs[3, 0], search_time_s, retrain_runs)
     draw_stage_timeline(fig, gs[3, 1], gen_data)
     draw_retrain_panel(fig, gs[4, :], retrain_runs, indiv_df)
