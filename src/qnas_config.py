@@ -180,6 +180,16 @@ class ConfigParameters(object):
             'early_stopping_min_delta', 0.0
         )
 
+        # Fixed dataset seed (optional, config-file only): the same seed must
+        # produce the same train/val split and limited-data subset across every
+        # generation, every individual, and both search and retrain runs of the
+        # same config, so fitness stays a valid comparative signal. Set
+        # use_seed: False to opt back into a fresh random split per run.
+        self.train_spec['use_seed'] = config_file.get('train', {}).get('use_seed', True)
+        self.train_spec['seed'] = config_file.get('train', {}).get(
+            'seed', input.DEFAULT_DATA_SEED
+        )
+
         self._get_fn_spec()
 
         self.train_spec['experiment_path'] = self.args['experiment_path']

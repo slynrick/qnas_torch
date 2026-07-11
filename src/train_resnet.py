@@ -26,7 +26,11 @@ def main(**args):
     train_params['experiment_path'] = os.path.join(experiment_path, args['retrain_folder'])
     # Load data
     logger.info(f"Loading data ...")
-    data_loader = input.GenericDataLoader(params=train_params)
+    data_loader = input.GenericDataLoader(
+        params=train_params,
+        seed=train_params.get('seed', input.DEFAULT_DATA_SEED),
+        use_seed=train_params.get('use_seed', True),
+    )
     train_loader, val_loader = data_loader.get_loader(pin_memory_device=args['device'])
     test_loader = data_loader.get_loader(for_train=False, pin_memory_device=args['device'])
     

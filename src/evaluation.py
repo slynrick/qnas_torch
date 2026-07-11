@@ -79,7 +79,11 @@ class EvalPopulation(object):
         self.logger = init_log(log_level, name=__name__,
                                file_path=os.path.join(params['experiment_path'], 'train.log'))
         self.gpus = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
-        self.loader = input.GenericDataLoader(params=self.train_params)
+        self.loader = input.GenericDataLoader(
+            params=self.train_params,
+            seed=self.train_params.get('seed'),
+            use_seed=self.train_params.get('use_seed', True),
+        )
 
         # Single cache.json shared for the whole experiment (all progressive stages
         # included - the net_list key already disambiguates by architecture, so

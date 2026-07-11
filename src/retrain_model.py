@@ -35,7 +35,11 @@ def main(**args):
 
     # Load data
     logger.info(f"Loading data ...")
-    data_loader = input.GenericDataLoader(params=config.train_spec)
+    data_loader = input.GenericDataLoader(
+        params=config.train_spec,
+        seed=config.train_spec.get('seed'),
+        use_seed=config.train_spec.get('use_seed', True),
+    )
     train_loader, val_loader = data_loader.get_loader(pin_memory_device=args['device'])
     test_loader = data_loader.get_loader(for_train=False, pin_memory_device=args['device'])
     

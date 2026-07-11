@@ -9,13 +9,17 @@ import random
 import util
 import os
 import numpy as np
-from time import time
 import torchvision.datasets
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision.transforms import ToTensor, Resize, Compose, Normalize, TrivialAugmentWide
 from sklearn.model_selection import StratifiedShuffleSplit
 import medmnist
 from medmnist import INFO
+
+# Fixed default so runs are reproducible/comparable out of the box (search vs.
+# retrain, generation vs. generation) unless a config explicitly opts out via
+# use_seed: False.
+DEFAULT_DATA_SEED = 42
 
 cifar10_info = {
   'dataset': 'CIFAR10',
@@ -80,27 +84,44 @@ class MyDataset(Dataset):
         
 class GenericDataLoader:
   """A generic data loader for PyTorch, supporting various datasets and data augmentation."""
-  def __init__(self, params: dict, train_split=0.9, seed=None, info: dict = {}):
+  def __init__(self, params: dict, train_split=0.9, seed=None, use_seed=True,
+              info: dict = {}):
     """
     Initialize the GenericDataLoader.
-    
+
     Parameters:
       params (dict): Dictionary containing parameters.
       train_split (float): Split ratio for training data.
-      seed (int): Seed for randomization.
+      seed (int): Seed for randomization; defaults to DEFAULT_DATA_SEED if
+          use_seed is True and no seed is given.
+      use_seed (bool): If True (default), use a fixed seed so the train/val
+          split and limited-data subset are identical across every call to
+          get_loader() and across every construction (search vs. retrain) -
+          needed so fitness stays comparable across individuals/generations/
+          runs. If False, a fresh random seed is drawn at construction time
+          instead (restores the old "different every run" behavior for
+          experiments that deliberately want dataset variance); splits
+          within that single instance's lifetime still stay internally
+          consistent with each other.
       info (dict): Additional information about the dataset.
-      
+
     Returns:
       None
     """
     self.params = params
     self.train_split = train_split
     error_msg = "[!] train_split should be in the range [0, 1]."
-    assert 0 <= self.train_split <= 1, error_msg    
-    if seed is None:
-        seed = int(time())
-        random.seed(seed)
-        torch.manual_seed(seed)
+    assert 0 <= self.train_split <= 1, error_msg
+    if use_seed:
+        seed = DEFAULT_DATA_SEED if seed is None else seed
+    else:
+        # A fresh, truly random seed per construction - random.SystemRandom()
+        # (OS entropy) rather than int(time()), which can collide when two
+        # instances are constructed within the same wall-clock second.
+        seed = random.SystemRandom().randint(0, 2**31 - 1)
+    self.seed = seed
+    random.seed(seed)
+    torch.manual_seed(seed)
     self.info_dict = {'dataset': f'{self.params["dataset"]}'}
     self.info_dict['seed'] = seed
     self.download_status = not os.path.exists(self.params['data_path'])
@@ -253,7 +274,14 @@ class GenericDataLoader:
       val_split = 1 - self.train_split
       # Get the labels and create StratifiedShuffleSplit
       labels = full_dataset.targets
-      stratified_split = StratifiedShuffleSplit(n_splits=1, test_size=val_split)
+      # random_state=self.seed is the core determinism fix: without it, this
+      # split reruns against numpy's unseeded global RNG every single call
+      # (get_loader() is invoked fresh every generation, once per worker
+      # thread/process - see EvalPopulation.run_individuals), so every
+      # generation/thread previously saw a different random train/val split
+      # and thus a different limited-data subset.
+      stratified_split = StratifiedShuffleSplit(n_splits=1, test_size=val_split,
+                                                random_state=self.seed)
 
       # Get the training and validation indices
       train_idx, val_idx = next(stratified_split.split(labels, labels))
@@ -270,7 +298,7 @@ class GenericDataLoader:
         
         train_indices = []
         val_indices = []
-        for label in set(labels):
+        for label in sorted(set(labels)):
           label_indices = [i for i in train_idx if labels[i] == label]
           train_indices.extend(label_indices[:train_count_per_class])
 
@@ -307,11 +335,11 @@ class GenericDataLoader:
         val_indices = []
 
         # Iterate through each class and pick 1000 samples
-        for label in set(train_labels):
+        for label in sorted(set(train_labels)):
             label_indices = [i for i, l in enumerate(train_labels) if l == label]
             train_indices.extend(label_indices[:train_count_per_class])
 
-        for label in set(val_labels):
+        for label in sorted(set(val_labels)):
             label_indices = [i for i, l in enumerate(val_labels) if l == label]
             val_indices.extend(label_indices[:val_count_per_class])
       
