@@ -59,13 +59,19 @@ def train_epoch(model, criterion, optimizer, data_loader, params, scaler):
     total = 0
     device = torch.device(params['device'])
     amp_device = device.type  # 'cuda' or 'cpu'
+    # NHWC memory format lets cuDNN use its fastest Tensor Core conv kernels on
+    # Ampere+ under AMP (typical 1.2-1.4x speedup) - the tensor's logical NCHW
+    # shape is unchanged, only its physical memory layout.
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
     # Accumulate on-device and only sync to host once, after the loop - a per-batch
     # .item() call forces a CUDA sync and stalls the async training pipeline.
     train_loss_t = torch.zeros((), device=device)
     correct_t = torch.zeros((), device=device)
 
     for inputs, labels in data_loader:
-        inputs, labels = inputs.to(device), labels.to(device)
+        inputs = inputs.to(device, memory_format=memory_format)
+        labels = labels.to(device)
         optimizer.zero_grad()
 
         with torch.autocast(device_type=amp_device, dtype=torch.float16, enabled=params['mixed_precision']):
@@ -90,12 +96,15 @@ def evaluate(model, criterion, data_loader, params):
     total = 0
     device = torch.device(params['device'])
     amp_device = device.type  # 'cuda' or 'cpu'
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
     validation_loss_t = torch.zeros((), device=device)
     correct_t = torch.zeros((), device=device)
 
     with torch.no_grad():
         for inputs, labels in data_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs = inputs.to(device, memory_format=memory_format)
+            labels = labels.to(device)
             with torch.autocast(device_type=amp_device, dtype=torch.float16, enabled=params['mixed_precision']):
                 y_logits = model(inputs)
                 if params['task'] == 'multi-class':
@@ -218,9 +227,11 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     
     model_metrics = metrics.ModelMetrics(model, device=params['device'])
     
-    inference_images = next(iter(val_loader))[0][:10].to(params['device'])
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    inference_images = next(iter(val_loader))[0][:10].to(params['device'], memory_format=memory_format)
     input_shape = params['input_shape']
-    
+
     cuda_inference_time = model_metrics.measure_inference_time(inference_images)
     model_memory_usage = model_metrics.measure_memory(input_shape) / (1024 ** 2)  # Convert bytes to MB
     total_trainable_params = model_metrics.measure_parameters()
@@ -369,7 +380,9 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     inputs = torch.randn(input_shape)
     with torch.no_grad():
         _ = model_net(inputs)
-    model_net.to(device)
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    model_net.to(device, memory_format=memory_format)
 
     params['input_shape'] = input_shape
 

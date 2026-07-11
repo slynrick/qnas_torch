@@ -286,22 +286,28 @@ class QPopulationNetwork(QPopulation):
                 self.probabilities[node][idx], best_classic[idx, node], update_value,
             )
 
-    def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list):
+    def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list,
+                                reset_probs: bool = False):
         """Resize *self.probabilities* (the quantum PMF) for a P-DARTS-style progressive
         stage transition. Each node prunes and grows independently:
 
         - Existing nodes (index < old_num_nodes): *new_fn_list[i]* is that node's own
           already-pruned op list (produced per node by the caller, e.g.
-          QNAS._rank_and_prune_all_nodes). Kept ops carry over their probability mass,
-          matched by name since pruning can reorder indices; each node's row is
-          renormalized afterwards so it still sums to 1, as required by
-          generate_classical()'s np.random.choice(..., p=...). If an individual's carried
-          mass for a node is ~0 (all its mass was on ops pruned away at that node), that
-          individual's row resets to uniform over the node's new op list.
-        - New nodes (index >= old_num_nodes, from growing depth): start UNIFORM (not
-          mean-seeded) over the distinct UNION of ops that survived pruning across all
-          existing nodes (uncapped - can exceed the stage's num_ops). Every individual
-          gets the same uniform row for a new node.
+          QNAS._rank_and_prune_all_nodes). If *reset_probs* is False (default), kept ops
+          carry over their probability mass, matched by name since pruning can reorder
+          indices; each node's row is renormalized afterwards so it still sums to 1, as
+          required by generate_classical()'s np.random.choice(..., p=...). If an
+          individual's carried mass for a node is ~0 (all its mass was on ops pruned away
+          at that node), that individual's row resets to uniform over the node's new op
+          list. If *reset_probs* is True, every existing node's row is set uniform over
+          its new op list instead of carrying anything over - i.e. the search "forgets"
+          what it learned before the transition and restarts from scratch on the new
+          (smaller) op menu.
+        - New nodes (index >= old_num_nodes, from growing depth): always start UNIFORM
+          (not mean-seeded) over the distinct UNION of ops that survived pruning across
+          all existing nodes (uncapped - can exceed the stage's num_ops), regardless of
+          *reset_probs* - they have no prior probability mass to carry over or reset.
+          Every individual gets the same uniform row for a new node.
 
         self.probabilities/self.chromosome.fn_list stay ragged Python lists (see
         initialize_qpop) - never coerced into one dense 3D array.
@@ -310,15 +316,24 @@ class QPopulationNetwork(QPopulation):
             new_num_nodes: new depth (>= current depth).
             new_fn_list: list of length old_num_nodes, each entry the (already pruned,
                 per-node) new ordered list of operation names for that existing node.
+            reset_probs: (bool) if True, reset existing nodes' probabilities to uniform
+                instead of carrying over/renormalizing the pre-transition PMF.
         """
         old_fn_list = self.chromosome.fn_list
         old_num_nodes = self.chromosome.num_genes
 
         new_probabilities = [None] * new_num_nodes
         for i in range(old_num_nodes):
-            old_idx = {name: k for k, name in enumerate(old_fn_list[i])}
             node_new_fn_list = new_fn_list[i]
 
+            if reset_probs:
+                new_probabilities[i] = np.full(
+                    (self.num_ind, len(node_new_fn_list)),
+                    1.0 / len(node_new_fn_list), dtype=self.dtype,
+                )
+                continue
+
+            old_idx = {name: k for k, name in enumerate(old_fn_list[i])}
             carried = np.zeros((self.num_ind, len(node_new_fn_list)), dtype=self.dtype)
             for k, name in enumerate(node_new_fn_list):
                 carried[:, k] = self.probabilities[i][:, old_idx[name]]

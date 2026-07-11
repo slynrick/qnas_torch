@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from medmnist import INFO, Evaluator
 import torch.nn as nn
+from torch.amp import GradScaler
 from tqdm.notebook import tqdm
 from typing import Dict, List, Union, Any
 from sklearn.metrics import confusion_matrix
@@ -85,10 +86,13 @@ def compute_metrics(model, data_loader, params):
     all_predictions = []
     auc, acc = 0, 0
     y_score = torch.tensor([]).to(params['device'])
-    
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+
     with torch.no_grad():
         for inputs, labels in data_loader:
-            inputs, labels = inputs.to(params['device']), labels.to(params['device'])
+            inputs = inputs.to(params['device'], memory_format=memory_format)
+            labels = labels.to(params['device'])
             y_logits = model(inputs)
             _, predicted = y_logits.max(1)
 
@@ -121,59 +125,77 @@ def reset_and_load_best_model(params, best_model_path):
         _ = best_model(input_random)
     # Load the state dictionary of the best model into the new model
     best_model.load_state_dict(torch.load(best_model_path))
-    best_model.to(params['device'])
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    best_model.to(params['device'], memory_format=memory_format)
 
     return best_model
 
-def train_epoch(model, criterion, optimizer, data_loader, params):
+def train_epoch(model, criterion, optimizer, data_loader, params, scaler):
     model.train()
-    train_loss = 0.0
-    correct = 0
     total = 0
+    device = torch.device(params['device'])
+    amp_device = device.type  # 'cuda' or 'cpu'
+    # NHWC memory format lets cuDNN use its fastest Tensor Core conv kernels on
+    # Ampere+ under AMP (typical 1.2-1.4x speedup) - the tensor's logical NCHW
+    # shape is unchanged, only its physical memory layout.
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    # Accumulate on-device and only sync to host once, after the loop - a per-batch
+    # .item() call forces a CUDA sync and stalls the async training pipeline (mirrors
+    # cnn/train.py's search-phase train_epoch).
+    train_loss_t = torch.zeros((), device=device)
+    correct_t = torch.zeros((), device=device)
 
     for inputs, labels in data_loader:
-        inputs, labels = inputs.to(params['device']), labels.to(params['device'])
+        inputs = inputs.to(device, memory_format=memory_format)
+        labels = labels.to(device)
         optimizer.zero_grad()
-        y_logits = model(inputs)
-        
-        if params['task'] == 'multi-class':
-            labels = labels.squeeze().long() # medmnist
-            
-        loss = criterion(y_logits, labels)
-        loss.backward()       
-        optimizer.step()
-        train_loss += loss.item()
+
+        with torch.autocast(device_type=amp_device, dtype=torch.float16, enabled=params['mixed_precision']):
+            y_logits = model(inputs)
+            if params['task'] == 'multi-class':
+                labels = labels.squeeze().long() # medmnist
+            loss = criterion(y_logits, labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        train_loss_t += loss.detach()
         _, predicted = y_logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        
-    accuracy = 100 * correct / total
-    train_loss /= len(data_loader)
+        correct_t += predicted.eq(labels).sum()
+
+    accuracy = 100 * correct_t.item() / total
+    train_loss = train_loss_t.item() / len(data_loader)
     return train_loss, accuracy
 
 def evaluate(model, criterion, data_loader, params, test=False):
     model.eval()
-    eval_loss = 0.0
-    correct = 0
     total = 0
+    device = torch.device(params['device'])
+    amp_device = device.type  # 'cuda' or 'cpu'
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    eval_loss_t = torch.zeros((), device=device)
+    correct_t = torch.zeros((), device=device)
 
     with torch.no_grad():
         for inputs, labels in data_loader:
-            inputs, labels = inputs.to(params['device']), labels.to(params['device'])
-            y_logits = model(inputs)
-            
-            if params['task'] == 'multi-class':
-                labels = labels.squeeze().long() # medmnist
-                
-            loss = criterion(y_logits, labels)
-            eval_loss += loss.item()
+            inputs = inputs.to(device, memory_format=memory_format)
+            labels = labels.to(device)
+            with torch.autocast(device_type=amp_device, dtype=torch.float16, enabled=params['mixed_precision']):
+                y_logits = model(inputs)
+                if params['task'] == 'multi-class':
+                    labels = labels.squeeze().long() # medmnist
+                loss = criterion(y_logits, labels)
+            eval_loss_t += loss.detach()
             _, predicted = y_logits.max(1)
             total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            correct_t += predicted.eq(labels).sum()
 
-    accuracy = 100 * correct / total
-    eval_loss /= len(data_loader)
-    
+    accuracy = 100 * correct_t.item() / total
+    eval_loss = eval_loss_t.item() / len(data_loader)
+
     if test:
         confusion_matrix, auc, acc = compute_metrics(model, data_loader, params)
         return eval_loss, accuracy, auc, acc , confusion_matrix
@@ -243,6 +265,9 @@ def train(model: torch.nn.Module,
 
     best_model_path = os.path.join(params['model_path'], 'best_model.pth')
 
+    amp_device = torch.device(params['device']).type
+    scaler = GradScaler(amp_device, enabled=params['mixed_precision'])
+
     if params['lr_scheduler'] == 'exponential':
         lr_scheduler = ExponentialLR(optimizer, gamma=0.9)
     elif params['lr_scheduler'] == 'reduce_on_plateau':
@@ -255,7 +280,7 @@ def train(model: torch.nn.Module,
         lr_scheduler = None
     #for epoch in tqdm(range(1, max_epochs + 1), desc="Retrain Scheme"):
     for epoch in range(1, max_epochs + 1):
-        train_loss, train_accuracy = train_epoch(model, criterion, optimizer, train_loader, params)
+        train_loss, train_accuracy = train_epoch(model, criterion, optimizer, train_loader, params, scaler)
         training_losses.append(train_loss)
         training_accuracies.append(train_accuracy)
         
@@ -304,8 +329,10 @@ def train(model: torch.nn.Module,
     create_info_file(params['model_path'], params, 'retraining_params.txt')
     
     model_metrics = metrics.ModelMetrics(best_model_loaded, device=params['device'])
-    
-    inference_images = next(iter(val_loader))[0][:10].to(params['device'])
+
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    inference_images = next(iter(val_loader))[0][:10].to(params['device'], memory_format=memory_format)
     input_shape = params['input_shape']
     
     cuda_inference_time = model_metrics.measure_inference_time(inference_images)
@@ -394,7 +421,9 @@ def train_and_eval(params: Dict[str, Any],
     input_shape =  [params['batch_size']] + dataset_info['shape']
     inputs = torch.randn(input_shape)
     _ = model_net(inputs)
-    model_net.to(device)
+    memory_format = torch.channels_last if params.get('channels_last', False) \
+        else torch.contiguous_format
+    model_net.to(device, memory_format=memory_format)
     
     params['input_shape'] = input_shape
     

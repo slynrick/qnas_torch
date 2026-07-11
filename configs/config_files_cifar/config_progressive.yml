@@ -26,6 +26,16 @@ QNAS:
         - {gen_start: 33, num_nodes: 13, num_ops: 7}
         - {gen_start: 66, num_nodes: 20, num_ops: 4}
 
+    # If True, quantum individuals' probabilities reset to uniform at each stage
+    # transition above instead of carrying over/renormalizing what was learned so
+    # far on the pre-transition op menu.
+    reset_probs_on_stage_change: True
+
+    # If True, op pruning at each stage transition ranks ops ONCE network-wide and
+    # applies the same surviving op list to every node. If False (default), each
+    # node ranks and prunes its own ops independently.
+    global_op_pruning: False
+
     params_ranges:
         decay: 0.9
         learning_rate: 0.001
@@ -53,8 +63,18 @@ train:
     fitness_metric: best_loss
     mo_metric_base: loss
     mixed_precision: True
+    # NHWC memory format - lets cuDNN pick its fastest Tensor Core conv kernels on
+    # Ampere+ under AMP (typical 1.2-1.4x speedup).
+    channels_last: True
     available_gpus: [0] # gpu0, gpu1, gpu2 [0, 1, 2]
     device: cuda:0
+
+    # Dataset split/subset must be identical across every individual, generation
+    # and retrain run of this config so fitness stays comparable - see
+    # cnn/input.py GenericDataLoader. Set use_seed: False to opt back into a
+    # fresh random split per run.
+    use_seed: True
+    seed: 42
 
     # Dataset
     dataset: Cifar10

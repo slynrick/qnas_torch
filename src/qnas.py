@@ -74,7 +74,8 @@ class QNAS(object):
                         patience, early_stopping, save_data_freq=0, penalize_number=0,
                         crossover_frequency=5, en_pop_crossover=False,
                         pop_crossover_rate=0.25, pop_crossover_method='hux',
-                        progressive_stages=None, noop_fn_name=None):
+                        progressive_stages=None, noop_fn_name=None,
+                        reset_probs_on_stage_change=False, global_op_pruning=False):
 
         """ Initialize algorithm with several parameter values.
 
@@ -114,6 +115,18 @@ class QNAS(object):
                 the number of offspring to generate in the crossover [0 - 1].
             pop_crossover_method: (str) one of 'hux' or 'uniform', indicating the method to
                 apply crossover in the population of networks.
+            reset_probs_on_stage_change: (bool) if True, every existing node's quantum
+                probabilities are reset to uniform at each progressive-stage transition
+                instead of carrying over/renormalizing the pre-transition PMF - i.e. the
+                search "forgets" what it learned so far and restarts exploration on the
+                new (pruned) op menu. Ignored if progressive_stages is not set.
+            global_op_pruning: (bool) if True, op pruning at each stage transition ranks
+                ops ONCE using the mean quantum probability mass across every node and
+                individual, and applies that single surviving op list to every node
+                (the pre-per-node-pruning behavior - all nodes always share one op
+                menu). If False (default), each node ranks and prunes its own ops
+                independently, so different nodes can end up with different op
+                subsets. Ignored if progressive_stages is not set.
         """
 
         self.generations = max_generations
@@ -133,6 +146,8 @@ class QNAS(object):
         self.progressive_stages = progressive_stages
         self.current_stage_idx = 0
         self.noop_fn_name = noop_fn_name
+        self.reset_probs_on_stage_change = reset_probs_on_stage_change
+        self.global_op_pruning = global_op_pruning
         if progressive_stages:
             if progressive_stages[0]['num_ops'] != len(fn_list):
                 raise ValueError(
@@ -562,17 +577,40 @@ class QNAS(object):
                         best_id=f'{self.best_so_far_id[0]}_{self.best_so_far_id[1]}')
         self.current_gen += 1
 
+    def _rank_and_prune_ops(self, names, mean_weight, num_ops):
+        """Rank one node's (or the whole network's, in global mode) op list by
+        *mean_weight* and keep the top *num_ops*.
+
+        *self.noop_fn_name* is never eligible for pruning: it's excluded from the
+        ranking pool and unconditionally re-added (spending one of *num_ops* slots),
+        so it's kept forever. This guarantees a no-op is always available to extend
+        surviving classical individuals into newly grown nodes without invalidating
+        their fitness (see QPopulationNetwork.filter_and_remap_classical).
+
+        Args:
+            names: (list[str]) current op-name list to prune.
+            mean_weight: 1D array, mean quantum probability mass per op in *names*.
+            num_ops: (int) number of ops to keep.
+
+        Returns:
+            list[str]: the pruned op-name list.
+        """
+        if num_ops >= len(names):
+            return list(names)
+
+        rankable = [i for i, n in enumerate(names) if n != self.noop_fn_name]
+        ranked = sorted(rankable, key=lambda i: (mean_weight[i], -i), reverse=True)
+        kept = set(ranked[:max(num_ops - 1, 0)])
+        if self.noop_fn_name in names:
+            kept.add(names.index(self.noop_fn_name))
+        kept = sorted(kept)
+        return [names[i] for i in kept]
+
     def _rank_and_prune_all_nodes(self, old_fn_list, num_ops):
         """Rank each node's ops independently by that node's own mean quantum
         probability mass (across quantum individuals only) and keep the top *num_ops*
         for that node. Different nodes can end up keeping different op subsets.
-
-        *self.noop_fn_name* is never eligible for pruning: it's excluded from the
-        ranking pool and unconditionally re-added (spending one of the node's
-        *num_ops* slots), so every node keeps it forever. This guarantees a no-op is
-        always available to extend surviving classical individuals into newly grown
-        nodes without invalidating their fitness (see
-        QPopulationNetwork.filter_and_remap_classical).
+        Used when *self.global_op_pruning* is False (the default).
 
         Args:
             old_fn_list: list of length num_genes, each entry that node's current
@@ -584,24 +622,47 @@ class QNAS(object):
         """
         new_fn_list = []
         for node_idx, names in enumerate(old_fn_list):
-            if num_ops >= len(names):
-                new_fn_list.append(list(names))
-                continue
-
             mean_weight = self.qpop_net.probabilities[node_idx].mean(axis=0)
-            rankable = [i for i, n in enumerate(names) if n != self.noop_fn_name]
-            ranked = sorted(rankable, key=lambda i: (mean_weight[i], -i), reverse=True)
-            kept = set(ranked[:max(num_ops - 1, 0)])
-            if self.noop_fn_name in names:
-                kept.add(names.index(self.noop_fn_name))
-            kept = sorted(kept)
-            node_new_fn_list = [names[i] for i in kept]
+            node_new_fn_list = self._rank_and_prune_ops(names, mean_weight, num_ops)
             self.logger.info(
                 f"Op pruning (PMF-ranked), node {node_idx}: {names} -> {node_new_fn_list}"
             )
             new_fn_list.append(node_new_fn_list)
 
         return new_fn_list
+
+    def _rank_and_prune_globally(self, old_fn_list, num_ops):
+        """Rank ops ONCE using the mean quantum probability mass across every node
+        AND every quantum individual, and apply that single surviving op list
+        uniformly to every node - i.e. the pre-per-node-pruning behavior. Used when
+        *self.global_op_pruning* is True.
+
+        Requires every node to currently share the same op list (true as long as
+        global_op_pruning has been used consistently since stage 0 - per-node
+        pruning can make nodes diverge, at which point a network-wide mean is no
+        longer well-defined across differing op sets).
+
+        Args:
+            old_fn_list: list of length num_genes, each entry that node's current
+                op-name list (all identical).
+            num_ops: (int) number of ops to keep, network-wide.
+
+        Returns:
+            list of length num_genes, each entry the SAME pruned op-name list.
+        """
+        names = old_fn_list[0]
+        if any(node_names != names for node_names in old_fn_list):
+            raise ValueError(
+                "global_op_pruning requires every node to share the same op list - "
+                "nodes have already diverged (was global_op_pruning enabled from "
+                "stage 0 onward?)."
+            )
+
+        mean_weight = np.stack(self.qpop_net.probabilities, axis=1).mean(axis=(0, 1))
+        new_fn_list = self._rank_and_prune_ops(names, mean_weight, num_ops)
+        self.logger.info(f"Op pruning (PMF-ranked, global): {names} -> {new_fn_list}")
+
+        return [list(new_fn_list) for _ in old_fn_list]
 
     def _transition_stage(self, new_stage_idx):
         """Grow depth / prune ops at a progressive-stage boundary, preserving the
@@ -612,8 +673,13 @@ class QNAS(object):
         old_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
         old_num_nodes = self.qpop_net.chromosome.num_genes
 
-        new_fn_list = self._rank_and_prune_all_nodes(old_fn_list, stage['num_ops'])
-        self.qpop_net.grow_and_prune_discrete(stage['num_nodes'], new_fn_list)
+        if self.global_op_pruning:
+            new_fn_list = self._rank_and_prune_globally(old_fn_list, stage['num_ops'])
+        else:
+            new_fn_list = self._rank_and_prune_all_nodes(old_fn_list, stage['num_ops'])
+        self.qpop_net.grow_and_prune_discrete(
+            stage['num_nodes'], new_fn_list, reset_probs=self.reset_probs_on_stage_change,
+        )
 
         # Filter+remap the existing classical population against the new per-node
         # fn_lists (post prune+growth) instead of wiping it: individuals whose ops all

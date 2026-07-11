@@ -167,6 +167,23 @@ class ConfigParameters(object):
                 raise ValueError("progressive_stages must include a stage starting at gen_start=0")
         self.QNAS_spec['progressive_stages'] = stages
 
+        # Whether to reset quantum individuals' probabilities to uniform at each
+        # progressive-stage transition (op pruning + depth growth), instead of the
+        # default carry-over/renormalize behavior (see
+        # QPopulationNetwork.grow_and_prune_discrete). Config-file only, no CLI flag.
+        self.QNAS_spec['reset_probs_on_stage_change'] = config_file.get('QNAS', {}).get(
+            'reset_probs_on_stage_change', False
+        )
+
+        # Whether op pruning at each stage transition ranks/prunes each node's ops
+        # independently (False, default - different nodes can end up with different
+        # op subsets) or ranks ops ONCE network-wide and applies the same surviving
+        # op list to every node (True - the pre-per-node-pruning behavior). Config-
+        # file only, no CLI flag.
+        self.QNAS_spec['global_op_pruning'] = config_file.get('QNAS', {}).get(
+            'global_op_pruning', False
+        )
+
         # Per-individual training early stopping (optional, config-file only). Distinct
         # from the QNAS-level early_stopping/patience above, which stops the whole
         # generational search instead of one individual's training loop.
@@ -178,6 +195,14 @@ class ConfigParameters(object):
         )
         self.train_spec['early_stopping_min_delta'] = config_file.get('train', {}).get(
             'early_stopping_min_delta', 0.0
+        )
+
+        # NHWC memory format (optional, config-file only): lets cuDNN pick its fastest
+        # Tensor Core conv kernels on Ampere+ under AMP. Applied to the model and every
+        # input batch in cnn/train.py and cnn/train_detailed.py via
+        # tensor.to(device, memory_format=torch.channels_last).
+        self.train_spec['channels_last'] = config_file.get('train', {}).get(
+            'channels_last', False
         )
 
         # Fixed dataset seed (optional, config-file only): the same seed must
