@@ -226,6 +226,23 @@ class ConfigParameters(object):
         for item in self.fn_dict.values():
             del item['prob']
 
+        # Progressive stages need a designated no-op function: per-node pruning force-
+        # keeps it forever (see QNAS._rank_and_prune_all_nodes) so that growing a
+        # surviving classical individual can always extend it with a no-op instead of
+        # invalidating its already-evaluated fitness.
+        if self.QNAS_spec.get('progressive_stages'):
+            noop_candidates = [
+                fn for fn in self.QNAS_spec['fn_list']
+                if self.fn_dict[fn].get('function') == 'NoOp'
+            ]
+            if not noop_candidates:
+                raise ValueError(
+                    "progressive_stages requires a NoOp function in function_dict "
+                    "(function: 'NoOp') so grown nodes can extend surviving classical "
+                    "individuals without changing their decoded network."
+                )
+            self.QNAS_spec['noop_fn_name'] = noop_candidates[0]
+
     def _get_ranges(self, config_file):
         """  Get the ranges of the numerical parameters to be evolved.
 

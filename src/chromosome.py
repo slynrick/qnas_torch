@@ -98,20 +98,26 @@ class QChromosomeNetwork(QChromosome):
         Args:
             max_num_nodes: (int) maximum number of nodes of the network, which will be the
                 number of genes.
-            fn_list: list of possible functions.
+            fn_list: list of possible functions, shared by every node (flat list), or a
+                list of length *max_num_nodes* already giving each node its own list of
+                functions (ragged, e.g. after a progressive-stage prune).
             dtype: type of the chromosome array.
         """
 
         super(QChromosomeNetwork, self).__init__(dtype)
 
+        if fn_list and isinstance(fn_list[0], str):
+            # Flat list: every node starts from the same (full) op menu.
+            fn_list = [list(fn_list) for _ in range(max_num_nodes)]
         self.fn_list = fn_list
-        self.num_functions = len(self.fn_list)
+        self.num_functions = [len(node_fn_list) for node_fn_list in self.fn_list]
 
         self.set_num_genes(max_num_nodes)
 
     def initialize_qgenes(self, initial_probs=None):
         """ Get the initial values for probabilities based on the available number of
-            functions of a node if *initial_probs* is empty.
+            functions of a node if *initial_probs* is empty. Assumes every node still
+            shares the same (initial) op menu - only true before any stage transition.
 
         Args:
             initial_probs: list defining the initial probabilities for each function.
@@ -121,8 +127,9 @@ class QChromosomeNetwork(QChromosome):
         """
 
         if not initial_probs:
-            prob = 1 / self.num_functions
-            initial_probs = np.full(shape=(self.num_functions,), fill_value=prob,
+            num_functions = self.num_functions[0]
+            prob = 1 / num_functions
+            initial_probs = np.full(shape=(num_functions,), fill_value=prob,
                                     dtype=self.dtype)
         else:
             initial_probs = np.array(initial_probs)
@@ -135,7 +142,7 @@ class QChromosomeNetwork(QChromosome):
 
         Args:
             chromosome: int numpy array, containing indexes that will be used to get the
-                corresponding function names in self.fn_list.
+                corresponding function names in self.fn_list[node].
 
         Returns:
             list with function names, in the order they represent the network.
@@ -145,6 +152,6 @@ class QChromosomeNetwork(QChromosome):
 
         for i, gene in enumerate(chromosome):
             if gene >= 0:
-                decoded[i] = self.fn_list[gene]
+                decoded[i] = self.fn_list[i][gene]
 
         return decoded

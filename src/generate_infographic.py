@@ -161,8 +161,11 @@ def load_best_networks_per_stage(gen_data, stage_ranges):
         fn_list = gen_data[best_gen].get("fn_list")
         if not fn_list:
             continue
+        if isinstance(fn_list[0], str):
+            continue  # legacy flat fn_list format, predates per-node pruning - skip
         chromosome = gen_data[best_gen]["net_pop"][0]
-        net_list = [fn_list[i] for i in chromosome if i >= 0]
+        net_list = [fn_list[node_idx][gene] for node_idx, gene in enumerate(chromosome)
+                    if gene >= 0]
 
         stages.append({
             "stage_idx": stage_idx,
@@ -504,7 +507,11 @@ def draw_stage_timeline(fig, gs_cell, gen_data):
     _style_axes(ax, "Progressive stage growth")
 
     gens = sorted(gen_data.keys()) if gen_data else []
-    gens_with_stage = [g for g in gens if "fn_list" in gen_data[g]]
+    gens_with_stage = [
+        g for g in gens
+        if "fn_list" in gen_data[g] and gen_data[g]["fn_list"]
+        and not isinstance(gen_data[g]["fn_list"][0], str)  # skip legacy flat format
+    ]
     if not gens_with_stage:
         ax.text(0.5, 0.5, "no progressive_stages configured", color=MUTED,
                 ha="center", va="center", transform=ax.transAxes)
@@ -513,7 +520,10 @@ def draw_stage_timeline(fig, gs_cell, gen_data):
         return
 
     num_nodes = [gen_data[g]["num_net_nodes"] for g in gens_with_stage]
-    num_ops = [len(gen_data[g]["fn_list"]) for g in gens_with_stage]
+    # Union of ops surviving across all (possibly divergent) per-node op lists for that
+    # generation - the "op menu breadth" available to the search, consistent with how
+    # grow_and_prune_discrete seeds new nodes.
+    num_ops = [len(set().union(*gen_data[g]["fn_list"])) for g in gens_with_stage]
 
     ax2 = ax.twinx()
     ax2.tick_params(colors=MUTED, labelsize=8)

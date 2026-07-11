@@ -125,3 +125,5 @@ exp*/
 
 # old files
 x_files/*
+
+.runs.txt

@@ -165,29 +165,33 @@ class QPopulationNetwork(QPopulation):
         self.initialize_qpop()
 
     def initialize_qpop(self):
-        """ Initialize quantum population with *self.num_ind* individuals. """
+        """ Initialize quantum population with *self.num_ind* individuals.
 
-        # Shape = (num_ind, num_nodes, num_functions)
-        self.probabilities = np.tile(self.initial_probs, (self.num_ind,
-                                                        self.chromosome.num_genes, 1))
+        self.probabilities is a list of length num_genes (one entry per node), each a
+        [num_ind, num_functions] array - kept ragged (not a single dense 3D array) since
+        nodes can later diverge to different op-set sizes/identities after a progressive-
+        stage prune (see grow_and_prune_discrete). Never coerce this list into a single
+        np.array() - a ragged 2nd axis would force dtype=object with no vectorized ops.
+        """
+
+        self.probabilities = [
+            np.tile(self.initial_probs, (self.num_ind, 1))
+            for _ in range(self.chromosome.num_genes)
+        ]
 
     def generate_classical(self):
         """ Generate a specific number of classical individuals from the observation of quantum
             individuals. This number is equal to (*num_ind* x *repetition*).
         """
 
-        def sample(idx0, idx1):
-            return np.random.choice(size, p=temp_prob[idx0, idx1, :])
-
-        size = self.chromosome.num_functions
         new_pop = np.zeros(shape=(self.num_ind * self.repetition, self.chromosome.num_genes),
                             dtype=np.int32)
 
-        temp_prob = np.tile(self.probabilities, (self.repetition, 1, 1))
-        
-        for ind in range(self.num_ind * self.repetition):
-            for node in range(self.chromosome.num_genes):
-                new_pop[ind, node] = sample(ind, node)
+        for node in range(self.chromosome.num_genes):
+            size = len(self.chromosome.fn_list[node])
+            temp_prob = np.tile(self.probabilities[node], (self.repetition, 1))
+            for ind in range(self.num_ind * self.repetition):
+                new_pop[ind, node] = np.random.choice(size, p=temp_prob[ind, :])
 
         return new_pop
     
@@ -271,64 +275,128 @@ class QPopulationNetwork(QPopulation):
             intensity: (float) value defining the intensity of the update.
         """
 
-        random = np.random.rand(self.num_ind, self.chromosome.num_genes)
-        mask = np.where(random <= self.update_quantum_rate)
-
         update_value = intensity * self.max_update
-
         best_classic = self.current_pop[:self.num_ind]
-        self.probabilities[mask] = self._update(self.probabilities[mask], best_classic[mask],
-                                                update_value)
+
+        for node in range(self.chromosome.num_genes):
+            random = np.random.rand(self.num_ind)
+            idx = np.where(random <= self.update_quantum_rate)[0]
+
+            self.probabilities[node][idx] = self._update(
+                self.probabilities[node][idx], best_classic[idx, node], update_value,
+            )
 
     def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list):
         """Resize *self.probabilities* (the quantum PMF) for a P-DARTS-style progressive
-        stage transition: grow the node axis and prune the op axis to *new_fn_list*
-        (kept ops carry over their probability mass, matched by name since pruning can
-        reorder indices; each node's row is renormalized afterwards so it still sums to
-        1, as required by generate_classical()'s np.random.choice(..., p=...)).
+        stage transition. Each node prunes and grows independently:
 
-        New nodes (positions beyond the old depth) do NOT start uniform: they're
-        seeded with the average of the surviving nodes' (renormalized) distributions,
-        per quantum individual - i.e. the combined op preferences of every node that
-        survived the transition, rather than throwing that signal away.
+        - Existing nodes (index < old_num_nodes): *new_fn_list[i]* is that node's own
+          already-pruned op list (produced per node by the caller, e.g.
+          QNAS._rank_and_prune_all_nodes). Kept ops carry over their probability mass,
+          matched by name since pruning can reorder indices; each node's row is
+          renormalized afterwards so it still sums to 1, as required by
+          generate_classical()'s np.random.choice(..., p=...). If an individual's carried
+          mass for a node is ~0 (all its mass was on ops pruned away at that node), that
+          individual's row resets to uniform over the node's new op list.
+        - New nodes (index >= old_num_nodes, from growing depth): start UNIFORM (not
+          mean-seeded) over the distinct UNION of ops that survived pruning across all
+          existing nodes (uncapped - can exceed the stage's num_ops). Every individual
+          gets the same uniform row for a new node.
+
+        self.probabilities/self.chromosome.fn_list stay ragged Python lists (see
+        initialize_qpop) - never coerced into one dense 3D array.
 
         Args:
             new_num_nodes: new depth (>= current depth).
-            new_fn_list: new (pruned) ordered list of operation names.
+            new_fn_list: list of length old_num_nodes, each entry the (already pruned,
+                per-node) new ordered list of operation names for that existing node.
         """
-        old_fn_list = list(self.chromosome.fn_list)
+        old_fn_list = self.chromosome.fn_list
         old_num_nodes = self.chromosome.num_genes
-        old_op_idx = {name: i for i, name in enumerate(old_fn_list)}
-        new_op_idx = {name: i for i, name in enumerate(new_fn_list)}
-        shared_ops = set(old_fn_list) & set(new_fn_list)
-        carry_over_nodes = min(old_num_nodes, new_num_nodes)
 
-        carried = np.zeros(
-            (self.num_ind, carry_over_nodes, len(new_fn_list)), dtype=self.dtype,
-        )
-        for op_name in shared_ops:
-            old_i, new_i = old_op_idx[op_name], new_op_idx[op_name]
-            carried[:, :, new_i] = self.probabilities[:, :carry_over_nodes, old_i]
+        new_probabilities = [None] * new_num_nodes
+        for i in range(old_num_nodes):
+            old_idx = {name: k for k, name in enumerate(old_fn_list[i])}
+            node_new_fn_list = new_fn_list[i]
 
-        row_sums = carried.sum(axis=-1, keepdims=True)
-        safe_sums = np.where(row_sums > 1e-12, row_sums, 1.0)
-        carried_normalized = np.where(
-            row_sums > 1e-12, carried / safe_sums, 1.0 / len(new_fn_list),
-        )
+            carried = np.zeros((self.num_ind, len(node_new_fn_list)), dtype=self.dtype)
+            for k, name in enumerate(node_new_fn_list):
+                carried[:, k] = self.probabilities[i][:, old_idx[name]]
 
-        # Aggregate the surviving nodes' distributions (per quantum individual) into a
-        # single "what has worked across the survived nodes" prior - averaging
-        # already-normalized rows keeps the result summing to 1, no renormalization
-        # needed. Used to seed every new node below.
-        aggregated = carried_normalized.mean(axis=1)  # [num_ind, num_new_ops]
+            row_sums = carried.sum(axis=1, keepdims=True)
+            zero_mask = row_sums[:, 0] <= 1e-12
+            carried[zero_mask] = 1.0 / len(node_new_fn_list)
+            carried[~zero_mask] /= row_sums[~zero_mask]
 
-        new_probabilities = np.empty(
-            (self.num_ind, new_num_nodes, len(new_fn_list)), dtype=self.dtype,
-        )
-        new_probabilities[:, :carry_over_nodes, :] = carried_normalized
-        new_probabilities[:, carry_over_nodes:, :] = aggregated[:, None, :]
+            new_probabilities[i] = carried
+
+        if new_num_nodes > old_num_nodes:
+            union_ops = sorted(set().union(*new_fn_list[:old_num_nodes]))
+            if not union_ops:
+                raise ValueError(
+                    "grow_and_prune_discrete: union of surviving ops across existing "
+                    "nodes is empty - cannot seed new nodes."
+                )
+            for i in range(old_num_nodes, new_num_nodes):
+                new_fn_list.append(union_ops)
+                new_probabilities[i] = np.full(
+                    (self.num_ind, len(union_ops)), 1.0 / len(union_ops), dtype=self.dtype,
+                )
 
         self.probabilities = new_probabilities
         self.chromosome.fn_list = new_fn_list
-        self.chromosome.num_functions = len(new_fn_list)
+        self.chromosome.num_functions = [len(l) for l in new_fn_list]
         self.chromosome.set_num_genes(new_num_nodes)
+
+    def filter_and_remap_classical(self, old_current_pop, old_fn_list, new_fn_list, noop_name):
+        """Filter and remap a classical (gene-index) population across a progressive-stage
+        transition, so individuals with real evaluated fitness survive instead of being
+        thrown away.
+
+        For each individual and each pre-existing node position, the op name it currently
+        encodes is looked up against that node's new (pruned) op list: if the op didn't
+        survive the prune at that node, the whole individual is dropped (its network is no
+        longer decodable/valid). Surviving individuals have their gene at that node
+        remapped to the op's new index (pruning can reorder indices). Any brand-new node
+        positions (growth) are set to *noop_name*'s index - a no-op is a computational
+        identity, so appending it doesn't change what the individual's fitness measured;
+        it does not need to be re-evaluated just because the population grew deeper.
+
+        Args:
+            old_current_pop: int ndarray [n_individuals, old_num_nodes], gene indices.
+            old_fn_list: list of length old_num_nodes (per-node op lists before the prune).
+            new_fn_list: list of length new_num_nodes (per-node op lists after prune+growth,
+                i.e. self.chromosome.fn_list right after grow_and_prune_discrete).
+            noop_name: (str) name of the no-op function, used to fill newly grown node
+                positions for surviving individuals.
+
+        Returns:
+            (kept_mask, remapped_pop): kept_mask is a bool ndarray of length
+            n_individuals (True for individuals to keep); remapped_pop is an int ndarray
+            [n_kept, new_num_nodes] with remapped/extended gene indices for kept individuals
+            (empty first axis if none survive).
+        """
+        old_num_nodes = len(old_fn_list)
+        new_num_nodes = len(new_fn_list)
+        n_individuals = old_current_pop.shape[0]
+
+        kept_mask = np.ones(n_individuals, dtype=bool)
+        remapped = np.zeros((n_individuals, new_num_nodes), dtype=old_current_pop.dtype)
+
+        for node in range(old_num_nodes):
+            new_index_of = {name: k for k, name in enumerate(new_fn_list[node])}
+            for ind in range(n_individuals):
+                if not kept_mask[ind]:
+                    continue
+                gene = old_current_pop[ind, node]
+                name = old_fn_list[node][gene]
+                if name not in new_index_of:
+                    kept_mask[ind] = False
+                    continue
+                remapped[ind, node] = new_index_of[name]
+
+        for node in range(old_num_nodes, new_num_nodes):
+            noop_idx = new_fn_list[node].index(noop_name)
+            remapped[:, node] = noop_idx
+
+        return kept_mask, remapped[kept_mask]

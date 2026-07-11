@@ -46,7 +46,7 @@ class QNAS(object):
         self.penalize_number = None
         self.random = 0.0
         self.raw_fitnesses = None
-        self.reducing_fns_list = []
+        self.reducing_fns_names = set()
         self.replace_method = None
         self.save_data_freq = np.inf
         self.total_eval = 0
@@ -59,8 +59,10 @@ class QNAS(object):
         self.progressive_stages = None
         self.current_stage_idx = 0
         self._just_transitioned = False  # True for the generation right after a stage
-                                          # transition, when current_pop's chromosome
-                                          # length no longer matches the old population
+                                          # transition, when current_pop has already been
+                                          # filtered/remapped by _transition_stage and
+                                          # replace_pop should keep all survivors rather
+                                          # than apply elitism's "keep only 1" slice.
 
         # How many of the current generation's individuals were actually trained
         # (i.e. did NOT hit the architecture cache) - see eval_pop().
@@ -72,7 +74,7 @@ class QNAS(object):
                         patience, early_stopping, save_data_freq=0, penalize_number=0,
                         crossover_frequency=5, en_pop_crossover=False,
                         pop_crossover_rate=0.25, pop_crossover_method='hux',
-                        progressive_stages=None):
+                        progressive_stages=None, noop_fn_name=None):
 
         """ Initialize algorithm with several parameter values.
 
@@ -130,18 +132,32 @@ class QNAS(object):
         # num_nodes.
         self.progressive_stages = progressive_stages
         self.current_stage_idx = 0
+        self.noop_fn_name = noop_fn_name
         if progressive_stages:
             if progressive_stages[0]['num_ops'] != len(fn_list):
                 raise ValueError(
                     "progressive_stages[0].num_ops must equal len(fn_list) - the first "
                     "stage starts from the full op menu."
                 )
+            for stage in progressive_stages:
+                if stage['num_nodes'] < 1:
+                    raise ValueError("progressive_stages[*].num_nodes must be >= 1.")
+            if not noop_fn_name or noop_fn_name not in fn_list:
+                raise ValueError(
+                    "progressive_stages requires noop_fn_name to be set and present in "
+                    "fn_list - per-node pruning force-keeps it forever so grown nodes "
+                    "can extend surviving classical individuals with a no-op."
+                )
             max_num_nodes = progressive_stages[0]['num_nodes']
 
+        # Per-node reducing-ops names (used by get_penalties). Kept as names, not
+        # global indices: once fn_list is per-node (progressive stages), the same
+        # gene integer can mean a different op at different node positions, so
+        # index-based matching would silently misclassify ops.
+        self.reducing_fns_names = set()
         if reducing_fns_list:
             self.penalties = np.zeros(shape=(num_quantum_ind * repetition))
-            self.reducing_fns_list = [i for i in range(len(fn_list))
-                                    if fn_list[i] in reducing_fns_list]
+            self.reducing_fns_names = set(reducing_fns_list)
 
         if save_data_freq:
             self.save_data_freq = save_data_freq
@@ -176,23 +192,28 @@ class QNAS(object):
                 is applied, *raw_fitnesses* = *new_fitnesses*.
         """
 
-        if self.current_gen == 0 or self._just_transitioned:
-            # In the 1st generation, and right after a progressive-stage transition (the
-            # old current_pop's chromosome length no longer matches the new num_nodes,
-            # so it can't be concatenated with the freshly-generated population), the
-            # current population is the one that was just generated.
+        if self.current_gen == 0 or (self._just_transitioned and self.qpop_net.current_pop is None):
+            # In the 1st generation, and right after a progressive-stage transition that
+            # left no surviving classical individual (_transition_stage already filtered
+            # out anyone whose ops didn't survive the prune), the current population is
+            # the one that was just generated.
             self.qpop_params.current_pop = new_pop_params
             self.qpop_net.current_pop = new_pop_net
 
             self.fitnesses = new_fitnesses
             self.raw_fitnesses = raw_fitnesses
             self.update_best_id(new_fitnesses)
-            self._just_transitioned = False
         else:
             # Checking if the best so far individual has changed in the current generation
             self.update_best_id(new_fitnesses)
 
-            if self.replace_method == 'elitism':
+            if self._just_transitioned:
+                # _transition_stage already filtered/remapped current_pop to only the
+                # individuals whose fitness is still valid post-transition - keep all of
+                # them (like 'best') rather than applying elitism's "keep only 1" slice,
+                # which assumes an untouched prior generation.
+                selected = range(self.fitnesses.shape[0])
+            elif self.replace_method == 'elitism':
                 select_new = range(new_fitnesses.shape[0] - 1)
                 new_fitnesses, raw_fitnesses, new_pop_params, \
                     new_pop_net = self.order_pop(new_fitnesses,
@@ -224,10 +245,11 @@ class QNAS(object):
                                                         selection=range(num_classic))       
         
         # self.fitnesses[0] is normally the best-ever individual (elitism/best always
-        # concatenate history in), except right after a progressive-stage transition,
-        # where the population is a fresh start with no history concatenated - guard
-        # with max() so best_so_far can never regress in that case.
+        # concatenate history in), except right after a progressive-stage transition
+        # that left no surviving individual, where the population is a fresh start with
+        # no history concatenated - guard with max() so best_so_far can never regress.
         self.best_so_far = max(self.best_so_far, self.fitnesses[0])
+        self._just_transitioned = False
 
     @staticmethod
     def order_pop(fitnesses, raw_fitnesses, pop_params, pop_net, selection=None):
@@ -365,11 +387,17 @@ class QNAS(object):
         """
 
         penalties = np.zeros(shape=pop_net.shape[0])
+        fn_list = self.qpop_net.chromosome.fn_list
 
         for i, net in enumerate(pop_net):
-            unique, counts = np.unique(net, return_counts=True)
-            reducing_fns_count = np.sum([counts[i] for i in range(len(unique))
-                                        if unique[i] in self.reducing_fns_list])
+            # Gene value meaning is per-node (fn_list[node]), so a gene must be matched
+            # against the reducing-ops names node-by-node, not compared network-wide by
+            # raw integer value - the same integer can be a different op at different
+            # node positions once fn_list is per-node (progressive stages).
+            reducing_fns_count = sum(
+                1 for node, gene in enumerate(net)
+                if gene >= 0 and fn_list[node][gene] in self.reducing_fns_names
+            )
             # Penalize individual only if number of reducing layers exceed the maximum allowed
             if reducing_fns_count > self.penalize_number:
                 penalties[i] = reducing_fns_count - self.penalize_number
@@ -427,7 +455,9 @@ class QNAS(object):
 
         if self.progressive_stages:
             entry['current_stage_idx'] = self.current_stage_idx
-            entry['fn_list'] = list(self.qpop_net.chromosome.fn_list)
+            # List of per-node op-name lists (ragged) - deep-copied one level deeper
+            # than a flat list so later in-place mutation can't corrupt this entry.
+            entry['fn_list'] = [list(names) for names in self.qpop_net.chromosome.fn_list]
 
         data[self.current_gen] = entry
 
@@ -475,10 +505,17 @@ class QNAS(object):
         self.qpop_net.current_pop = log_data['net_pop']
 
         if self.progressive_stages and 'current_stage_idx' in log_data:
+            fn_list = log_data['fn_list']
+            if not fn_list or isinstance(fn_list[0], str):
+                raise RuntimeError(
+                    "Checkpoint predates the per-node progressive-pruning refactor "
+                    "(fn_list is a flat list, not one list per node) - re-run from "
+                    "scratch instead of resuming with progressive_stages configured."
+                )
             self.current_stage_idx = log_data['current_stage_idx']
-            self.qpop_net.chromosome.fn_list = log_data['fn_list']
-            self.qpop_net.chromosome.num_functions = len(log_data['fn_list'])
-            self.eval_func.fn_list = log_data['fn_list']
+            self.qpop_net.chromosome.fn_list = fn_list
+            self.qpop_net.chromosome.num_functions = [len(names) for names in fn_list]
+            self.eval_func.fn_list = fn_list
 
     def check_early_stopping(self):
         """
@@ -525,30 +562,86 @@ class QNAS(object):
                         best_id=f'{self.best_so_far_id[0]}_{self.best_so_far_id[1]}')
         self.current_gen += 1
 
-    def _rank_and_prune_ops(self, old_fn_list, num_ops):
-        """Rank ops by mean quantum probability mass (across quantum individuals and all
-        gene positions) and keep the top *num_ops*.
-        """
-        if num_ops >= len(old_fn_list):
-            return list(old_fn_list)
+    def _rank_and_prune_all_nodes(self, old_fn_list, num_ops):
+        """Rank each node's ops independently by that node's own mean quantum
+        probability mass (across quantum individuals only) and keep the top *num_ops*
+        for that node. Different nodes can end up keeping different op subsets.
 
-        mean_weight = self.qpop_net.probabilities.mean(axis=(0, 1))  # [num_functions]
-        ranked = sorted(range(len(old_fn_list)), key=lambda i: mean_weight[i], reverse=True)
-        kept_indices = sorted(ranked[:num_ops])
-        new_fn_list = [old_fn_list[i] for i in kept_indices]
-        self.logger.info(f"Op pruning (PMF-ranked): {old_fn_list} -> {new_fn_list}")
+        *self.noop_fn_name* is never eligible for pruning: it's excluded from the
+        ranking pool and unconditionally re-added (spending one of the node's
+        *num_ops* slots), so every node keeps it forever. This guarantees a no-op is
+        always available to extend surviving classical individuals into newly grown
+        nodes without invalidating their fitness (see
+        QPopulationNetwork.filter_and_remap_classical).
+
+        Args:
+            old_fn_list: list of length num_genes, each entry that node's current
+                op-name list.
+            num_ops: (int) number of ops to keep per node for the new stage.
+
+        Returns:
+            list of length num_genes, each entry that node's pruned op-name list.
+        """
+        new_fn_list = []
+        for node_idx, names in enumerate(old_fn_list):
+            if num_ops >= len(names):
+                new_fn_list.append(list(names))
+                continue
+
+            mean_weight = self.qpop_net.probabilities[node_idx].mean(axis=0)
+            rankable = [i for i, n in enumerate(names) if n != self.noop_fn_name]
+            ranked = sorted(rankable, key=lambda i: (mean_weight[i], -i), reverse=True)
+            kept = set(ranked[:max(num_ops - 1, 0)])
+            if self.noop_fn_name in names:
+                kept.add(names.index(self.noop_fn_name))
+            kept = sorted(kept)
+            node_new_fn_list = [names[i] for i in kept]
+            self.logger.info(
+                f"Op pruning (PMF-ranked), node {node_idx}: {names} -> {node_new_fn_list}"
+            )
+            new_fn_list.append(node_new_fn_list)
+
         return new_fn_list
 
     def _transition_stage(self, new_stage_idx):
-        """Grow depth / prune ops at a progressive-stage boundary."""
+        """Grow depth / prune ops at a progressive-stage boundary, preserving the
+        classical population's already-evaluated fitness wherever possible instead of
+        discarding it.
+        """
         stage = self.progressive_stages[new_stage_idx]
-        old_fn_list = list(self.qpop_net.chromosome.fn_list)
+        old_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
         old_num_nodes = self.qpop_net.chromosome.num_genes
 
-        new_fn_list = self._rank_and_prune_ops(old_fn_list, stage['num_ops'])
+        new_fn_list = self._rank_and_prune_all_nodes(old_fn_list, stage['num_ops'])
         self.qpop_net.grow_and_prune_discrete(stage['num_nodes'], new_fn_list)
 
-        self.eval_func.fn_list = new_fn_list
+        # Filter+remap the existing classical population against the new per-node
+        # fn_lists (post prune+growth) instead of wiping it: individuals whose ops all
+        # survived keep their evaluated fitness; newly grown node positions are set to
+        # a no-op so the decoded network - and its fitness - doesn't change just
+        # because the population grew deeper.
+        if self.qpop_net.current_pop is not None:
+            kept_mask, remapped_net = self.qpop_net.filter_and_remap_classical(
+                self.qpop_net.current_pop, old_fn_list,
+                self.qpop_net.chromosome.fn_list, self.noop_fn_name,
+            )
+            if kept_mask.any():
+                self.qpop_net.current_pop = remapped_net
+                self.qpop_params.current_pop = self.qpop_params.current_pop[kept_mask]
+                self.fitnesses = self.fitnesses[kept_mask]
+                self.raw_fitnesses = self.raw_fitnesses[kept_mask]
+                self.logger.info(
+                    f"Stage transition: kept {int(kept_mask.sum())}/{len(kept_mask)} "
+                    f"classical individuals across the transition."
+                )
+            else:
+                self.qpop_net.current_pop = None
+                self.logger.warning(
+                    "Stage transition: no classical individual survived the op "
+                    "prune - starting the next generation from scratch."
+                )
+
+        self.eval_func.fn_list = self.qpop_net.chromosome.fn_list
 
         self.current_stage_idx = new_stage_idx
         self._just_transitioned = True
@@ -556,8 +649,7 @@ class QNAS(object):
             f"Progressive stage transition -> stage {new_stage_idx} "
             f"(gen_start={stage['gen_start']}, num_nodes={stage['num_nodes']}, "
             f"num_ops={stage['num_ops']}): "
-            f"{old_num_nodes} -> {stage['num_nodes']} nodes, "
-            f"{len(old_fn_list)} -> {len(new_fn_list)} ops."
+            f"{old_num_nodes} -> {stage['num_nodes']} nodes."
         )
 
     def evolve(self):
