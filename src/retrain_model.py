@@ -115,6 +115,9 @@ if __name__ == '__main__':
                         help='Optimizer to be used during training. Default = AdamW.')
     parser.add_argument('--data_augmentation', action='store_true',
                     help='Disable data augmentation during training. Default = False.')
+    parser.add_argument('--mixed_precision', action='store_true',
+                    help='Enable AMP mixed precision during retrain. Default = False (FP32), '
+                         'regardless of the mixed_precision setting used during search.')
     parser.add_argument('--num_workers', type=int, default=8,
                         help='Number of workers to be used during data loading. Default = 4.')
     parser.add_argument('--save_checkpoints_epochs', type=int, default=5,

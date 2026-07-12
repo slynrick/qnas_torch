@@ -15,6 +15,7 @@
 #   -n  network_config (default: default)
 #   -m  fitness_metric override for run_evolution.py (omit to use config file's value)
 #   -C  continue_path (resume a previous run instead of starting fresh)
+#   -X  pass to enable population crossover (en_pop_crossover flag, no value)
 #
 # Optional (retrain):
 #   -g  config_code, used for output filenames (default: run1)
@@ -24,6 +25,7 @@
 #   -A  pass to enable retrain data_augmentation (flag, no value)
 #   -T  pass to enable retrain early stopping (flag, no value)
 #   -P  retrain early_stopping_patience (default: 10, only used if -T is passed)
+#   -M  pass to enable AMP mixed precision during retrain (default: FP32, flag, no value)
 #
 # Optional (skip steps, e.g. to only regenerate the infographic):
 #   -S  comma-separated steps to skip: evolve,retrain,infographic (default: none)
@@ -45,9 +47,11 @@ lr_scheduler="None"
 data_augmentation_flag=""
 early_stopping_flag=""
 early_stopping_patience=10
+en_pop_crossover_flag=""
+mixed_precision_flag=""
 skip_steps=""
 
-while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:" opt; do
+while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:XM" opt; do
     case "$opt" in
         e) experiment_path="$OPTARG" ;;
         c) config_file="$OPTARG" ;;
@@ -63,6 +67,8 @@ while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:" opt; do
         T) early_stopping_flag="--early_stopping_enabled" ;;
         P) early_stopping_patience="$OPTARG" ;;
         S) skip_steps="$OPTARG" ;;
+        X) en_pop_crossover_flag="--en_pop_crossover" ;;
+        M) mixed_precision_flag="--mixed_precision" ;;
         *) echo "Unknown option"; exit 1 ;;
     esac
 done
@@ -96,6 +102,7 @@ if should_run "evolve"; then
     )
     [[ -n "$fitness_metric" ]] && evolve_args+=(--fitness_metric "$fitness_metric")
     [[ -n "$continue_path" ]] && evolve_args+=(--continue_path "$continue_path")
+    [[ -n "$en_pop_crossover_flag" ]] && evolve_args+=("$en_pop_crossover_flag")
 
     uv run python "${SRC_DIR}/run_evolution.py" "${evolve_args[@]}"
 else
@@ -117,7 +124,8 @@ if should_run "retrain"; then
         --lr_scheduler "$lr_scheduler" \
         --early_stopping_patience "$early_stopping_patience" \
         $data_augmentation_flag \
-        $early_stopping_flag
+        $early_stopping_flag \
+        $mixed_precision_flag
 else
     echo "=== [2/3] Retrain: skipped ==="
 fi
