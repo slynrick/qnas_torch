@@ -254,14 +254,23 @@ def train(model: torch.nn.Module,
     max_epochs = params['max_epochs']
     milestones = [0.5 * max_epochs, 0.75 * max_epochs]
 
-    # Early stopping: stop retraining once validation loss plateaus instead of
-    # always running the full max_epochs (mirrors cnn/train.py's search-phase
-    # early stopping). Disabled by default - opt in via --early_stopping_enabled.
+    # Early stopping: stop retraining once the monitored validation metric
+    # plateaus instead of always running the full max_epochs (mirrors
+    # cnn/train.py's search-phase early stopping). Disabled by default - opt in
+    # via --early_stopping_enabled. Monitors accuracy instead of loss when that's
+    # what fitness_metric optimizes for, so a stalled/noisy loss doesn't stop a
+    # model whose accuracy is still improving.
     es_enabled = params.get('early_stopping_enabled', False)
     es_patience = params.get('early_stopping_patience', 10)
     es_min_delta = params.get('early_stopping_min_delta', 0.0)
     es_counter = 0
     stopped_early_at = None
+    fitness_metric = params.get('fitness_metric')
+    mo_base_metric = params.get('mo_metric_base')
+    es_monitor_accuracy = (
+        fitness_metric == 'best_accuracy'
+        or (fitness_metric == 'scalar_multi_objective' and mo_base_metric == 'accuracy')
+    )
 
     best_model_path = os.path.join(params['model_path'], 'best_model.pth')
 
@@ -288,13 +297,21 @@ def train(model: torch.nn.Module,
         validation_losses.append(validation_loss)
         validation_accuracies.append(accuracy)
         
+        prev_best_accuracy = best_accuracy
+        prev_best_validation_loss = best_validation_loss
         if accuracy > best_accuracy:
             best_accuracy = accuracy
             torch.save(model.state_dict(), best_model_path)
             create_info_file(params['model_path'], {'best_accuracy': best_accuracy}, 'best_accuracy.txt')
 
-        if validation_loss < best_validation_loss - es_min_delta:
+        if validation_loss < best_validation_loss:
             best_validation_loss = validation_loss
+
+        if es_monitor_accuracy:
+            monitored_improved = accuracy > prev_best_accuracy + es_min_delta
+        else:
+            monitored_improved = validation_loss < prev_best_validation_loss - es_min_delta
+        if monitored_improved:
             es_counter = 0
         else:
             es_counter += 1

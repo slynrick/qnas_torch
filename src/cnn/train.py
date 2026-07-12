@@ -158,15 +158,26 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     epochs_to_eval = params['epochs_to_eval']
     start_eval = max_epochs - epochs_to_eval
 
-    # Per-individual early stopping: stop THIS model's training once its validation
-    # loss stops improving, instead of always running the full max_epochs. Distinct
-    # from QNAS-level early_stopping (src/qnas.py), which stops the whole generational
-    # search - this stops one individual's training loop.
+    # Per-individual early stopping: stop THIS model's training once its monitored
+    # validation metric stops improving, instead of always running the full
+    # max_epochs. Distinct from QNAS-level early_stopping (src/qnas.py), which stops
+    # the whole generational search - this stops one individual's training loop.
+    #
+    # Monitors whichever metric actually drives fitness (see fitness_metric handling
+    # below, ~line 243) instead of always watching val_loss: otherwise a model whose
+    # accuracy is still climbing can get killed by a stalled/noisy loss that isn't
+    # even what's being optimized for.
     individual_es_enabled = params.get('early_stopping_enabled', False)
     individual_es_patience = params.get('early_stopping_patience', 5)
     individual_es_min_delta = params.get('early_stopping_min_delta', 0.0)
     individual_es_counter = 0
     stopped_early_at = None
+    fitness_metric = params['fitness_metric']
+    mo_base_metric = params.get('mo_metric_base')
+    es_monitor_accuracy = (
+        fitness_metric == 'best_accuracy'
+        or (fitness_metric == 'scalar_multi_objective' and mo_base_metric == 'accuracy')
+    )
 
     # Automatic mixed precision training (AMP)
     amp_device = torch.device(params['device']).type
@@ -193,12 +204,23 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
             validation_losses.append(validation_loss)
             validation_accuracies.append(accuracy)
 
+            # min_delta gates only the patience-counter reset below, not this
+            # best-value bookkeeping, so best_accuracy/best_validation_loss always
+            # reflect the true best seen regardless of the early-stopping threshold.
+            prev_best_accuracy = best_accuracy
+            prev_best_validation_loss = best_validation_loss
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 create_info_file(params['model_path'], {'best_accuracy': best_accuracy}, 'best_accuracy.txt')
-            if validation_loss < best_validation_loss - individual_es_min_delta:
+            if validation_loss < best_validation_loss:
                 best_validation_loss = validation_loss
                 create_info_file(params['model_path'], {'best_validation_loss': best_validation_loss}, 'best_validation_loss.txt')
+
+            if es_monitor_accuracy:
+                monitored_improved = accuracy > prev_best_accuracy + individual_es_min_delta
+            else:
+                monitored_improved = validation_loss < prev_best_validation_loss - individual_es_min_delta
+            if monitored_improved:
                 individual_es_counter = 0
             else:
                 individual_es_counter += 1

@@ -130,10 +130,17 @@ algorithm.
 A plain genetic algorithm would keep a population of concrete architectures
 and mutate/crossover them directly. Q-NAS instead keeps, **for each node
 position, a probability distribution over which op is likely to go there**.
-This is `QPopulationNetwork.probabilities`, a 3-D array of shape
-`[num_quantum_individuals, num_nodes, num_ops]` — for every "quantum
-individual" (think of it as one evolving probability table) and every node,
-it holds a probability for each candidate op, summing to 1 per node.
+This is `QPopulationNetwork.probabilities`, a **list of length `num_nodes`**,
+one `[num_quantum_individuals, num_ops_at_that_node]` array per node — for
+every "quantum individual" (think of it as one evolving probability table)
+and every node, it holds a probability for each candidate op, summing to 1
+per node. It's kept as a ragged Python list rather than one dense 3-D array
+because different nodes can end up with different op menus (of possibly
+different sizes) after a progressive-growth op prune — see Appendix A. Each
+node also has its own `chromosome.fn_list[node]` (the ordered op names that
+row's probabilities line up with); outside of progressive growth every node
+starts with an identical `fn_list`/`num_ops`, so the "3-D array" mental model
+still holds in that common case.
 
 Every generation, **concrete (classical) individuals are sampled** from this
 distribution (`generate_classical()`, using `np.random.choice` weighted by
@@ -266,6 +273,20 @@ Each worker process runs `run_individuals`, which calls
 simple loop (individuals within one worker process are trained
 sequentially; parallelism comes from having multiple worker processes).
 
+`EvalPopulation.__init__` builds one `GenericDataLoader` (`cnn/input.py`)
+shared for the whole run. By default (`train.use_seed: True`, the default,
+with `train.seed` defaulting to a fixed constant) it seeds Python/NumPy/
+`sklearn`'s `StratifiedShuffleSplit` explicitly, so the train/validation
+split — and the subset picked when `limit_data` is on — is identical every
+time `get_loader()` is called, across every generation, worker thread, and
+individual. Before this, the split re-ran against unseeded global RNG state
+on every call, so two individuals in the same generation (or the same
+architecture reappearing in a later generation) could silently be scored
+against different data, undermining the fitness comparisons the whole
+search depends on. Set `train.use_seed: False` to opt back into a fresh
+random split per run (still internally consistent within that one loader's
+lifetime).
+
 ---
 
 ## 8. Training one individual (`fitness_calculation`)
@@ -283,7 +304,17 @@ For a single individual, `cnn/train.py`'s `fitness_calculation`:
    sequentially with a final classifier head.
 3. Trains it for a short, configurable number of epochs (`train()` in the
    same file), tracking training/validation loss and accuracy each epoch,
-   with optional per-individual early stopping.
+   with optional per-individual early stopping (config:
+   `early_stopping_enabled`/`_patience`/`_min_delta`) — this monitors
+   whichever metric `fitness_metric` (step 5 below) actually optimizes for
+   — accuracy or loss — not always validation loss, so a model whose
+   accuracy is still improving isn't killed by a stalled/noisy loss it
+   isn't even being scored on. Two optional performance features apply
+   here too: `train.mixed_precision` (AMP, `torch.autocast`/`GradScaler`)
+   and `train.channels_last` (NHWC memory format — lets cuDNN pick its
+   fastest Tensor Core conv kernels on Ampere+ GPUs under AMP, typically
+   1.2-1.4x faster; changes only the tensors' physical memory layout, not
+   their logical NCHW shape or the resulting numbers).
 4. Measures parameter count, FLOPs, and CUDA inference time
    (`cnn/metrics.py`).
 5. Computes the **fitness** from whichever metric the config selects:
@@ -455,23 +486,37 @@ A config file opts in with a `progressive_stages` list under `QNAS:`:
 ```yaml
 QNAS:
   progressive_stages:
-    - {gen_start: 0,   num_nodes: 7,  num_ops: 11}
-    - {gen_start: 50,  num_nodes: 13, num_ops: 7}
-    - {gen_start: 100, num_nodes: 20, num_ops: 4}
+    - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
+    - {gen_start: 100, num_nodes: 13, num_ops: 8}
+    - {gen_start: 200, num_nodes: 20, num_ops: 4}
+
+  # Optional, both default False - see A.3.
+  reset_probs_on_stage_change: True
+  global_op_pruning: False
 ```
 
 Each entry says: "starting at generation `gen_start`, the network has
-`num_nodes` nodes and a menu of `num_ops` candidate operations." Stage 0
-must start at generation 0 and must use the *full* operation menu (there's
-nothing to prune yet). Later stages grow `num_nodes` (deeper networks) and
-shrink `num_ops` (fewer choices per node).
+`num_nodes` nodes and a menu of up to `num_ops` candidate operations per
+node." Stage 0 must start at generation 0 and must use the *full* operation
+menu (there's nothing to prune yet). Later stages grow `num_nodes` (deeper
+networks) and shrink `num_ops` (fewer choices per node).
+
+Two independent flags (both default to `False`) tune how a transition
+prunes/carries over the search's existing knowledge; see A.3 for what each
+one actually changes:
+
+- `reset_probs_on_stage_change` — forget vs. carry over the learned PMF for
+  ops that survive the prune.
+- `global_op_pruning` — rank/prune ops once for the whole network vs.
+  independently per node (the default; lets different node positions settle
+  on different surviving ops).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Stage0
-    Stage0: Stage 0 (gen 0+)\n7 nodes, 11 ops (full menu)
-    Stage1: Stage 1 (gen 50+)\n13 nodes, 7 ops
-    Stage2: Stage 2 (gen 100+)\n20 nodes, 4 ops
+    Stage0: Stage 0 (gen 0+)\n7 nodes, up to 13 ops/node (full menu)
+    Stage1: Stage 1 (gen 100+)\n13 nodes, up to 8 ops/node
+    Stage2: Stage 2 (gen 200+)\n20 nodes, up to 4 ops/node
     Stage0 --> Stage1: current_gen reaches progressive_stages[1].gen_start
     Stage1 --> Stage2: current_gen reaches progressive_stages[2].gen_start
     Stage2 --> [*]: evolution ends (max_generations reached)
@@ -489,74 +534,129 @@ flowchart TD
     A["evolve() loop: new generation starts"] --> B{"progressive_stages configured AND\ncurrent_gen reached the next stage's gen_start?"}
     B -- no --> G["generate_classical() + evaluate,\nas in any normal generation"]
     B -- yes --> C["_transition_stage(new_stage_idx)"]
-    C --> D["_rank_and_prune_ops():\nrank every op in the CURRENT menu by its\nmean probability across the whole quantum\npopulation (probabilities.mean over quantum\nindividuals AND nodes), keep the top num_ops"]
-    D --> E["qpop_net.grow_and_prune_discrete():\nresize the probabilities tensor -\ngrow the node axis, prune the op axis"]
-    E --> F["eval_func.fn_list = new (pruned) op menu\ncurrent_stage_idx = new_stage_idx\n_just_transitioned = True"]
+    C --> D{"global_op_pruning?"}
+    D -- "False (default)" --> D1["_rank_and_prune_all_nodes():\neach node ranks its OWN ops by that\nnode's mean quantum probability\n(probabilities[node].mean(axis=0)),\nindependently - nodes can diverge"]
+    D -- True --> D2["_rank_and_prune_globally():\nrank ops ONCE using the mean probability\nacross every node AND every quantum\nindividual; requires all nodes to still\nshare one op list"]
+    D1 --> E["qpop_net.grow_and_prune_discrete():\nresize probabilities per-node,\ngrow the node axis"]
+    D2 --> E
+    E --> F1["qpop_net.filter_and_remap_classical():\ndrop individuals whose surviving genes\ndon't fit the new op lists, remap the\nrest, extend survivors with no_op at\nnew node positions"]
+    F1 --> F["eval_func.fn_list = new (pruned) op menu\ncurrent_stage_idx = new_stage_idx\n_just_transitioned = True"]
     F --> G
 ```
 
-**Op pruning** (`_rank_and_prune_ops`) needed a replacement for what the
+**Op pruning** (`_rank_and_prune_ops`, called by whichever of the two
+ranking modes above is active) needed a replacement for what the
 now-removed DARTS/MixedOp version used (a per-op weight *learned by
 gradient descent* inside a continuous supernet — not available here, since
 there is no supernet). The discrete stand-in reuses something the search
 already maintains for free: `QPopulationNetwork.probabilities`, the
 quantum-inspired PMF from §5. Since ops that have been performing well tend
 to accumulate probability mass over generations (that's exactly what
-`update_quantum` does), averaging each op's probability across every
-quantum individual and every node gives a reasonable "how promising has
-this op been so far" signal, with no extra machinery needed:
+`update_quantum` does), averaging each op's probability gives a reasonable
+"how promising has this op been so far" signal, with no extra machinery
+needed. The no-op is never eligible for pruning — it's excluded from the
+ranking pool and unconditionally kept (spending one of `num_ops` slots), so
+there is always a no-op available to pad newly grown node positions (see
+below) without invalidating a surviving individual's fitness.
+
+Two modes decide *which* mean to rank by (config: `global_op_pruning`,
+default `False`):
+
+- **Per-node (default)** — `_rank_and_prune_all_nodes` ranks each node's own
+  op list by that node's own mean probability across quantum individuals
+  only (`probabilities[node].mean(axis=0)`) and keeps that node's own top
+  `num_ops`. Different node positions can end up keeping a different subset
+  of ops — e.g. node 0 might settle on convolutions while a later node keeps
+  pooling ops.
+- **Global** (`global_op_pruning: True`) — `_rank_and_prune_globally` ranks
+  every op once using the mean probability across *every* node and *every*
+  quantum individual, and applies that single surviving list to all nodes
+  uniformly — the older, network-wide-only behavior. This requires every
+  node to still share an identical op list at the point of the transition
+  (raises if per-node pruning was ever used before it, since a network-wide
+  mean isn't well-defined once nodes have diverged onto different op sets).
 
 ```python
-mean_weight = qpop_net.probabilities.mean(axis=(0, 1))  # one score per op
-# rank ops by mean_weight, keep the top `num_ops`, preserve their original order
+mean_weight = probabilities[node].mean(axis=0)  # per-node mode: one score per op, this node only
+# or, global mode:
+mean_weight = np.stack(probabilities, axis=1).mean(axis=(0, 1))  # one score per op, network-wide
+# rank ops by mean_weight (no-op excluded/always kept), keep the top `num_ops`, preserve original order
 ```
 
 **Resizing the population** (`grow_and_prune_discrete`,
-`src/population.py`) then has to reshape `probabilities` from
-`[num_ind, old_num_nodes, old_num_ops]` to `[num_ind, new_num_nodes,
-new_num_ops]`:
+`src/population.py`) then updates `probabilities` (still the ragged,
+per-node list from §5) and `chromosome.fn_list` node by node:
 
 ```mermaid
 flowchart LR
-    subgraph before["Before: probabilities[num_ind, 7, 11]"]
-        B1["7 nodes x 11 ops"]
+    subgraph before["Before: 7 nodes, each its own op list/probabilities"]
+        B1["nodes 0-6"]
     end
-    subgraph after["After: probabilities[num_ind, 13, 7]"]
-        A1["13 nodes x 7 ops"]
+    subgraph after["After: 13 nodes"]
+        A1["nodes 0-6 (pruned)"]
+        A2["nodes 7-12 (new)"]
     end
-    B1 -- "for the first 7 (surviving) nodes:\ncarry over the KEPT ops' probability mass,\nmatched by name, then renormalize each\nnode's row back to sum-to-1" --> A1
-    B1 -. "for the 6 NEW nodes (8-13):\nseed with the MEAN of the 7 surviving\nnodes' renormalized distributions,\nper quantum individual" .-> A1
+    B1 -- "reset_probs_on_stage_change: False (default) -\ncarry over the KEPT ops' probability mass,\nmatched by name, renormalize each row to sum-to-1.\nIf a row's carried mass is ~0 (all its mass was on\npruned ops), that row resets to uniform instead." --> A1
+    B1 -. "reset_probs_on_stage_change: True -\nevery surviving node's row is reset to\nUNIFORM over its new (pruned) op list,\ndiscarding what was learned pre-transition" .-> A1
+    B1 -- "new nodes seeded UNIFORM over the\nDISTINCT UNION of ops that survived\npruning across all existing nodes\n(same row for every quantum individual) -\nnever mean-seeded, regardless of reset_probs" --> A2
 ```
 
-New nodes are deliberately not seeded uniformly: averaging the surviving
-nodes' distributions carries forward "what has worked at the nodes that
-survived the transition" as a prior for the newly added depth, instead of
-discarding that signal and starting from scratch. Averaging
-already-normalized rows keeps the result summing to 1 with no extra
-renormalization needed.
+New nodes are seeded uniformly over the *union* of surviving ops (not
+mean-seeded from the surviving nodes' distributions, and not affected by
+`reset_probs_on_stage_change`, since there is no prior for a brand-new node
+position to reset or carry over in the first place) — simpler than the
+mean-seeding this repository used previously, and avoids biasing a new node
+toward whichever surviving node happened to have the most mass concentrated
+on a single op.
 
 Renormalizing after dropping ops matters: `generate_classical()` samples
-each node with `np.random.choice(..., p=probabilities[...])`, which
-requires the probabilities for a node to sum to 1 — simply deleting the
-pruned ops' columns without renormalizing would leave each row summing to
-less than 1.
+each node with `np.random.choice(..., p=probabilities[node][...])`, which
+requires that node's probabilities to sum to 1 — simply deleting the pruned
+ops' columns without renormalizing would leave a row summing to less than 1.
 
-### A.4 A subtlety: population reset at a transition boundary
+### A.4 A subtlety: carrying the classical population across a transition
 
-Growing `num_nodes` changes the *shape* of every individual's chromosome
-(an architecture is an array of `num_nodes` op indices) — a chromosome from
-before the transition (7 numbers) can no longer be compared or merged with
-one from after (13 numbers). Normal generations merge the previous
-generation's survivors with the newly-sampled population
-(`replace_pop`'s `elitism`/`best` selection); right after a stage
-transition, that merge is impossible, so `QNAS` treats the first
-post-transition generation as a fresh start (`_just_transitioned` flag) —
-the new, larger-chromosome population simply becomes the current
-population outright, with no attempt to carry over specific individuals
-from the old shape. `best_so_far` (the best fitness recorded across the
-*entire* run) is still preserved correctly across this reset — it is never
-allowed to decrease, since a fresh, un-evaluated population may score lower
-than a well-optimized previous stage until it catches up.
+Growing `num_nodes` and pruning each node's op menu both change the
+*shape/meaning* of every individual's chromosome (an architecture is an
+array of `num_nodes` op indices, each index into that node's own op list) —
+a chromosome from before the transition can't be directly compared or
+merged with one from after. Rather than discarding the whole classical
+population at every transition (which would throw away already-evaluated
+fitness for individuals that are still perfectly valid),
+`filter_and_remap_classical` (`src/population.py`, called from
+`_transition_stage`) individual-by-individual:
+
+- For each pre-existing node, looks up the op name that individual's gene
+  currently encodes. If that op didn't survive the prune at that node, the
+  **whole individual is dropped** — its network is no longer decodable in
+  the new op menu, so its old fitness no longer means anything.
+- Otherwise, remaps that gene to the op's new index (pruning can reorder a
+  node's surviving ops), and pads any newly grown node positions with the
+  no-op's index — a no-op is a computational identity, so extending a
+  surviving individual with it doesn't change what its already-measured
+  fitness describes; it does **not** need to be retrained just because the
+  population grew deeper.
+
+The individuals that pass this filter keep their fitness from before the
+transition and are carried straight into the current population
+(`current_pop`, `fitnesses`, `raw_fitnesses` are all filtered/remapped
+together); the individuals that get dropped are simply gone until the next
+`generate_classical()` call resamples fresh ones from the (freshly
+resized) quantum distribution to refill the population. If *no* individual
+survives the prune, `current_pop` is set to `None` and `QNAS` logs a
+warning — the next generation starts from scratch on the new op menu, same
+as before this mechanism existed.
+
+`QNAS` still treats the first post-transition generation as special
+(`_just_transitioned` flag) so `replace_pop`'s normal
+`elitism`/`best` merge logic — which assumes old and new populations share
+a chromosome shape — isn't applied across the boundary; the
+filter-and-remap step above is what replaces it. `best_so_far` (the best
+fitness recorded across the *entire* run) is preserved correctly across a
+transition regardless of how many individuals survive the filter — it is
+never allowed to decrease, since a partially-refilled or freshly-resampled
+population may score lower than a well-optimized previous stage until it
+catches up.
 
 ### A.5 Why no weight transfer between stages
 
@@ -568,11 +668,20 @@ means copying weights between structurally-compatible mixture modules),
 here every individual is an independent, single-path concrete network, so
 warm-starting would require inventing a layer-matching heuristic between
 two differently-shaped, differently-sized networks — a lot of complexity
-for uncertain benefit. Instead, the only reuse mechanism across the whole
-run is the architecture cache (§9): if the *exact same* architecture
-reappears **within a stage** (which happens often, e.g. via elitism
-carrying an individual forward unchanged), its fitness is reused;
-otherwise, everything trains from scratch. Across a stage boundary this
-never applies - a different `num_nodes`/op menu means every architecture's
-`net_list` necessarily differs in length or content, so cache keys from
-different stages never match.
+for uncertain benefit. This is distinct from what A.4 describes: A.4's
+`filter_and_remap_classical` carries forward an individual's already-known
+*fitness score* (a scalar) across a stage boundary when its architecture is
+still valid under the new op menu, which needs no layer-matching at all —
+it's the same kind of reuse the architecture cache (§9) already does within
+a stage, just applied across the transition instead of skipped there.
+*Weights* are a different matter: within a stage, if the *exact same*
+architecture reappears (which happens often, e.g. via elitism carrying an
+individual forward unchanged), the architecture cache reuses its fitness
+without retraining, but there are never any weights to reuse either way -
+the cache only ever stores the scalar result (§9). Across a stage boundary,
+even a surviving individual's `net_list` differs from before (deeper, and
+possibly re-indexed), so it is retrained from scratch to get a fitness
+number that's valid at the new depth/op menu - only individuals whose op at
+every pre-existing node happened to survive pruning skip that retrain, via
+A.4's mechanism, and only for the fitness they already had *before* growing
+deeper.

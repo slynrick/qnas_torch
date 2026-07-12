@@ -96,11 +96,14 @@ train:
     threads: 2
 
     # Per-individual training early stopping: stop one candidate's brief training
-    # early once its validation loss plateaus, instead of always running the full
-    # max_epochs. Distinct from QNAS.patience above, which stops the whole search.
+    # early once its monitored validation metric plateaus, instead of always
+    # running the full max_epochs. Distinct from QNAS.patience above, which stops
+    # the whole search. Monitors whatever fitness_metric optimizes for above -
+    # here, accuracy (a percentage) - so min_delta is in percentage points, not
+    # loss units.
     early_stopping_enabled: True
     early_stopping_patience: 5
-    early_stopping_min_delta: 0.005
+    early_stopping_min_delta: 0.05
 
     # penalization parameters - scalarized fitness
     max_params: 1300000 # 1.3M
