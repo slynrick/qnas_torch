@@ -323,7 +323,8 @@ class QNAS(object):
 
         new_pop_net = self.qpop_net.generate_classical()
 
-        if self.current_gen > 0 and self.en_pop_crossover:
+        if (self.current_gen > 0 and self.en_pop_crossover
+                and self.qpop_net.current_pop is not None):
             if self.current_gen % self.crossover_frequency == 0:
                 num_offspring = int(len(new_pop_net) * self.pop_crossover_rate)
                 best_current_pop = self.qpop_net.current_pop[:num_offspring]

@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import re
+import statistics
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -18,7 +19,6 @@ from matplotlib.patches import FancyBboxPatch
 
 from util import load_pkl, load_yaml
 
-_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+")
 _HHMM_RE = re.compile(r"(\d+)h:?(\d+)m")
 
 # --- palette -----------------------------------------------------------
@@ -199,47 +199,47 @@ def _parse_hhmm_seconds(time_str):
     return hours * 3600 + minutes * 60
 
 
-def search_wall_time_seconds(experiment_path, gen_data):
-    """Real wall-clock duration of the search, from the first log line's
-    timestamp to the last generation's recorded time (both in log_QNAS.txt /
-    data_QNAS.pkl). Falls back to first-generation-to-last-generation if the
-    log file is missing, since that's still an observed timestamp span.
+def actual_running_time_seconds(gen_data, pause_factor=3.0):
+    """Sum of per-generation wall-clock durations, excluding any gap that looks
+    like a pause rather than genuine compute - e.g. the process crashed (like the
+    generate_classical/current_pop=None bug after a progressive-stage transition)
+    and sat untouched until manually resumed via --continue_path. Unlike a raw
+    first-generation-to-last-generation timestamp span, this doesn't count that
+    idle stretch as search time.
+
+    A per-generation gap is treated as a pause if it exceeds *pause_factor* times
+    the median generation duration - normal generations vary in duration (more
+    individuals to train, deeper progressive stages) but not by multiples of the
+    typical case, so this only strips genuinely anomalous gaps.
+
+    Args:
+        gen_data: {generation: {...}} loaded from data_QNAS.pkl, each entry with
+            a "time" ISO timestamp recorded when that generation finished.
+        pause_factor: (float) gap-to-median-duration ratio above which a gap is
+            treated as a pause and excluded.
+
+    Returns:
+        float seconds of actual running time, or None if it can't be computed.
     """
-    if not gen_data:
+
+    if not gen_data or len(gen_data) < 2:
         return None
 
-    start_dt = None
-    log_path = os.path.join(experiment_path, "log_QNAS.txt")
-    if os.path.exists(log_path):
-        try:
-            with open(log_path) as f:
-                first_line = f.readline()
-            m = _TIMESTAMP_RE.search(first_line)
-            if m:
-                start_dt = datetime.fromisoformat(m.group(0))
-        except Exception:
-            start_dt = None
-
-    last_gen = max(gen_data.keys())
-    end_str = gen_data[last_gen].get("time")
-    if not end_str:
-        return None
-    try:
-        end_dt = datetime.fromisoformat(end_str)
-    except Exception:
-        return None
-
-    if start_dt is None:
-        first_gen = min(gen_data.keys())
-        first_str = gen_data[first_gen].get("time")
-        if not first_str:
+    gens = sorted(gen_data.keys())
+    times = []
+    for g in gens:
+        t = gen_data[g].get("time")
+        if not t:
             return None
         try:
-            start_dt = datetime.fromisoformat(first_str)
+            times.append(datetime.fromisoformat(t))
         except Exception:
             return None
 
-    return (end_dt - start_dt).total_seconds()
+    deltas = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
+    median = statistics.median(deltas)
+    threshold = median * pause_factor if median > 0 else None
+    return sum(d for d in deltas if threshold is None or d <= threshold)
 
 
 def load_retrain_runs(experiment_path):
@@ -582,11 +582,13 @@ def draw_stat_tiles(fig, gs_row, indiv_df, gen_data, search_time_s, retrain_runs
     best_params = indiv_df.loc[indiv_df["best_accuracy"].idxmax(), "total_trainable_params"] \
         if not indiv_df.empty and indiv_df["best_accuracy"].notna().any() else None
     n_generations = len(gen_data) if gen_data else 0
-    # GPU-days = wall-clock search time * number of physical GPUs used. Threads
-    # sharing one GPU don't add throughput, so this is wall time * len(available_gpus),
-    # not a sum of per-individual durations (those threads contend for the same
-    # GPU(s), and only a handful of individual dirs typically survive on disk to
-    # average over, making a per-individual extrapolation unreliable).
+    # GPU-days = actual running time (search_time_s, which excludes any
+    # crash/resume idle gap - see actual_running_time_seconds) * number of physical
+    # GPUs used. Threads sharing one GPU don't add throughput, so this is running
+    # time * len(available_gpus), not a sum of per-individual durations (those
+    # threads contend for the same GPU(s), and only a handful of individual dirs
+    # typically survive on disk to average over, making a per-individual
+    # extrapolation unreliable).
     gpu_days = (search_time_s * num_gpus / 86400) if search_time_s is not None else None
 
     retrain_accs = [r["accuracy"] for r in retrain_runs]
@@ -626,7 +628,7 @@ def generate_infographic(experiment_path, output_path):
     stage_nets = load_best_networks_per_stage(gen_data, stage_ranges)
     retrain_runs = load_retrain_runs(experiment_path)
     run_config = load_run_config(experiment_path)
-    search_time_s = search_wall_time_seconds(experiment_path, gen_data)
+    search_time_s = actual_running_time_seconds(gen_data)
     num_gpus = len(run_config.get("train", {}).get("available_gpus") or [1])
 
     # The genome panel needs more room the more progressive stages it stacks.
