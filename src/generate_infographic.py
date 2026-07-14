@@ -300,6 +300,37 @@ def _format_hours(seconds):
     return f"{seconds / 3600:.1f}h"
 
 
+def load_cache_stats(experiment_path, gen_data):
+    """Distinct-architecture count and cache hit ratio, from the shared cache.json
+    (see architecture_cache.py). Each entry's hit_count is how many times that exact
+    architecture was reused from cache instead of retrained, so total cache hits is
+    the sum of hit_count across entries and distinct architectures found is just the
+    number of entries.
+    """
+    cache_path = os.path.join(experiment_path, "cache.json")
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path) as f:
+            content = f.read()
+        index = json.loads(content) if content else {}
+    except Exception:
+        return None
+    if not index:
+        return None
+
+    distinct = len(index)
+    total_hits = sum(entry.get("hit_count", 0) for entry in index.values())
+    total_evaluations = _total_individuals_evaluated(gen_data) or (distinct + total_hits)
+    hit_ratio = total_hits / total_evaluations if total_evaluations else None
+    return {
+        "distinct": distinct,
+        "total_hits": total_hits,
+        "total_evaluations": total_evaluations,
+        "hit_ratio": hit_ratio,
+    }
+
+
 def load_run_config(experiment_path):
     log_path = os.path.join(experiment_path, "log_params_evolution.txt")
     if not os.path.exists(log_path):
@@ -395,20 +426,37 @@ def draw_fitness_curve(fig, gs_cell, gen_data):
         text.set_color(MUTED)
 
 
-def draw_pareto_scatter(fig, gs_cell, indiv_df):
+def draw_cache_panel(fig, gs_cell, cache_stats):
     ax = fig.add_subplot(gs_cell)
-    _style_axes(ax, "Accuracy vs. model size")
-    if indiv_df.empty or indiv_df["total_trainable_params"].isna().all():
-        ax.text(0.5, 0.5, "no per-individual data found", color=MUTED, ha="center", va="center",
+    _style_axes(ax, "Architecture cache")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if not cache_stats:
+        ax.text(0.5, 0.5, "no cache.json found", color=MUTED, ha="center", va="center",
                 transform=ax.transAxes)
         return
 
-    df = indiv_df.dropna(subset=["total_trainable_params", "best_accuracy"])
-    sizes = 40 + 200 * (df["cuda_inference_time"].fillna(0) / max(df["cuda_inference_time"].max(), 1))
-    ax.scatter(df["total_trainable_params"] / 1e6, df["best_accuracy"], s=sizes,
-               c=ACCENT, alpha=0.75, edgecolors=BG, linewidths=0.5)
-    ax.set_xlabel("params (M)", color=MUTED, fontsize=9)
-    ax.set_ylabel("best accuracy / fitness", color=MUTED, fontsize=9)
+    distinct = cache_stats["distinct"]
+    total_hits = cache_stats["total_hits"]
+    hit_ratio = cache_stats["hit_ratio"]
+
+    tiles = [
+        ("Distinct architectures", f"{distinct}"),
+        ("Cache hits", f"{total_hits}"),
+        ("Cache hit ratio", f"{hit_ratio * 100:.1f}%" if hit_ratio is not None else "—"),
+    ]
+    n = len(tiles)
+    tile_w = 1.0 / n
+    for i, (label, value) in enumerate(tiles):
+        x0 = i * tile_w
+        ax.add_patch(FancyBboxPatch((x0 + tile_w * 0.06, 0.1), tile_w * 0.88, 0.8,
+                                     boxstyle="round,pad=0.01,rounding_size=0.03",
+                                     transform=ax.transAxes, facecolor=PANEL_BG,
+                                     edgecolor=GRID, linewidth=1))
+        ax.text(x0 + tile_w / 2, 0.62, value, transform=ax.transAxes, ha="center", va="center",
+                fontsize=19, color=ACCENT_2, fontweight="bold")
+        ax.text(x0 + tile_w / 2, 0.28, label, transform=ax.transAxes, ha="center", va="center",
+                fontsize=9, color=MUTED)
 
 
 def _draw_genome_row(ax, y0, row_h, ops, label):
@@ -629,6 +677,7 @@ def generate_infographic(experiment_path, output_path):
     retrain_runs = load_retrain_runs(experiment_path)
     run_config = load_run_config(experiment_path)
     search_time_s = actual_running_time_seconds(gen_data)
+    cache_stats = load_cache_stats(experiment_path, gen_data)
     num_gpus = len(run_config.get("train", {}).get("available_gpus") or [1])
 
     # The genome panel needs more room the more progressive stages it stacks.
@@ -645,7 +694,7 @@ def generate_infographic(experiment_path, output_path):
 
     draw_header(fig, gs[0, :], experiment_path, gen_data, indiv_df, run_config, search_time_s)
     draw_fitness_curve(fig, gs[1, 0], gen_data)
-    draw_pareto_scatter(fig, gs[1, 1], indiv_df)
+    draw_cache_panel(fig, gs[1, 1], cache_stats)
     draw_genome_strip(fig, gs[2, :], best_net, stage_nets)
     draw_timing_panel(fig, gs[3, 0], search_time_s, retrain_runs)
     draw_stage_timeline(fig, gs[3, 1], gen_data)
