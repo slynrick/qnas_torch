@@ -29,7 +29,7 @@ QNAS:
     # If True, quantum individuals' probabilities reset to uniform at each stage
     # transition above instead of carrying over/renormalizing what was learned so
     # far on the pre-transition op menu.
-    reset_probs_on_stage_change: True
+    reset_probs_on_stage_change: False
 
     # If True, op pruning at each stage transition ranks ops ONCE network-wide and
     # applies the same surviving op list to every node. If False (default), each
