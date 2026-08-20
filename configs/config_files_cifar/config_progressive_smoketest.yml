@@ -17,12 +17,14 @@ QNAS:
     pop_crossover_method: hux
     patience: 60
 
-    progressive_stages:
-        - {gen_start: 0, num_nodes: 4, num_ops: 11}
-        - {gen_start: 1, num_nodes: 6, num_ops: 6}
+    progressive:
+        enabled: True
+        stages:
+            - {gen_start: 0, num_nodes: 4, num_ops: 11}
+            - {gen_start: 1, num_nodes: 6, num_ops: 6}
 
-    reset_probs_on_stage_change: False
-    global_op_pruning: False
+        reset_probs_on_stage_change: False
+        global_op_pruning: False
 
     params_ranges:
         decay: 0.9

@@ -18,23 +18,27 @@ QNAS:
     pop_crossover_method: hux # hux, uniform
     patience: 60
 
-    # P-DARTS-style progressive depth growth + operation pruning.
-    # Stage 0 must start at gen_start: 0 and use the full op menu (13 ops below).
-    # Op pruning between stages ranks ops by mean quantum probability mass.
-    progressive_stages:
-        - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
-        - {gen_start: 100, num_nodes: 13, num_ops: 8}
-        - {gen_start: 200, num_nodes: 20, num_ops: 4}
+    # P-DARTS-style progressive depth growth + operation pruning. Set enabled:
+    # False to run plain (non-progressive) QNAS without deleting the stage list.
+    progressive:
+        enabled: True
 
-    # If True, quantum individuals' probabilities reset to uniform at each stage
-    # transition above instead of carrying over/renormalizing what was learned so
-    # far on the pre-transition op menu.
-    reset_probs_on_stage_change: False
+        # Stage 0 must start at gen_start: 0 and use the full op menu (13 ops below).
+        # Op pruning between stages ranks ops by mean quantum probability mass.
+        stages:
+            - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
+            - {gen_start: 100, num_nodes: 13, num_ops: 8}
+            - {gen_start: 200, num_nodes: 20, num_ops: 4}
 
-    # If True, op pruning at each stage transition ranks ops ONCE network-wide and
-    # applies the same surviving op list to every node. If False (default), each
-    # node ranks and prunes its own ops independently.
-    global_op_pruning: False
+        # If True, quantum individuals' probabilities reset to uniform at each stage
+        # transition above instead of carrying over/renormalizing what was learned so
+        # far on the pre-transition op menu.
+        reset_probs_on_stage_change: False
+
+        # If True, op pruning at each stage transition ranks ops ONCE network-wide and
+        # applies the same surviving op list to every node. If False (default), each
+        # node ranks and prunes its own ops independently.
+        global_op_pruning: False
 
     params_ranges:
         decay: 0.9

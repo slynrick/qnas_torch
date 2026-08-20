@@ -481,25 +481,39 @@ stages.
 
 ### A.2 Configuring stages
 
-A config file opts in with a `progressive_stages` list under `QNAS:`:
+A config file opts in with a `progressive:` block under `QNAS:`, grouping the
+stage list together with the two tuning flags below and an explicit
+`enabled` switch:
 
 ```yaml
 QNAS:
-  progressive_stages:
-    - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
-    - {gen_start: 100, num_nodes: 13, num_ops: 8}
-    - {gen_start: 200, num_nodes: 20, num_ops: 4}
+  progressive:
+    enabled: True   # optional tri-state, see below
 
-  # Optional, both default False - see A.3.
-  reset_probs_on_stage_change: True
-  global_op_pruning: False
+    stages:
+      - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
+      - {gen_start: 100, num_nodes: 13, num_ops: 8}
+      - {gen_start: 200, num_nodes: 20, num_ops: 4}
+
+    # Optional, both default False - see A.3.
+    reset_probs_on_stage_change: True
+    global_op_pruning: False
 ```
 
-Each entry says: "starting at generation `gen_start`, the network has
+Each stage entry says: "starting at generation `gen_start`, the network has
 `num_nodes` nodes and a menu of up to `num_ops` candidate operations per
 node." Stage 0 must start at generation 0 and must use the *full* operation
 menu (there's nothing to prune yet). Later stages grow `num_nodes` (deeper
 networks) and shrink `num_ops` (fewer choices per node).
+
+`progressive.enabled` is a tri-state, letting a config keep its `stages`
+list on file without it being active:
+
+- absent (or the whole `progressive:` block absent) — inferred from whether
+  `stages` is set, i.e. plain QNAS (identical to `main`'s behavior) unless a
+  config opts in with a `stages` list.
+- `False` — forces plain (non-progressive) QNAS even if `stages` is present.
+- `True` — requires `stages` to be set; raises a config error otherwise.
 
 Two independent flags (both default to `False`) tune how a transition
 prunes/carries over the search's existing knowledge; see A.3 for what each

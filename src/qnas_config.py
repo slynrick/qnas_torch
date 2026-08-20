@@ -158,31 +158,44 @@ class ConfigParameters(object):
         self.QNAS_spec['en_pop_crossover'] = self.args['en_pop_crossover']
 
         # P-DARTS-style progressive depth growth + operation pruning (optional).
-        # List of {gen_start, num_nodes, num_ops} stages, sorted by gen_start.
-        # Config-file only, no CLI flag.
-        stages = config_file.get('QNAS', {}).get('progressive_stages', None)
+        # Everything related lives under QNAS.progressive so one block documents
+        # and controls the whole feature. Config-file only, no CLI flag.
+        #
+        # progressive.enabled is a tri-state:
+        #   - absent (or the whole `progressive` block absent): inferred from
+        #     whether `stages` is set, for backward compatibility.
+        #   - False: force progressive mode off even if `stages` is present,
+        #     so a config can keep its stage list on file without deleting it.
+        #   - True: require `stages` to be set; raises otherwise.
+        progressive_cfg = self.QNAS_spec.pop('progressive', None) or {}
+        enabled = progressive_cfg.get('enabled', None)
+        stages = progressive_cfg.get('stages', None)
+
+        if enabled is False:
+            stages = None
+        elif enabled is True and not stages:
+            raise ValueError(
+                "QNAS.progressive.enabled: True requires QNAS.progressive.stages to be set"
+            )
+
         if stages:
             stages = sorted(stages, key=lambda s: s['gen_start'])
             if stages[0]['gen_start'] != 0:
-                raise ValueError("progressive_stages must include a stage starting at gen_start=0")
+                raise ValueError("progressive.stages must include a stage starting at gen_start=0")
         self.QNAS_spec['progressive_stages'] = stages
 
-        # Whether to reset quantum individuals' probabilities to uniform at each
-        # progressive-stage transition (op pruning + depth growth), instead of the
-        # default carry-over/renormalize behavior (see
-        # QPopulationNetwork.grow_and_prune_discrete). Config-file only, no CLI flag.
-        self.QNAS_spec['reset_probs_on_stage_change'] = config_file.get('QNAS', {}).get(
+        # Ignored unless progressive mode is active (see qnas.py::initialize_qnas).
+        # reset_probs_on_stage_change: if True, quantum individuals' probabilities
+        # reset to uniform at each stage transition instead of the default
+        # carry-over/renormalize behavior (see QPopulationNetwork.grow_and_prune_discrete).
+        self.QNAS_spec['reset_probs_on_stage_change'] = progressive_cfg.get(
             'reset_probs_on_stage_change', False
         )
 
-        # Whether op pruning at each stage transition ranks/prunes each node's ops
-        # independently (False, default - different nodes can end up with different
-        # op subsets) or ranks ops ONCE network-wide and applies the same surviving
-        # op list to every node (True - the pre-per-node-pruning behavior). Config-
-        # file only, no CLI flag.
-        self.QNAS_spec['global_op_pruning'] = config_file.get('QNAS', {}).get(
-            'global_op_pruning', False
-        )
+        # global_op_pruning: if True, op pruning at each stage transition ranks ops
+        # ONCE network-wide and applies the same surviving op list to every node.
+        # If False (default), each node ranks and prunes its own ops independently.
+        self.QNAS_spec['global_op_pruning'] = progressive_cfg.get('global_op_pruning', False)
 
         # Per-individual training early stopping (optional, config-file only). Distinct
         # from the QNAS-level early_stopping/patience above, which stops the whole
