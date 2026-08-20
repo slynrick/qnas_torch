@@ -127,3 +127,5 @@ exp*/
 x_files/*
 
 .runs.txt
+docs/*
+!docs/QNAS_ARCHITECTURE.md
