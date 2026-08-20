@@ -129,3 +129,6 @@ x_files/*
 .runs.txt
 docs/*
 !docs/QNAS_ARCHITECTURE.md
+
+# Experiment queue CLI (sqlite db, worker lockfile, job logs)
+.qnas_queue/
