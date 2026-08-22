@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     extra_args      TEXT NOT NULL DEFAULT '',
     priority        INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'queued'
-                    CHECK(status IN ('queued','running','done','failed','stopped')),
+                    CHECK(status IN ('queued','running','done','failed','stopped','cancelled')),
     pgid            INTEGER,
     log_path        TEXT,
     exit_code       INTEGER,
@@ -50,6 +50,26 @@ def ensure_dirs():
     LOG_DIR.mkdir(exist_ok=True)
 
 
+def _migrate_jobs_table(conn):
+    """Older DBs have a jobs.status CHECK constraint without 'cancelled'; SQLite can't
+    ALTER a CHECK constraint in place, so rebuild the table when that's detected."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+    ).fetchone()
+    if row is None or "cancelled" in row["sql"]:
+        return
+    conn.executescript("ALTER TABLE jobs RENAME TO jobs_old;")
+    conn.executescript(SCHEMA)
+    conn.execute(
+        "INSERT INTO jobs (id, mode, config_path, experiment_path, extra_args, priority, "
+        "status, pgid, log_path, exit_code, error_message, created_at, started_at, finished_at) "
+        "SELECT id, mode, config_path, experiment_path, extra_args, priority, "
+        "status, pgid, log_path, exit_code, error_message, created_at, started_at, finished_at "
+        "FROM jobs_old"
+    )
+    conn.executescript("DROP TABLE jobs_old;")
+
+
 @contextmanager
 def connect():
     ensure_dirs()
@@ -57,6 +77,7 @@ def connect():
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(SCHEMA)
+        _migrate_jobs_table(conn)
         conn.execute("INSERT OR IGNORE INTO worker (id, status) VALUES (1, 'stopped')")
         yield conn
         conn.commit()
@@ -91,11 +112,25 @@ def delete_job(conn, job_id):
     conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
 
+def cancel_job(conn, job_id):
+    update_job(conn, job_id, status="cancelled", finished_at=now_iso())
+
+
 def update_job(conn, job_id, **fields):
     if not fields:
         return
     cols = ", ".join(f"{key} = ?" for key in fields)
     conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", (*fields.values(), job_id))
+
+
+def resume_stopped_jobs(conn):
+    rows = conn.execute("SELECT id FROM jobs WHERE status = 'stopped'").fetchall()
+    for row in rows:
+        update_job(
+            conn, row["id"], status="queued", started_at=None, finished_at=None,
+            exit_code=None, error_message=None, pgid=None,
+        )
+    return [row["id"] for row in rows]
 
 
 def claim_next_job(conn):

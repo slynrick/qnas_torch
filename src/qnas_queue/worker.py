@@ -72,6 +72,9 @@ def run():
     with db.connect() as conn:
         db.set_worker(conn, pid=os.getpid(), status="running",
                        current_job_id=None, started_at=db.now_iso())
+        resumed = db.resume_stopped_jobs(conn)
+    for job_id in resumed:
+        print(f"Resuming stopped job {job_id}.")
 
     while not _stop_requested:
         with db.connect() as conn:

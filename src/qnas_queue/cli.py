@@ -70,13 +70,25 @@ def cmd_remove(args):
     print(f"Removed job {args.id}.")
 
 
+def cmd_cancel(args):
+    with db.connect() as conn:
+        job = db.get_job(conn, args.id)
+        if job is None:
+            sys.exit(f"error: no job with id {args.id}")
+        if job["status"] != "queued":
+            sys.exit(f"error: job {args.id} is {job['status']} - only queued jobs can be cancelled")
+        db.cancel_job(conn, args.id)
+    print(f"Job {args.id} cancelled.")
+
+
 def cmd_retry(args):
     with db.connect() as conn:
         job = db.get_job(conn, args.id)
         if job is None:
             sys.exit(f"error: no job with id {args.id}")
-        if job["status"] not in ("failed", "stopped"):
-            sys.exit(f"error: job {args.id} is {job['status']} - only failed/stopped jobs can be retried")
+        if job["status"] not in ("failed", "stopped", "cancelled"):
+            sys.exit(f"error: job {args.id} is {job['status']} - "
+                     f"only failed/stopped/cancelled jobs can be retried")
         db.update_job(
             conn, args.id, status="queued", started_at=None, finished_at=None,
             exit_code=None, error_message=None, pgid=None,
@@ -132,7 +144,7 @@ def cmd_status(args):
         print(f"  log: {current['log_path']}")
     print("Queue counts: " + ", ".join(
         f"{status}={counts.get(status, 0)}"
-        for status in ("queued", "running", "done", "failed", "stopped")
+        for status in ("queued", "running", "done", "failed", "stopped", "cancelled")
     ))
 
 
@@ -200,18 +212,26 @@ def main():
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list", help="List queued/past jobs.")
-    p_list.add_argument("--status", choices=["queued", "running", "done", "failed", "stopped"])
+    p_list.add_argument(
+        "--status",
+        choices=["queued", "running", "done", "failed", "stopped", "cancelled"],
+    )
     p_list.set_defaults(func=cmd_list)
 
-    p_remove = sub.add_parser("remove", aliases=["cancel"], help="Remove a queued job.")
+    p_remove = sub.add_parser("remove", help="Delete a job from the queue/history.")
     p_remove.add_argument("id", type=int)
     p_remove.set_defaults(func=cmd_remove)
 
-    p_retry = sub.add_parser("retry", help="Re-queue a failed/stopped job.")
+    p_cancel = sub.add_parser("cancel", help="Cancel a queued job (kept in history as 'cancelled').")
+    p_cancel.add_argument("id", type=int)
+    p_cancel.set_defaults(func=cmd_cancel)
+
+    p_retry = sub.add_parser("retry", help="Re-queue a failed/stopped/cancelled job.")
     p_retry.add_argument("id", type=int)
     p_retry.set_defaults(func=cmd_retry)
 
-    p_start = sub.add_parser("start", help="Start the background worker.")
+    p_start = sub.add_parser(
+        "start", help="Start the background worker (also resumes any stopped job).")
     p_start.set_defaults(func=cmd_start)
 
     p_stop = sub.add_parser("stop", help="Stop the worker and the currently running job.")

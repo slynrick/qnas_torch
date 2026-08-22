@@ -1,0 +1,114 @@
+# Configuration file: discrete Q-NAS with P-DARTS-style progressive growth
+# (grows network depth and shrinks the candidate-op menu across stages; based on
+# config8.yml's op menu/hyperparameters, kept fully discrete - no MixedOp).
+
+QNAS:
+    crossover_rate: 0.5
+    max_generations: 300
+    max_num_nodes: 20
+    num_quantum_ind: 5
+    penalize_number: 3
+    repetition: 4
+    replace_method: best
+    update_quantum_gen: 5
+    update_quantum_rate: 0.1
+    save_data_freq: 10
+    crossover_frequency: 5
+    pop_crossover_rate: 0.4 # offspring replacement proportion in the population
+    pop_crossover_method: hux # hux, uniform
+    patience: 60
+
+    # P-DARTS-style progressive depth growth + operation pruning. Set enabled:
+    # False to run plain (non-progressive) QNAS without deleting the stage list.
+    progressive:
+        enabled: True
+
+        # Stage 0 must start at gen_start: 0 and use the full op menu (13 ops below).
+        # Op pruning between stages ranks ops by mean quantum probability mass.
+        stages:
+            - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
+            - {gen_start: 100, num_nodes: 13, num_ops: 10}
+            - {gen_start: 200, num_nodes: 20, num_ops: 8}
+
+        # If True, quantum individuals' probabilities reset to uniform at each stage
+        # transition above instead of carrying over/renormalizing what was learned so
+        # far on the pre-transition op menu.
+        reset_probs_on_stage_change: True
+
+        # If True, op pruning at each stage transition ranks ops ONCE network-wide and
+        # applies the same surviving op list to every node. If False (default), each
+        # node ranks and prunes its own ops independently.
+        global_op_pruning: False
+
+    params_ranges:
+        decay: 0.9
+        learning_rate: 0.001
+        momentum: 0.0
+        weight_decay: 1.0e-4
+
+    function_dict:  {
+        'conv_1_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 32}, 'prob': 1.0/3.0/10.0},
+        'conv_1_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 64}, 'prob': 1.0/3.0/10.0},
+        'conv_1_1_128': {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 128}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 32}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 64}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_128': {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 128}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_256': {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 256}, 'prob': 1.0/3.0/10.0},
+        'conv_5_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 5, 'strides': 1, 'filters': 32}, 'prob': 1.0/3.0/10.0},
+        'conv_5_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 5, 'strides': 1, 'filters': 64}, 'prob': 1.0/3.0/10.0},
+        'conv_5_1_128': {'function': 'ConvBlock', 'params': {'kernel': 5, 'strides': 1, 'filters': 128}, 'prob': 1.0/3.0/10.0},
+        'max_pool_2_2': {'function': 'MaxPooling', 'params': {'kernel': 2, 'strides': 2}, 'prob': 1.0/3.0/2.0},
+        'avg_pool_2_2': {'function': 'AvgPooling', 'params': {'kernel': 2, 'strides': 2}, 'prob': 1.0/3.0/2.0},
+        'no_op':        {'function': 'NoOp', 'params': {}, 'prob': 1.0/3.0}
+    }
+
+train:
+    batch_size: 256
+    eval_batch_size: 256
+    max_epochs: 50
+    epochs_to_eval: 5
+    optimizer: AdamW
+    fitness_metric: best_accuracy
+    mo_metric_base: accuracy
+    mixed_precision: True
+    # NHWC memory format - lets cuDNN pick its fastest Tensor Core conv kernels on
+    # Ampere+ under AMP (typical 1.2-1.4x speedup).
+    channels_last: True
+    available_gpus: [0] # gpu0, gpu1, gpu2 [0, 1, 2]
+    device: cuda:0
+
+    # Dataset split/subset must be identical across every individual, generation
+    # and retrain run of this config so fitness stays comparable - see
+    # cnn/input.py GenericDataLoader. Set use_seed: False to opt back into a
+    # fresh random split per run.
+    use_seed: True
+    seed: 42
+
+    # Dataset
+    dataset: Cifar10
+    data_augmentation: False
+    subtract_mean: True
+    limit_data: True
+    limit_data_value: 10000
+    num_workers: 2
+    network_config: default
+    network_gap: False
+
+    # Tensorflow
+    save_checkpoints_epochs: 5
+    save_summary_epochs: 0.25
+    threads: 2
+
+    # Per-individual training early stopping: stop one candidate's brief training
+    # early once its monitored validation metric plateaus, instead of always
+    # running the full max_epochs. Distinct from QNAS.patience above, which stops
+    # the whole search. Monitors whatever fitness_metric optimizes for above -
+    # here, accuracy (a percentage) - so min_delta is in percentage points, not
+    # loss units.
+    early_stopping_enabled: True
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.05
+
+    # penalization parameters - scalarized fitness
+    max_params: 1300000 # 1.3M
+    max_inference_time: 6400 # us
