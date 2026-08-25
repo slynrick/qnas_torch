@@ -57,6 +57,7 @@ class QNAS(object):
 
         # P-DARTS-style progressive depth growth + op pruning (optional)
         self.progressive_stages = None
+        self.progressive_mode = None
         self.current_stage_idx = 0
         self._just_transitioned = False  # True for the generation right after a stage
                                           # transition, when current_pop has already been
@@ -75,7 +76,12 @@ class QNAS(object):
                         crossover_frequency=5, en_pop_crossover=False,
                         pop_crossover_rate=0.25, pop_crossover_method='hux',
                         progressive_stages=None, noop_fn_name=None,
-                        reset_probs_on_stage_change=False, global_op_pruning=False):
+                        reset_probs_on_stage_change=False, global_op_pruning=False,
+                        progressive_mode=None, dynamic_initial_num_nodes=None,
+                        dynamic_max_num_nodes=None, dynamic_probability_threshold=0.8,
+                        dynamic_min_ops=2, dynamic_flatness_epsilon=0.0,
+                        dynamic_check_every_gen=None, dynamic_growth_patience=1,
+                        dynamic_node_growth_amount=1):
 
         """ Initialize algorithm with several parameter values.
 
@@ -126,7 +132,28 @@ class QNAS(object):
                 (the pre-per-node-pruning behavior - all nodes always share one op
                 menu). If False (default), each node ranks and prunes its own ops
                 independently, so different nodes can end up with different op
-                subsets. Ignored if progressive_stages is not set.
+                subsets. Applies to both progressive modes.
+            progressive_mode: (str or None) 'deterministic' or 'dynamic', set only when
+                progressive mode is active (None otherwise). 'deterministic' uses
+                progressive_stages (gen_start-triggered, fixed num_ops per stage).
+                'dynamic' has no stage list - see the dynamic_* args below.
+            dynamic_initial_num_nodes: (int) starting depth for dynamic mode - the
+                dynamic-mode equivalent of progressive_stages[0]['num_nodes'].
+            dynamic_max_num_nodes: (int) growth ceiling for dynamic mode.
+            dynamic_probability_threshold: (float) nucleus mass to keep per node (or
+                network-wide under global_op_pruning) when dynamic-pruning ops.
+            dynamic_min_ops: (int) floor on ops kept per node (NoOp included) when
+                dynamic-pruning.
+            dynamic_flatness_epsilon: (float) if the rankable (non-NoOp) ops' mean-PMF
+                spread (max - min) is <= this, dynamic pruning skips this check
+                entirely - the distribution hasn't differentiated enough to prune yet.
+            dynamic_check_every_gen: (int or None) how often (generations) dynamic mode
+                re-ranks/cuts; must be a positive multiple of update_quantum_gen.
+                Defaults to update_quantum_gen if None.
+            dynamic_growth_patience: (int) consecutive stable (no-cut) checks required
+                before dynamic mode grows depth.
+            dynamic_node_growth_amount: (int) nodes added per dynamic growth event,
+                capped at dynamic_max_num_nodes.
         """
 
         self.generations = max_generations
@@ -148,6 +175,9 @@ class QNAS(object):
         self.noop_fn_name = noop_fn_name
         self.reset_probs_on_stage_change = reset_probs_on_stage_change
         self.global_op_pruning = global_op_pruning
+        self.progressive_mode = progressive_mode
+        self._stable_streak = None  # dynamic mode only - initialized below, once
+                                     # self.qpop_net (and its num_genes) exists.
         if progressive_stages:
             if progressive_stages[0]['num_ops'] != len(fn_list):
                 raise ValueError(
@@ -164,6 +194,22 @@ class QNAS(object):
                     "can extend surviving classical individuals with a no-op."
                 )
             max_num_nodes = progressive_stages[0]['num_nodes']
+        elif progressive_mode == 'dynamic':
+            if not noop_fn_name or noop_fn_name not in fn_list:
+                raise ValueError(
+                    "progressive dynamic mode requires noop_fn_name to be set and "
+                    "present in fn_list - per-node pruning force-keeps it forever so "
+                    "grown nodes can extend surviving classical individuals with a "
+                    "no-op."
+                )
+            self.dynamic_max_num_nodes = dynamic_max_num_nodes
+            self.dynamic_probability_threshold = dynamic_probability_threshold
+            self.dynamic_min_ops = dynamic_min_ops
+            self.dynamic_flatness_epsilon = dynamic_flatness_epsilon
+            self.dynamic_check_every_gen = dynamic_check_every_gen or update_quantum_gen
+            self.dynamic_growth_patience = dynamic_growth_patience
+            self.dynamic_node_growth_amount = dynamic_node_growth_amount
+            max_num_nodes = dynamic_initial_num_nodes
 
         # Per-node reducing-ops names (used by get_penalties). Kept as names, not
         # global indices: once fn_list is per-node (progressive stages), the same
@@ -190,6 +236,9 @@ class QNAS(object):
                                             fn_list=fn_list,
                                             initial_probs=initial_probs,
                                             crossover_method=pop_crossover_method)
+
+        if self.progressive_mode == 'dynamic':
+            self._init_stability_streaks()
 
     def replace_pop(self, new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses):
         """ Replace the individuals of old population using one of two methods: elitism or
@@ -435,6 +484,12 @@ class QNAS(object):
                 f'(gen_start={stage["gen_start"]}, num_nodes={stage["num_nodes"]}, '
                 f'num_ops={stage["num_ops"]})\n'
             )
+        elif self.progressive_mode == 'dynamic':
+            streak = self._stable_streak if self.global_op_pruning else min(self._stable_streak)
+            stage_line = (
+                f'- Dynamic progressive: num_nodes={self.qpop_net.chromosome.num_genes}, '
+                f'stable_streak={streak}/{self.dynamic_growth_patience}\n'
+            )
 
         self.logger.info(f'New generation finished running!\n'
                         f'- Generation: {self.current_gen}\n'
@@ -474,6 +529,12 @@ class QNAS(object):
             # List of per-node op-name lists (ragged) - deep-copied one level deeper
             # than a flat list so later in-place mutation can't corrupt this entry.
             entry['fn_list'] = [list(names) for names in self.qpop_net.chromosome.fn_list]
+        elif self.progressive_mode == 'dynamic':
+            entry['progressive_mode'] = 'dynamic'
+            entry['fn_list'] = [list(names) for names in self.qpop_net.chromosome.fn_list]
+            entry['dynamic_stable_streak'] = (
+                self._stable_streak if self.global_op_pruning else list(self._stable_streak)
+            )
 
         data[self.current_gen] = entry
 
@@ -532,6 +593,21 @@ class QNAS(object):
             self.qpop_net.chromosome.fn_list = fn_list
             self.qpop_net.chromosome.num_functions = [len(names) for names in fn_list]
             self.eval_func.fn_list = fn_list
+        elif self.progressive_mode == 'dynamic' and 'fn_list' in log_data:
+            fn_list = log_data['fn_list']
+            if not fn_list or isinstance(fn_list[0], str):
+                raise RuntimeError(
+                    "Checkpoint predates the per-node progressive-pruning refactor "
+                    "(fn_list is a flat list, not one list per node) - re-run from "
+                    "scratch instead of resuming with progressive dynamic mode "
+                    "configured."
+                )
+            self.qpop_net.chromosome.fn_list = fn_list
+            self.qpop_net.chromosome.num_functions = [len(names) for names in fn_list]
+            self.eval_func.fn_list = fn_list
+            self._stable_streak = log_data.get('dynamic_stable_streak')
+            if self._stable_streak is None:
+                self._init_stability_streaks()
 
     def check_early_stopping(self):
         """
@@ -665,28 +741,26 @@ class QNAS(object):
 
         return [list(new_fn_list) for _ in old_fn_list]
 
-    def _transition_stage(self, new_stage_idx):
-        """Grow depth / prune ops at a progressive-stage boundary, preserving the
-        classical population's already-evaluated fitness wherever possible instead of
-        discarding it.
-        """
-        stage = self.progressive_stages[new_stage_idx]
-        old_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
-        old_num_nodes = self.qpop_net.chromosome.num_genes
+    def _apply_fn_list_change(self, new_fn_list, new_num_nodes):
+        """Apply an op-list change (and, if new_num_nodes > current, depth growth) to
+        the quantum PMF, then filter+remap the classical population against it instead
+        of wiping it: individuals whose ops all survived keep their evaluated fitness;
+        newly grown node positions are set to a no-op so the decoded network - and its
+        fitness - doesn't change just because the population grew deeper. Shared by
+        deterministic stage transitions (_transition_stage) and dynamic prune/growth
+        steps (_dynamic_prune_step).
 
-        if self.global_op_pruning:
-            new_fn_list = self._rank_and_prune_globally(old_fn_list, stage['num_ops'])
-        else:
-            new_fn_list = self._rank_and_prune_all_nodes(old_fn_list, stage['num_ops'])
+        Args:
+            new_fn_list: list of length *current* num_genes (before this call), each
+                entry that (existing) node's new op-name list.
+            new_num_nodes: new depth (>= current depth).
+        """
+        old_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
+
         self.qpop_net.grow_and_prune_discrete(
-            stage['num_nodes'], new_fn_list, reset_probs=self.reset_probs_on_stage_change,
+            new_num_nodes, new_fn_list, reset_probs=self.reset_probs_on_stage_change,
         )
 
-        # Filter+remap the existing classical population against the new per-node
-        # fn_lists (post prune+growth) instead of wiping it: individuals whose ops all
-        # survived keep their evaluated fitness; newly grown node positions are set to
-        # a no-op so the decoded network - and its fitness - doesn't change just
-        # because the population grew deeper.
         if self.qpop_net.current_pop is not None:
             kept_mask, remapped_net = self.qpop_net.filter_and_remap_classical(
                 self.qpop_net.current_pop, old_fn_list,
@@ -698,26 +772,214 @@ class QNAS(object):
                 self.fitnesses = self.fitnesses[kept_mask]
                 self.raw_fitnesses = self.raw_fitnesses[kept_mask]
                 self.logger.info(
-                    f"Stage transition: kept {int(kept_mask.sum())}/{len(kept_mask)} "
+                    f"Op-list change: kept {int(kept_mask.sum())}/{len(kept_mask)} "
                     f"classical individuals across the transition."
                 )
             else:
                 self.qpop_net.current_pop = None
                 self.logger.warning(
-                    "Stage transition: no classical individual survived the op "
+                    "Op-list change: no classical individual survived the op "
                     "prune - starting the next generation from scratch."
                 )
 
         self.eval_func.fn_list = self.qpop_net.chromosome.fn_list
+        self._just_transitioned = True
+
+    def _transition_stage(self, new_stage_idx):
+        """Grow depth / prune ops at a progressive-stage boundary (deterministic mode
+        only), preserving the classical population's already-evaluated fitness
+        wherever possible instead of discarding it.
+        """
+        stage = self.progressive_stages[new_stage_idx]
+        old_num_nodes = self.qpop_net.chromosome.num_genes
+        old_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
+
+        if self.global_op_pruning:
+            new_fn_list = self._rank_and_prune_globally(old_fn_list, stage['num_ops'])
+        else:
+            new_fn_list = self._rank_and_prune_all_nodes(old_fn_list, stage['num_ops'])
+
+        self._apply_fn_list_change(new_fn_list, stage['num_nodes'])
 
         self.current_stage_idx = new_stage_idx
-        self._just_transitioned = True
         self.logger.info(
             f"Progressive stage transition -> stage {new_stage_idx} "
             f"(gen_start={stage['gen_start']}, num_nodes={stage['num_nodes']}, "
             f"num_ops={stage['num_ops']}): "
             f"{old_num_nodes} -> {stage['num_nodes']} nodes."
         )
+
+    def _nucleus_prune_ops(self, names, mean_weight, threshold, min_ops, flatness_epsilon):
+        """Dynamic-mode counterpart to _rank_and_prune_ops: keep the smallest prefix of
+        *names* (ranked descending by mean_weight, NoOp excluded from ranking and
+        always force-kept, mirroring _rank_and_prune_ops) whose cumulative share of
+        mean_weight is >= threshold. Floors the total kept count (NoOp included) at
+        min_ops.
+
+        Flatness guard: if the spread (max - min) across the rankable (non-NoOp) ops'
+        mean_weight is <= flatness_epsilon, the distribution hasn't differentiated
+        enough to prune yet - returns *names* unchanged instead of cutting to whatever
+        prefix the nucleus walk happens to identify.
+
+        Args:
+            names: (list[str]) current op-name list to prune.
+            mean_weight: 1D array, mean quantum probability mass per op in *names*.
+            threshold: (float) cumulative probability mass to keep, in (0, 1].
+            min_ops: (int) floor on the total number of ops kept (NoOp included).
+            flatness_epsilon: (float) skip pruning if the rankable pool's spread is
+                <= this.
+
+        Returns:
+            (new_names, changed): changed is True iff new_names != names.
+        """
+        has_noop = self.noop_fn_name in names
+        rankable = [i for i, n in enumerate(names) if n != self.noop_fn_name]
+        if not rankable:
+            return list(names), False
+
+        rankable_weights = mean_weight[rankable]
+        if rankable_weights.max() - rankable_weights.min() <= flatness_epsilon:
+            return list(names), False
+
+        ranked = sorted(rankable, key=lambda i: (mean_weight[i], -i), reverse=True)
+        total = rankable_weights.sum()
+        min_rankable = max(min_ops - 1, 0) if has_noop else min_ops
+
+        cumulative = 0.0
+        num_kept_rankable = 0
+        for i in ranked:
+            cumulative += mean_weight[i]
+            num_kept_rankable += 1
+            if cumulative / total >= threshold:
+                break
+        num_kept_rankable = max(num_kept_rankable, min(min_rankable, len(ranked)))
+
+        kept = set(ranked[:num_kept_rankable])
+        if has_noop:
+            kept.add(names.index(self.noop_fn_name))
+        kept = sorted(kept)
+        new_names = [names[i] for i in kept]
+        return new_names, new_names != list(names)
+
+    def _nucleus_prune_all_nodes(self, old_fn_list):
+        """Nucleus-cut (with flatness guard) each node's ops independently, using that
+        node's own mean quantum probability mass. Dynamic-mode counterpart to
+        _rank_and_prune_all_nodes.
+
+        Args:
+            old_fn_list: list of length num_genes, each entry that node's current
+                op-name list.
+
+        Returns:
+            (new_fn_list, changed_per_node): changed_per_node[i] is True iff node i's
+            op list changed this call.
+        """
+        new_fn_list = []
+        changed_per_node = []
+        for node_idx, names in enumerate(old_fn_list):
+            mean_weight = self.qpop_net.probabilities[node_idx].mean(axis=0)
+            node_new_fn_list, changed = self._nucleus_prune_ops(
+                names, mean_weight, self.dynamic_probability_threshold,
+                self.dynamic_min_ops, self.dynamic_flatness_epsilon,
+            )
+            if changed:
+                self.logger.info(
+                    f"Dynamic op pruning (nucleus), node {node_idx}: "
+                    f"{names} -> {node_new_fn_list}"
+                )
+            new_fn_list.append(node_new_fn_list)
+            changed_per_node.append(changed)
+
+        return new_fn_list, changed_per_node
+
+    def _nucleus_prune_globally(self, old_fn_list):
+        """Nucleus-cut (with flatness guard) ONCE using the mean quantum probability
+        mass across every node and individual, applying the same surviving op list to
+        every node. Dynamic-mode counterpart to _rank_and_prune_globally.
+
+        Requires every node to currently share the same op list (see
+        _rank_and_prune_globally's docstring for why).
+
+        Args:
+            old_fn_list: list of length num_genes, each entry that node's current
+                op-name list (all identical).
+
+        Returns:
+            (new_fn_list, changed): new_fn_list has the same (single) op list repeated
+            for every node; changed is a single network-wide flag.
+        """
+        names = old_fn_list[0]
+        if any(node_names != names for node_names in old_fn_list):
+            raise ValueError(
+                "global_op_pruning requires every node to share the same op list - "
+                "nodes have already diverged (was global_op_pruning enabled from the "
+                "start?)."
+            )
+
+        mean_weight = np.stack(self.qpop_net.probabilities, axis=1).mean(axis=(0, 1))
+        new_names, changed = self._nucleus_prune_ops(
+            names, mean_weight, self.dynamic_probability_threshold,
+            self.dynamic_min_ops, self.dynamic_flatness_epsilon,
+        )
+        if changed:
+            self.logger.info(f"Dynamic op pruning (nucleus, global): {names} -> {new_names}")
+
+        return [list(new_names) for _ in old_fn_list], changed
+
+    def _init_stability_streaks(self):
+        """(Re)initialize dynamic mode's op-pruning stability streak - zeroed per node
+        (or a single zero under global_op_pruning). Called on init and after every
+        depth-growth event, so streaks always count from the current depth.
+        """
+        if self.global_op_pruning:
+            self._stable_streak = 0
+        else:
+            self._stable_streak = [0] * self.qpop_net.chromosome.num_genes
+
+    def _update_stability_streaks(self, changed_flags):
+        """Advance dynamic mode's stability streak(s): a node (or, under
+        global_op_pruning, the whole network) whose op list did NOT change this check
+        increments its streak; a change resets it to 0.
+        """
+        if self.global_op_pruning:
+            self._stable_streak = 0 if changed_flags[0] else self._stable_streak + 1
+        else:
+            self._stable_streak = [
+                0 if changed else streak + 1
+                for changed, streak in zip(changed_flags, self._stable_streak)
+            ]
+
+    def _dynamic_prune_step(self):
+        """Dynamic-mode periodic check: nucleus-cut ops (no depth change), then decide
+        whether op-pruning has stabilized enough to grow depth. See
+        docs/QNAS_PROGRESSIVE_DYNAMIC_PLAN.md.
+        """
+        old_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
+        current_num_nodes = self.qpop_net.chromosome.num_genes
+
+        if self.global_op_pruning:
+            new_fn_list, changed = self._nucleus_prune_globally(old_fn_list)
+            changed_flags = [changed] * current_num_nodes
+        else:
+            new_fn_list, changed_flags = self._nucleus_prune_all_nodes(old_fn_list)
+
+        self._apply_fn_list_change(new_fn_list, current_num_nodes)
+        self._update_stability_streaks(changed_flags)
+
+        at_ceiling = current_num_nodes >= self.dynamic_max_num_nodes
+        streak = self._stable_streak if self.global_op_pruning else min(self._stable_streak)
+        if streak >= self.dynamic_growth_patience and not at_ceiling:
+            new_num_nodes = min(
+                current_num_nodes + self.dynamic_node_growth_amount,
+                self.dynamic_max_num_nodes,
+            )
+            grown_fn_list = [list(names) for names in self.qpop_net.chromosome.fn_list]
+            self._apply_fn_list_change(grown_fn_list, new_num_nodes)
+            self._init_stability_streaks()
+            self.logger.info(
+                f"Dynamic progressive growth: {current_num_nodes} -> {new_num_nodes} "
+                f"nodes (stable for >= {self.dynamic_growth_patience} checks)."
+            )
 
     def evolve(self):
         """ Run the evolution. """
@@ -751,6 +1013,10 @@ class QNAS(object):
                 )
                 if target_stage_idx != self.current_stage_idx:
                     self._transition_stage(target_stage_idx)
+            elif (self.progressive_mode == 'dynamic'
+                    and self.current_gen % self.dynamic_check_every_gen == 0
+                    and self.current_gen > 0):
+                self._dynamic_prune_step()
 
             self.generate_classical()
             self.go_next_gen()

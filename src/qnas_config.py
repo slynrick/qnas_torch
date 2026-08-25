@@ -161,41 +161,119 @@ class ConfigParameters(object):
         # Everything related lives under QNAS.progressive so one block documents
         # and controls the whole feature. Config-file only, no CLI flag.
         #
+        # progressive.mode selects the pruning/growth strategy once progressive is
+        # active: 'deterministic' (default) follows a config-authored stage list
+        # (progressive.deterministic.stages - gen_start-triggered, fixed num_ops per
+        # stage). 'dynamic' has NO stage list: op-pruning count and the timing/amount
+        # of node growth are both computed during the search itself, from
+        # progressive.dynamic.* (see docs/QNAS_PROGRESSIVE_DYNAMIC_PLAN.md).
+        #
         # progressive.enabled is a tri-state:
         #   - absent (or the whole `progressive` block absent): inferred from
-        #     whether `stages` is set, for backward compatibility.
-        #   - False: force progressive mode off even if `stages` is present,
-        #     so a config can keep its stage list on file without deleting it.
-        #   - True: require `stages` to be set; raises otherwise.
+        #     whether the active mode's required sub-block is set, for backward
+        #     compatibility.
+        #   - False: force progressive mode off even if deterministic.stages/dynamic
+        #     config is present, so a config can keep it on file without deleting it.
+        #   - True: require the active mode's sub-block to be set; raises otherwise.
         progressive_cfg = self.QNAS_spec.pop('progressive', None) or {}
         enabled = progressive_cfg.get('enabled', None)
-        stages = progressive_cfg.get('stages', None)
+        progressive_mode = progressive_cfg.get('mode', 'deterministic')
+        if progressive_mode not in ('deterministic', 'dynamic'):
+            raise ValueError(
+                f"QNAS.progressive.mode must be 'deterministic' or 'dynamic', "
+                f"got {progressive_mode!r}"
+            )
+
+        deterministic_cfg = progressive_cfg.get('deterministic', None) or {}
+        dynamic_cfg = progressive_cfg.get('dynamic', None) or {}
+
+        stages = deterministic_cfg.get('stages', None) if progressive_mode == 'deterministic' \
+            else None
+        dynamic_ready = progressive_mode == 'dynamic' and bool(dynamic_cfg.get('initial_num_nodes'))
 
         if enabled is False:
             stages = None
-        elif enabled is True and not stages:
-            raise ValueError(
-                "QNAS.progressive.enabled: True requires QNAS.progressive.stages to be set"
-            )
+            dynamic_ready = False
+            active = False
+        elif enabled is True:
+            if progressive_mode == 'deterministic' and not stages:
+                raise ValueError(
+                    "QNAS.progressive.enabled: True with mode: deterministic requires "
+                    "QNAS.progressive.deterministic.stages to be set"
+                )
+            if progressive_mode == 'dynamic' and not dynamic_ready:
+                raise ValueError(
+                    "QNAS.progressive.enabled: True with mode: dynamic requires "
+                    "QNAS.progressive.dynamic.initial_num_nodes to be set"
+                )
+            active = True
+        else:  # enabled is None: infer, for backward compatibility
+            active = bool(stages) or dynamic_ready
 
         if stages:
             stages = sorted(stages, key=lambda s: s['gen_start'])
             if stages[0]['gen_start'] != 0:
-                raise ValueError("progressive.stages must include a stage starting at gen_start=0")
-        self.QNAS_spec['progressive_stages'] = stages
+                raise ValueError(
+                    "progressive.deterministic.stages must include a stage starting at "
+                    "gen_start=0"
+                )
+        self.QNAS_spec['progressive_stages'] = stages if active else None
+        self.QNAS_spec['progressive_mode'] = progressive_mode if active else None
 
         # Ignored unless progressive mode is active (see qnas.py::initialize_qnas).
         # reset_probs_on_stage_change: if True, quantum individuals' probabilities
-        # reset to uniform at each stage transition instead of the default
+        # reset to uniform at each node-growth event instead of the default
         # carry-over/renormalize behavior (see QPopulationNetwork.grow_and_prune_discrete).
         self.QNAS_spec['reset_probs_on_stage_change'] = progressive_cfg.get(
             'reset_probs_on_stage_change', False
         )
 
-        # global_op_pruning: if True, op pruning at each stage transition ranks ops
-        # ONCE network-wide and applies the same surviving op list to every node.
-        # If False (default), each node ranks and prunes its own ops independently.
+        # global_op_pruning: if True, op pruning ranks ops ONCE network-wide and
+        # applies the same surviving op list to every node. If False (default), each
+        # node ranks and prunes its own ops independently. Applies to both modes.
         self.QNAS_spec['global_op_pruning'] = progressive_cfg.get('global_op_pruning', False)
+
+        if active and progressive_mode == 'dynamic':
+            update_quantum_gen = self.QNAS_spec['update_quantum_gen']
+            check_every_gen = dynamic_cfg.get('check_every_gen', update_quantum_gen)
+            if check_every_gen <= 0 or check_every_gen % update_quantum_gen != 0:
+                raise ValueError(
+                    "QNAS.progressive.dynamic.check_every_gen must be a positive multiple "
+                    "of QNAS.update_quantum_gen"
+                )
+            probability_threshold = dynamic_cfg.get('probability_threshold', 0.8)
+            if not (0.0 < probability_threshold <= 1.0):
+                raise ValueError(
+                    "QNAS.progressive.dynamic.probability_threshold must be in (0, 1]"
+                )
+            min_ops = dynamic_cfg.get('min_ops', 2)
+            if min_ops < 1:
+                raise ValueError("QNAS.progressive.dynamic.min_ops must be >= 1")
+            flatness_epsilon = dynamic_cfg.get('flatness_epsilon', 0.0)
+            if flatness_epsilon < 0:
+                raise ValueError("QNAS.progressive.dynamic.flatness_epsilon must be >= 0")
+            growth_patience = dynamic_cfg.get('growth_patience', 1)
+            if growth_patience < 1:
+                raise ValueError("QNAS.progressive.dynamic.growth_patience must be >= 1")
+            node_growth_amount = dynamic_cfg.get('node_growth_amount', 1)
+            if node_growth_amount < 1:
+                raise ValueError("QNAS.progressive.dynamic.node_growth_amount must be >= 1")
+            initial_num_nodes = dynamic_cfg['initial_num_nodes']
+            max_num_nodes = dynamic_cfg.get('max_num_nodes', self.QNAS_spec['max_num_nodes'])
+            if max_num_nodes < initial_num_nodes:
+                raise ValueError(
+                    "QNAS.progressive.dynamic.max_num_nodes must be >= "
+                    "QNAS.progressive.dynamic.initial_num_nodes"
+                )
+
+            self.QNAS_spec['dynamic_initial_num_nodes'] = initial_num_nodes
+            self.QNAS_spec['dynamic_max_num_nodes'] = max_num_nodes
+            self.QNAS_spec['dynamic_probability_threshold'] = probability_threshold
+            self.QNAS_spec['dynamic_min_ops'] = min_ops
+            self.QNAS_spec['dynamic_flatness_epsilon'] = flatness_epsilon
+            self.QNAS_spec['dynamic_check_every_gen'] = check_every_gen
+            self.QNAS_spec['dynamic_growth_patience'] = growth_patience
+            self.QNAS_spec['dynamic_node_growth_amount'] = node_growth_amount
 
         # Per-individual training early stopping (optional, config-file only). Distinct
         # from the QNAS-level early_stopping/patience above, which stops the whole
@@ -274,11 +352,12 @@ class ConfigParameters(object):
         for item in self.fn_dict.values():
             del item['prob']
 
-        # Progressive stages need a designated no-op function: per-node pruning force-
-        # keeps it forever (see QNAS._rank_and_prune_all_nodes) so that growing a
-        # surviving classical individual can always extend it with a no-op instead of
-        # invalidating its already-evaluated fitness.
-        if self.QNAS_spec.get('progressive_stages'):
+        # Progressive mode (either deterministic or dynamic) needs a designated no-op
+        # function: per-node pruning force-keeps it forever (see
+        # QNAS._rank_and_prune_all_nodes / QNAS._nucleus_prune_all_nodes) so that
+        # growing a surviving classical individual can always extend it with a no-op
+        # instead of invalidating its already-evaluated fitness.
+        if self.QNAS_spec.get('progressive_mode'):
             noop_candidates = [
                 fn for fn in self.QNAS_spec['fn_list']
                 if self.fn_dict[fn].get('function') == 'NoOp'
