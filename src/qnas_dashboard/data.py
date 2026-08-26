@@ -8,8 +8,22 @@ import os
 import signal
 import subprocess
 import sys
+from pathlib import Path
+
+import yaml
 
 from qnas_queue import db
+
+
+def list_config_files():
+    """Config files under configs/, relative to the project root, for the
+    "New job" form's picker.
+    """
+    configs_dir = db.PROJECT_ROOT / "configs"
+    if not configs_dir.is_dir():
+        return []
+    paths = list(configs_dir.rglob("*.yml")) + list(configs_dir.rglob("*.yaml"))
+    return sorted(str(p.relative_to(db.PROJECT_ROOT)) for p in paths)
 
 
 def list_jobs(status=None):
@@ -45,6 +59,35 @@ def status_counts():
 
 
 # --- mutating actions -------------------------------------------------
+
+def add_job(mode, config, experiment_path, extra, priority):
+    """Validates and queues a new job, mirroring qnas_queue.cli's `add`
+    command exactly (same path resolution + YAML check) so a job added from
+    the dashboard behaves identically to one added via the CLI.
+    """
+    if not config:
+        return False, "Config file is required.", None
+    if not experiment_path:
+        return False, "Experiment path is required.", None
+
+    config_path = (db.PROJECT_ROOT / config).resolve() if not Path(config).is_absolute() \
+        else Path(config).resolve()
+    if not config_path.is_file():
+        return False, f"Config file not found: {config_path}", None
+    try:
+        with open(config_path) as f:
+            yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        return False, f"Config file is not valid YAML: {e}", None
+
+    with db.connect() as conn:
+        job_id = db.add_job(
+            conn, mode=mode, config_path=str(config_path),
+            experiment_path=experiment_path, extra_args=extra or "",
+            priority=priority,
+        )
+    return True, f"Queued job {job_id} ({mode}): {config_path.name} → {experiment_path}", job_id
+
 
 def cancel_job(job_id):
     with db.connect() as conn:

@@ -162,11 +162,38 @@ def show_job_dialog(job_id):
         summary_tab()
 
 
+@st.dialog("New job", width="large")
+def show_new_job_dialog():
+    configs = data.list_config_files()
+    with st.form("new_job_form", border=False):
+        mode = st.selectbox("Mode", ["evolve", "retrain", "pipeline"])
+        if configs:
+            config = st.selectbox("Config file", configs)
+        else:
+            config = st.text_input("Config file path", placeholder="configs/config_files_cifar/config0.yml")
+        experiment_path = st.text_input(
+            "Experiment path", placeholder="experiment_cifar10_progressive/exp8")
+        extra = st.text_input(
+            "Extra args", placeholder='-d cifar10 -M -T -X (appended verbatim to the command)')
+        priority = st.number_input("Priority", value=0, step=1)
+        submitted = st.form_submit_button("Queue job", width='stretch')
+
+    if submitted:
+        ok, msg, job_id = data.add_job(mode, config, experiment_path, extra, int(priority))
+        (st.success if ok else st.error)(msg)
+        if ok:
+            st.rerun()
+
+
 @st.fragment(run_every=REFRESH_SECONDS)
 def queue_section():
     jobs = data.list_jobs()
     with st.container(border=True):
-        st.markdown("#### Jobs")
+        header = st.columns([5, 1.6])
+        header[0].markdown("#### Jobs")
+        if header[1].button("➕ New job", width='stretch'):
+            show_new_job_dialog()
+
         clicked_id = components.render_queue_rows(jobs)
         if clicked_id is not None:
             show_job_dialog(clicked_id)
