@@ -11,6 +11,16 @@ LOG_DIR = QUEUE_DIR / "logs"
 WORKER_PID_FILE = QUEUE_DIR / "worker.pid"
 WORKER_LOG_PATH = QUEUE_DIR / "worker.log"
 
+
+def resolve_path(path):
+    """Resolves a stored job path (config_path/log_path) against the current
+    PROJECT_ROOT if it's relative, so jobs stay runnable after the project
+    directory is moved. Absolute paths (old rows, or configs outside the
+    project tree) pass through unchanged.
+    """
+    p = Path(path)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

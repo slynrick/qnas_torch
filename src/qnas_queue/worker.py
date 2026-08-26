@@ -41,7 +41,7 @@ def _run_job(job):
 
     log_path = db.LOG_DIR / f"job_{job['id']}.log"
     with db.connect() as conn:
-        db.update_job(conn, job["id"], log_path=str(log_path))
+        db.update_job(conn, job["id"], log_path=str(log_path.relative_to(PROJECT_ROOT)))
         db.set_worker(conn, current_job_id=job["id"])
 
     argv = build_argv(job["mode"], job["config_path"], job["experiment_path"], job["extra_args"])

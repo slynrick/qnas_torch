@@ -41,9 +41,14 @@ def cmd_add(args):
     except yaml.YAMLError as e:
         sys.exit(f"error: config file is not valid YAML: {e}")
 
+    try:
+        stored_config_path = str(config_path.relative_to(db.PROJECT_ROOT))
+    except ValueError:
+        stored_config_path = str(config_path)
+
     with db.connect() as conn:
         job_id = db.add_job(
-            conn, mode=args.mode, config_path=str(config_path),
+            conn, mode=args.mode, config_path=stored_config_path,
             experiment_path=args.experiment_path, extra_args=args.extra or "",
             priority=args.priority,
         )
@@ -185,7 +190,7 @@ def cmd_logs(args):
     if job is None or not job["log_path"]:
         print("No job logs available yet.")
         return
-    log_path = Path(job["log_path"])
+    log_path = db.resolve_path(job["log_path"])
     if not log_path.exists():
         print(f"Log file not found yet: {log_path}")
         return
