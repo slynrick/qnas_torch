@@ -187,10 +187,22 @@ def cmd_logs(args):
                 "SELECT * FROM jobs WHERE status != 'queued' ORDER BY id DESC LIMIT 1"
             ).fetchone()
 
-    if job is None or not job["log_path"]:
+    if job is None:
         print("No job logs available yet.")
         return
-    log_path = db.resolve_path(job["log_path"])
+
+    if args.summary:
+        # log_QNAS.txt is the evolution-level summary log (one entry per generation:
+        # best-so-far, fitnesses, progressive-stage transitions - see
+        # qnas_config.py::files_spec['log_file']), as opposed to --detail's raw
+        # stdout/stderr capture of the underlying evolve/retrain/pipeline subprocess.
+        log_path = db.resolve_path(job["experiment_path"]) / "log_QNAS.txt"
+    else:
+        if not job["log_path"]:
+            print("No job logs available yet.")
+            return
+        log_path = db.resolve_path(job["log_path"])
+
     if not log_path.exists():
         print(f"Log file not found yet: {log_path}")
         return
@@ -250,7 +262,14 @@ def main():
                          help="Job id (defaults to the current/most recent job).")
     p_logs.add_argument("--follow", "-f", action="store_true")
     p_logs.add_argument("--lines", "-n", type=int, default=50)
-    p_logs.set_defaults(func=cmd_logs)
+    log_view = p_logs.add_mutually_exclusive_group()
+    log_view.add_argument("--detail", dest="summary", action="store_false",
+                           help="Raw subprocess stdout/stderr log (default).")
+    log_view.add_argument("--summary", dest="summary", action="store_true",
+                           help="Evolution-level summary log (log_QNAS.txt): "
+                                "best-so-far, fitnesses and progressive-stage "
+                                "transitions per generation.")
+    p_logs.set_defaults(func=cmd_logs, summary=False)
 
     args = parser.parse_args()
     args.func(args)

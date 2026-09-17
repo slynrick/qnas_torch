@@ -376,6 +376,11 @@ class QNAS(object):
                 and self.qpop_net.current_pop is not None):
             if self.current_gen % self.crossover_frequency == 0:
                 num_offspring = int(len(new_pop_net) * self.pop_crossover_rate)
+                # current_pop can be smaller than the full population right after a
+                # dynamic prune/growth step (individuals that didn't survive op
+                # pruning are dropped - see _apply_fn_list_change), so clamp to what
+                # is actually available to avoid a shape mismatch in apply_crossover.
+                num_offspring = min(num_offspring, len(self.qpop_net.current_pop))
                 best_current_pop = self.qpop_net.current_pop[:num_offspring]
                 new_pop_net[:num_offspring] = self.qpop_net.apply_crossover(
                     best_current_pop, new_pop_net[:num_offspring]

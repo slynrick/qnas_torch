@@ -1,0 +1,178 @@
+# Configuration file: discrete Q-NAS with P-DARTS-style progressive growth, DYNAMIC
+# variant (see docs/QNAS_PROGRESSIVE_DYNAMIC_PLAN.md). Same base op menu/hyperparameters
+# as config_progressive.yml; unlike it, there is no pre-declared stage list - everything
+# is decided during the search:
+#   - op pruning: continuously keeps the smallest set of highest-probability ops whose
+#     cumulative quantum probability mass is >= probability_threshold, re-checked every
+#     dynamic.check_every_gen generations - and skips pruning entirely on a check where
+#     the candidate ops' probabilities are still too close together to call
+#     (dynamic.flatness_epsilon).
+#   - node growth: triggered once op-pruning has stabilized (no cut for
+#     dynamic.growth_patience consecutive checks), growing by dynamic.node_growth_amount
+#     nodes at a time up to dynamic.max_num_nodes.
+#
+# v2: tuned against exp_dynamic_1 (config_progressive_dynamic.yml), which pruned every
+# convolution out of every node by generation 40 (min_ops: 2 floor let the nucleus cut
+# collapse the whole menu to {avg_pool, max_pool, no_op}), then never recovered -
+# best_so_far stayed flat at 72.7% while the rest of the population's fitness kept
+# sliding as depth grew on a conv-less search space. See the post-mortem in this
+# experiment's analysis (chat, 2026-09-15) for the full trace. Changes vs v1:
+#   - min_ops: 2 -> 5, so at least a few conv ops always survive the floor.
+#   - probability_threshold: 0.8 -> 0.92, less aggressive cuts (needs more cumulative
+#     mass before pruning).
+#   - check_every_gen: 10 -> 20, more generations for the quantum PMF to actually
+#     converge between cuts.
+#   - flatness_epsilon: 0.02 -> 0.06, wider tie zone so a check is more readily skipped
+#     when candidate ops are still close.
+#   - train.early_stopping_patience: 5 -> 9, gives conv ops more epochs to prove out
+#     before per-individual early stopping favors faster-converging pooling ops.
+# global_op_pruning is deliberately left unchanged (False, per-node pruning) - not part
+# of this tuning pass.
+
+QNAS:
+    crossover_rate: 0.5
+    max_generations: 300
+    max_num_nodes: 20
+    num_quantum_ind: 5
+    penalize_number: 3
+    repetition: 4
+    replace_method: best
+    update_quantum_gen: 5
+    update_quantum_rate: 0.1
+    save_data_freq: 10
+    crossover_frequency: 5
+    pop_crossover_rate: 0.4 # offspring replacement proportion in the population
+    pop_crossover_method: hux # hux, uniform
+    patience: 60
+
+    # P-DARTS-style progressive depth growth + operation pruning. Set enabled:
+    # False to run plain (non-progressive) QNAS.
+    progressive:
+        enabled: True
+        mode: dynamic
+
+        # Dynamic-mode-only: no stage list here (that's deterministic-only, see
+        # config_progressive.yml) - stage change, op-pruning count and node growth are
+        # all decided during the search instead.
+        dynamic:
+            # Starting depth - the dynamic-mode equivalent of a deterministic
+            # stages[0].num_nodes. Must use the full op menu (13 ops below) at this depth.
+            initial_num_nodes: 7
+            # Growth ceiling; defaults to QNAS.max_num_nodes (top-level, 20 above) if
+            # omitted - listed explicitly here for clarity.
+            max_num_nodes: 20
+            # Nucleus mass to keep per node (or network-wide under global_op_pruning):
+            # keep the fewest highest-probability ops whose mean quantum probability
+            # sums to at least this share.
+            # v2: 0.8 -> 0.92 - less aggressive cuts, more cumulative mass required
+            # before an op is dropped.
+            probability_threshold: 0.92
+            # Floor: never prune a node down past NoOp + this many real ops.
+            # v2: 2 -> 5 - v1's floor of 2 let every conv op get pruned out of every
+            # node (down to just {avg_pool, max_pool, no_op}), permanently capping the
+            # search space with zero learnable filters. 5 keeps a meaningful pool of
+            # conv variants alive at the floor.
+            min_ops: 5
+            # Re-rank/cut every N generations; must be a positive multiple of
+            # update_quantum_gen (5 above) since the PMF only moves on quantum
+            # updates - checking more often just re-evaluates an unchanged PMF.
+            # v2: 10 -> 20 - more generations for the PMF to genuinely converge (and
+            # for the population to recover fitness) between cuts.
+            check_every_gen: 20
+            # If the candidate ops' mean-probability spread (max - min) is <= this,
+            # they're still too close to call - skip pruning this check.
+            # v2: 0.02 -> 0.06 - wider tie zone, skips more checks when probabilities
+            # haven't meaningfully separated yet instead of forcing a premature cut.
+            flatness_epsilon: 0.06
+            # Consecutive stable (no-cut) checks required before growing depth - op
+            # pruning stabilizing signals the PMF has converged at the current depth.
+            growth_patience: 3
+            # Nodes added per growth event, capped at max_num_nodes.
+            node_growth_amount: 1
+
+        # If True, quantum individuals' probabilities reset to uniform at each node-growth
+        # event above instead of carrying over/renormalizing what was learned so far on
+        # the pre-growth op menu.
+        reset_probs_on_stage_change: False
+
+        # If True, op pruning at each stage transition ranks ops ONCE network-wide and
+        # applies the same surviving op list to every node. If False (default), each
+        # node ranks and prunes its own ops independently.
+        # Left unchanged from v1 - not part of this tuning pass.
+        global_op_pruning: False
+
+    params_ranges:
+        decay: 0.9
+        learning_rate: 0.001
+        momentum: 0.0
+        weight_decay: 1.0e-4
+
+    function_dict:  {
+        'conv_1_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 32}, 'prob': 1.0/3.0/10.0},
+        'conv_1_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 64}, 'prob': 1.0/3.0/10.0},
+        'conv_1_1_128': {'function': 'ConvBlock', 'params': {'kernel': 1, 'strides': 1, 'filters': 128}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 32}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 64}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_128': {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 128}, 'prob': 1.0/3.0/10.0},
+        'conv_3_1_256': {'function': 'ConvBlock', 'params': {'kernel': 3, 'strides': 1, 'filters': 256}, 'prob': 1.0/3.0/10.0},
+        'conv_5_1_32':  {'function': 'ConvBlock', 'params': {'kernel': 5, 'strides': 1, 'filters': 32}, 'prob': 1.0/3.0/10.0},
+        'conv_5_1_64':  {'function': 'ConvBlock', 'params': {'kernel': 5, 'strides': 1, 'filters': 64}, 'prob': 1.0/3.0/10.0},
+        'conv_5_1_128': {'function': 'ConvBlock', 'params': {'kernel': 5, 'strides': 1, 'filters': 128}, 'prob': 1.0/3.0/10.0},
+        'max_pool_2_2': {'function': 'MaxPooling', 'params': {'kernel': 2, 'strides': 2}, 'prob': 1.0/3.0/2.0},
+        'avg_pool_2_2': {'function': 'AvgPooling', 'params': {'kernel': 2, 'strides': 2}, 'prob': 1.0/3.0/2.0},
+        'no_op':        {'function': 'NoOp', 'params': {}, 'prob': 1.0/3.0}
+    }
+
+train:
+    batch_size: 256
+    eval_batch_size: 256
+    max_epochs: 50
+    epochs_to_eval: 5
+    optimizer: AdamW
+    fitness_metric: best_accuracy
+    mo_metric_base: accuracy
+    mixed_precision: True
+    # NHWC memory format - lets cuDNN pick its fastest Tensor Core conv kernels on
+    # Ampere+ under AMP (typical 1.2-1.4x speedup).
+    channels_last: True
+    available_gpus: [0] # gpu0, gpu1, gpu2 [0, 1, 2]
+    device: cuda:0
+
+    # Dataset split/subset must be identical across every individual, generation
+    # and retrain run of this config so fitness stays comparable - see
+    # cnn/input.py GenericDataLoader. Set use_seed: False to opt back into a
+    # fresh random split per run.
+    use_seed: True
+    seed: 42
+
+    # Dataset
+    dataset: Cifar10
+    data_augmentation: False
+    subtract_mean: True
+    limit_data: True
+    limit_data_value: 10000
+    num_workers: 2
+    network_config: default
+    network_gap: False
+
+    # Tensorflow
+    save_checkpoints_epochs: 5
+    save_summary_epochs: 0.25
+    threads: 2
+
+    # Per-individual training early stopping: stop one candidate's brief training
+    # early once its monitored validation metric plateaus, instead of always
+    # running the full max_epochs. Distinct from QNAS.patience above, which stops
+    # the whole search. Monitors whatever fitness_metric optimizes for above -
+    # here, accuracy (a percentage) - so min_delta is in percentage points, not
+    # loss units.
+    early_stopping_enabled: True
+    # v2: 5 -> 9 - gives slower-to-converge conv ops more epochs to prove their worth
+    # before per-individual early stopping cuts training short in their favor of
+    # faster-converging pooling ops (see the v2 note above).
+    early_stopping_patience: 9
+    early_stopping_min_delta: 0.05
+
+    # penalization parameters - scalarized fitness
+    max_params: 1300000 # 1.3M
+    max_inference_time: 6400 # us

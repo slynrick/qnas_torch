@@ -574,7 +574,12 @@ class ConfigParameters(object):
                     else:
                         print(f'{nested_level * spacing}{key}: {value}', file=text_file)
                 else:
-                    if type(value) == float:
+                    if value is None:
+                        # Bare `None` is not valid YAML null (it round-trips through
+                        # yaml.safe_load as the string "None", not None) - emit `null`
+                        # instead so continue_path/retrain reload the real value.
+                        print(f'{nested_level * spacing}{key}: null', file=text_file)
+                    elif type(value) == float:
                         if value < 1e-3:
                             print(f'{nested_level * spacing}{key}: {value:.2E}', file=text_file)
                         else:
