@@ -1,0 +1,108 @@
+.DEFAULT_GOAL := help
+
+space := $(subst ,, )
+QUEUE := scripts/qnas-queue.sh
+PIPELINE := scripts/run_pipeline.sh
+
+# Overridable on the command line, e.g.:
+#   make queue-add CONFIG=configs/config_files_cifar/config_progressive.yml \
+#       EXP=experiment_cifar10_progressive/exp8 EXTRA="-d cifar10 -M -T -X"
+MODE     ?= pipeline
+CONFIG   ?=
+EXP      ?=
+EXTRA    ?=
+PRIORITY ?= 0
+ID       ?=
+DATASET  ?= cifar10
+ARGS     ?=
+
+.PHONY: help sync \
+	queue-add queue-list queue-status queue-start queue-stop \
+	queue-logs queue-logs-summary queue-logs-all queue-remove queue-cancel queue-retry \
+	queue pipeline clean
+
+help: ## Show this help
+	@echo "QNAS-torch project commands"
+	@echo
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	@echo
+	@echo "Common variables: CONFIG, EXP, EXTRA, ID, MODE (default: pipeline)"
+	@echo "Example: make queue-add CONFIG=configs/config_files_cifar/config_progressive.yml \\"
+	@echo "             EXP=experiment_cifar10_progressive/exp8 EXTRA=\"-d cifar10 -M -T -X\""
+
+sync: ## Install/sync project dependencies with uv
+	uv sync
+
+## --- Experiment queue (src/qnas_queue) ---------------------------------
+
+# `make queue <sub>` is an alias for `make queue-<sub>` (e.g. `make queue list`).
+# The word after `queue` is a goal make would otherwise reject, so it is
+# swallowed by an empty phony rule and dispatched from the `queue` recipe.
+QUEUE_SUBS := add list status start stop logs logs-summary logs-all remove cancel retry
+ifeq ($(firstword $(MAKECMDGOALS)),queue)
+QUEUE_SUB := $(word 2,$(MAKECMDGOALS))
+ifneq ($(QUEUE_SUB),)
+.PHONY: $(QUEUE_SUB)
+$(QUEUE_SUB):
+	@:
+endif
+endif
+
+queue: ## Alias: make queue <add|list|status|start|stop|logs|logs-summary|logs-all|remove|cancel|retry>
+	@case " $(QUEUE_SUBS) " in \
+		*" $(QUEUE_SUB) "*) $(MAKE) --no-print-directory queue-$(QUEUE_SUB) ;; \
+		*) echo "usage: make queue <$(subst $(space),|,$(QUEUE_SUBS))>" >&2; exit 1 ;; \
+	esac
+
+queue-add: ## Queue a job (needs CONFIG=, EXP=; optional MODE=, EXTRA=, PRIORITY=)
+	@test -n "$(CONFIG)" || (echo "error: CONFIG=<path to yml> is required" >&2; exit 1)
+	@test -n "$(EXP)" || (echo "error: EXP=<experiment_path> is required" >&2; exit 1)
+	$(QUEUE) add --mode $(MODE) --config $(CONFIG) --experiment-path $(EXP) \
+		--extra "$(EXTRA)" --priority $(PRIORITY)
+
+queue-list: ## List queued/running/past jobs
+	$(QUEUE) list
+
+queue-status: ## Show worker and queue status
+	$(QUEUE) status
+
+queue-start: ## Start the background worker (also resumes any stopped job)
+	$(QUEUE) start
+
+queue-stop: ## Stop the worker and the currently running job
+	$(QUEUE) stop
+
+queue-logs: ## Follow logs of the current (or ID=) job; auto-continues into the next queued job
+	$(QUEUE) logs $(ID) -f
+
+queue-logs-summary: ## Follow the evolution-level summary log (log_QNAS.txt) instead of raw output
+	$(QUEUE) logs $(ID) -f --summary
+
+queue-logs-all: ## Follow the raw log and the summary log together, prefixed [detail]/[summary]
+	$(QUEUE) logs $(ID) -f --both
+
+queue-remove: ## Delete a job from the queue/history (needs ID=)
+	@test -n "$(ID)" || (echo "error: ID=<job id> is required" >&2; exit 1)
+	$(QUEUE) remove $(ID)
+
+queue-cancel: ## Cancel a queued job, kept in history as 'cancelled' (needs ID=)
+	@test -n "$(ID)" || (echo "error: ID=<job id> is required" >&2; exit 1)
+	$(QUEUE) cancel $(ID)
+
+queue-retry: ## Re-queue a failed/stopped/cancelled job (needs ID=)
+	@test -n "$(ID)" || (echo "error: ID=<job id> is required" >&2; exit 1)
+	$(QUEUE) retry $(ID)
+
+## --- Direct (foreground, not queued) runs ------------------------------
+
+pipeline: ## Run evolve -> retrain -> infographic directly, blocking (needs EXP=, CONFIG=; optional DATASET=, ARGS=)
+	@test -n "$(EXP)" || (echo "error: EXP=<experiment_path> is required" >&2; exit 1)
+	@test -n "$(CONFIG)" || (echo "error: CONFIG=<path to yml> is required" >&2; exit 1)
+	$(PIPELINE) -e $(EXP) -c $(CONFIG) -d $(DATASET) $(ARGS)
+
+## --- Housekeeping -------------------------------------------------------
+
+clean: ## Remove Python bytecode caches
+	find . -type d -name '__pycache__' -not -path './.venv/*' -prune -exec rm -rf {} +
+	find . -type f -name '*.pyc' -not -path './.venv/*' -delete

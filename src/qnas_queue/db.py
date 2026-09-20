@@ -143,6 +143,10 @@ def resume_stopped_jobs(conn):
     return [row["id"] for row in rows]
 
 
+def list_running_jobs(conn):
+    return conn.execute("SELECT * FROM jobs WHERE status = 'running' ORDER BY id").fetchall()
+
+
 def claim_next_job(conn):
     row = conn.execute(
         "SELECT * FROM jobs WHERE status = 'queued' ORDER BY priority DESC, id ASC LIMIT 1"

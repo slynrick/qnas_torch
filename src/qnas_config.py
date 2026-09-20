@@ -233,6 +233,33 @@ class ConfigParameters(object):
         # node ranks and prunes its own ops independently. Applies to both modes.
         self.QNAS_spec['global_op_pruning'] = progressive_cfg.get('global_op_pruning', False)
 
+        # quantum_update_engine (optional, config-file only): selects how the network
+        # (architecture) quantum population is rotated toward observed classical
+        # individuals. 'default' (unchanged) rotates quantum individual i toward
+        # whichever classical individual currently sits at rank i in current_pop
+        # (top num_quantum_ind, sorted by fitness) every update_quantum_gen
+        # generations - under replace_method: elitism that reference can stay the
+        # same individual for many generations, biasing the update toward it even on
+        # ties. 'ancestor_decay' instead rotates each quantum individual toward every
+        # classical individual it actually produced (tracked by lineage, not rank),
+        # with the update intensity decaying by how many generations that classical
+        # individual has already survived - a long-lived elite nudges less and less,
+        # while freshly generated individuals push at full strength. Only affects the
+        # network population; the hyperparameter population update is unchanged in
+        # both engines.
+        engine = config_file['QNAS'].get('quantum_update_engine', 'default')
+        if engine not in ('default', 'ancestor_decay'):
+            raise ValueError(
+                "QNAS.quantum_update_engine must be 'default' or 'ancestor_decay', "
+                f"got {engine!r}"
+            )
+        self.QNAS_spec['quantum_update_engine'] = engine
+        # quantum_update_age_decay: decay rate used by the 'ancestor_decay' engine
+        # (decay = exp(-quantum_update_age_decay * age), ignored by 'default').
+        self.QNAS_spec['quantum_update_age_decay'] = config_file['QNAS'].get(
+            'quantum_update_age_decay', 0.5
+        )
+
         if active and progressive_mode == 'dynamic':
             update_quantum_gen = self.QNAS_spec['update_quantum_gen']
             check_every_gen = dynamic_cfg.get('check_every_gen', update_quantum_gen)

@@ -286,6 +286,45 @@ class QPopulationNetwork(QPopulation):
                 self.probabilities[node][idx], best_classic[idx, node], update_value,
             )
 
+    def update_quantum_ancestor_decay(self, intensity, ages, ancestors, decay_rate):
+        """ Alternative quantum-update engine ("ancestor_decay").
+
+        Unlike update_quantum(), which always rotates quantum individual i toward
+        whichever classical individual currently sits at rank i of self.current_pop
+        (biased toward a persisting incumbent under elitism, even on generations
+        where nothing changed), this rotates each quantum individual toward every
+        classical individual it actually produced (its lineage, given by
+        *ancestors*), with the nudge weighted by an intensity that decays the longer
+        that classical individual has already survived (*ages*): a long-lived elite
+        keeps nudging less and less, while freshly generated individuals push at
+        full strength.
+
+        Args:
+            intensity: (float) base intensity of the update, same role as in
+                update_quantum().
+            ages: int ndarray, shape (n_classic,), generations survived by each row
+                of self.current_pop.
+            ancestors: int ndarray, shape (n_classic,), quantum individual index
+                (0..num_ind-1) that generated each row of self.current_pop.
+            decay_rate: (float) >= 0; higher values make older individuals'
+                influence fall off faster. decay = exp(-decay_rate * age).
+        """
+
+        decay = np.exp(-decay_rate * ages)
+
+        for node in range(self.chromosome.num_genes):
+            random = np.random.rand(ages.shape[0])
+            active = np.where(random <= self.update_quantum_rate)[0]
+
+            for row in active:
+                q_idx = ancestors[row]
+                update_value = intensity * self.max_update * decay[row]
+                self.probabilities[node][q_idx:q_idx + 1] = self._update(
+                    self.probabilities[node][q_idx:q_idx + 1],
+                    self.current_pop[row:row + 1, node],
+                    update_value,
+                )
+
     def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list,
                                 reset_probs: bool = False):
         """Resize *self.probabilities* (the quantum PMF) for a P-DARTS-style progressive

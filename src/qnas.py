@@ -52,6 +52,16 @@ class QNAS(object):
         self.total_eval = 0
         self.early_stopping_counter = 0
 
+        # Quantum update engine selection - see initialize_qnas() docstring.
+        self.quantum_update_engine = 'default'
+        self.quantum_update_age_decay = 0.5
+        # Per-classical-individual lineage tracking (row-aligned with current_pop),
+        # used only by the 'ancestor_decay' engine: how many generations each
+        # individual has survived, and which quantum individual originally produced
+        # it. Populated by replace_pop().
+        self.classic_age = None
+        self.classic_ancestor = None
+
         self.qpop_params = None
         self.qpop_net = None
 
@@ -81,7 +91,8 @@ class QNAS(object):
                         dynamic_max_num_nodes=None, dynamic_probability_threshold=0.8,
                         dynamic_min_ops=2, dynamic_flatness_epsilon=0.0,
                         dynamic_check_every_gen=None, dynamic_growth_patience=1,
-                        dynamic_node_growth_amount=1):
+                        dynamic_node_growth_amount=1, quantum_update_engine='default',
+                        quantum_update_age_decay=0.5):
 
         """ Initialize algorithm with several parameter values.
 
@@ -154,11 +165,19 @@ class QNAS(object):
                 before dynamic mode grows depth.
             dynamic_node_growth_amount: (int) nodes added per dynamic growth event,
                 capped at dynamic_max_num_nodes.
+            quantum_update_engine: (str) one of 'default' or 'ancestor_decay' -
+                selects how the network quantum population is rotated toward
+                observed classical individuals. See update_quantum() and
+                QPopulationNetwork.update_quantum_ancestor_decay() for details.
+            quantum_update_age_decay: (float) decay rate used by the
+                'ancestor_decay' engine (ignored by 'default').
         """
 
         self.generations = max_generations
         self.update_quantum_gen = update_quantum_gen
         self.replace_method = replace_method
+        self.quantum_update_engine = quantum_update_engine
+        self.quantum_update_age_decay = quantum_update_age_decay
         self.penalize_number = penalize_number
         self.patience = patience
         self.early_stopping = early_stopping
@@ -240,7 +259,8 @@ class QNAS(object):
         if self.progressive_mode == 'dynamic':
             self._init_stability_streaks()
 
-    def replace_pop(self, new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses):
+    def replace_pop(self, new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
+                    new_ancestor=None):
         """ Replace the individuals of old population using one of two methods: elitism or
             replace the worst. In *elitism*, only the best individual of the old population is
             maintained, while all the others are replaced by the new population. In *best*,
@@ -254,7 +274,17 @@ class QNAS(object):
             raw_fitnesses: float numpy array representing the fitness of each individual in
                 *new_pop* before the penalization method. Note that, if no penalization method
                 is applied, *raw_fitnesses* = *new_fitnesses*.
+            new_ancestor: int ndarray, shape (new_fitnesses.shape[0],), the quantum
+                individual index (0..num_quantum_ind-1) that generated each row of
+                *new_pop_net*/*new_pop_params*. Used only by the 'ancestor_decay'
+                quantum update engine to track lineage/age of classical individuals
+                across generations. If None, falls back to a positional index
+                (row % num_quantum_ind).
         """
+
+        if new_ancestor is None:
+            new_ancestor = np.arange(new_fitnesses.shape[0]) % self.qpop_net.num_ind
+        new_ancestor = new_ancestor.astype(np.int64)
 
         if self.current_gen == 0 or (self._just_transitioned and self.qpop_net.current_pop is None):
             # In the 1st generation, and right after a progressive-stage transition that
@@ -266,10 +296,22 @@ class QNAS(object):
 
             self.fitnesses = new_fitnesses
             self.raw_fitnesses = raw_fitnesses
+            self.classic_age = np.zeros(new_fitnesses.shape[0], dtype=np.int64)
+            self.classic_ancestor = new_ancestor
             self.update_best_id(new_fitnesses)
         else:
             # Checking if the best so far individual has changed in the current generation
             self.update_best_id(new_fitnesses)
+
+            # Lineage/age tracking can go stale (e.g. right after a progressive-stage
+            # transition externally filtered/remapped current_pop without knowing about
+            # these arrays) - auto-heal instead of crashing on a shape mismatch. This
+            # just means age tracking restarts from that point.
+            if (self.classic_age is None
+                    or self.classic_age.shape[0] != self.fitnesses.shape[0]):
+                self.classic_age = np.zeros(self.fitnesses.shape[0], dtype=np.int64)
+                self.classic_ancestor = np.arange(
+                    self.fitnesses.shape[0]) % self.qpop_net.num_ind
 
             if self._just_transitioned:
                 # _transition_stage already filtered/remapped current_pop to only the
@@ -279,15 +321,17 @@ class QNAS(object):
                 selected = range(self.fitnesses.shape[0])
             elif self.replace_method == 'elitism':
                 select_new = range(new_fitnesses.shape[0] - 1)
-                new_fitnesses, raw_fitnesses, new_pop_params, \
-                    new_pop_net = self.order_pop(new_fitnesses,
-                                                new_pop_params,
-                                                new_pop_net,
-                                                select_new)
+                new_fitnesses, raw_fitnesses, new_pop_params, new_pop_net, \
+                    (new_ancestor,) = self.order_pop(new_fitnesses,
+                                                    raw_fitnesses,
+                                                    new_pop_params,
+                                                    new_pop_net,
+                                                    select_new,
+                                                    extra=[new_ancestor])
                 selected = range(1)
             elif self.replace_method == 'best':
                 selected = range(self.fitnesses.shape[0])
-                
+
             # Concatenate populations
             self.fitnesses = np.concatenate((self.fitnesses[selected], new_fitnesses))
             self.raw_fitnesses = np.concatenate((self.raw_fitnesses[selected], raw_fitnesses))
@@ -295,19 +339,29 @@ class QNAS(object):
                     (self.qpop_params.current_pop[selected], new_pop_params))
             self.qpop_net.current_pop = np.concatenate(
                     (self.qpop_net.current_pop[selected], new_pop_net))
-        
+            # Individuals that survive into the next generation get older; freshly
+            # generated ones start at age 0 - this is what lets the 'ancestor_decay'
+            # engine nudge less and less toward a stale, long-surviving elite.
+            self.classic_age = np.concatenate(
+                (self.classic_age[selected] + 1,
+                np.zeros(new_fitnesses.shape[0], dtype=np.int64)))
+            self.classic_ancestor = np.concatenate(
+                (self.classic_ancestor[selected], new_ancestor))
+
         ## TODO: Here we have the the last and new population Multi objective operation
-        
-            
+
+
         # Order the population based on fitness
         num_classic = self.qpop_params.num_ind * self.qpop_params.repetition
         self.fitnesses, self.raw_fitnesses, self.qpop_params.current_pop, \
-            self.qpop_net.current_pop = self.order_pop(self.fitnesses,
-                                                        self.raw_fitnesses,
-                                                        self.qpop_params.current_pop,
-                                                        self.qpop_net.current_pop,
-                                                        selection=range(num_classic))       
-        
+            self.qpop_net.current_pop, (self.classic_age, self.classic_ancestor) = \
+            self.order_pop(self.fitnesses,
+                            self.raw_fitnesses,
+                            self.qpop_params.current_pop,
+                            self.qpop_net.current_pop,
+                            selection=range(num_classic),
+                            extra=[self.classic_age, self.classic_ancestor])
+
         # self.fitnesses[0] is normally the best-ever individual (elitism/best always
         # concatenate history in), except right after a progressive-stage transition
         # that left no surviving individual, where the population is a fresh start with
@@ -316,7 +370,7 @@ class QNAS(object):
         self._just_transitioned = False
 
     @staticmethod
-    def order_pop(fitnesses, raw_fitnesses, pop_params, pop_net, selection=None):
+    def order_pop(fitnesses, raw_fitnesses, pop_params, pop_net, selection=None, extra=None):
         """ Order the population based on *fitnesses*.
 
         Args:
@@ -326,9 +380,13 @@ class QNAS(object):
             pop_params: ndarray with population of parameters.
             pop_net: ndarray with population of networks.
             selection: range to select elements from the population.
+            extra: optional list of additional 1D ndarrays, aligned with *fitnesses*,
+                to reorder/select in lockstep (e.g. the per-individual age/ancestor
+                lineage tracking used by the 'ancestor_decay' quantum update engine).
 
         Returns:
-            ordered population and fitnesses.
+            ordered population and fitnesses, plus a tuple of the reordered *extra*
+            arrays as a 5th return value if *extra* was given.
         """
 
         if selection is None:
@@ -338,6 +396,10 @@ class QNAS(object):
         pop_net = pop_net[idx][selection]
         fitnesses = fitnesses[idx][selection]
         raw_fitnesses = raw_fitnesses[idx][selection]
+
+        if extra is not None:
+            extra = tuple(arr[idx][selection] for arr in extra)
+            return fitnesses, raw_fitnesses, pop_params, pop_net, extra
 
         return fitnesses, raw_fitnesses, pop_params, pop_net
 
@@ -371,6 +433,12 @@ class QNAS(object):
                                                                 distance=self.random)
 
         new_pop_net = self.qpop_net.generate_classical()
+        # Row i of a freshly generated population was sampled from quantum individual
+        # i % num_ind (see QPopulationNetwork.generate_classical) - record this before
+        # any crossover/reordering so the 'ancestor_decay' quantum update engine can
+        # later trace each classical individual back to the quantum individual that
+        # produced it, instead of relying on its current rank in current_pop.
+        new_ancestor = np.arange(new_pop_net.shape[0]) % self.qpop_net.num_ind
 
         if (self.current_gen > 0 and self.en_pop_crossover
                 and self.qpop_net.current_pop is not None):
@@ -389,7 +457,8 @@ class QNAS(object):
         self.logger.info("new population created =%s", new_pop_net)
         new_fitnesses, raw_fitnesses = self.eval_pop(new_pop_params, new_pop_net)
 
-        self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses)
+        self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
+                        new_ancestor)
 
     def decode_pop(self, pop_params, pop_net):
         """ Decode a population of parameters and networks.
@@ -635,13 +704,35 @@ class QNAS(object):
         return False
 
     def update_quantum(self):
-        """ Update quantum populations of networks and hyperparameters. """
+        """ Update quantum populations of networks and hyperparameters.
+
+            The hyperparameter population always uses its single update rule. The
+            network (architecture) population uses whichever rule
+            *self.quantum_update_engine* selects:
+              - 'default': rotate quantum individual i toward whichever classical
+                individual currently sits at rank i in current_pop (top num_ind,
+                sorted by fitness) - fires unconditionally every update_quantum_gen
+                generations regardless of whether that ranking actually changed.
+              - 'ancestor_decay': rotate each quantum individual toward every
+                classical individual it actually produced (tracked lineage), with
+                the nudge intensity decaying by how long that classical individual
+                has survived, so a stale elite stops forcing convergence over time.
+        """
 
         if np.remainder(self.current_gen,
                         self.update_quantum_gen) == 0 and self.current_gen > 0:
 
             self.qpop_params.update_quantum(intensity=self.random)
-            self.qpop_net.update_quantum(intensity=self.random)
+
+            if self.quantum_update_engine == 'ancestor_decay':
+                self.qpop_net.update_quantum_ancestor_decay(
+                    intensity=self.random,
+                    ages=self.classic_age,
+                    ancestors=self.classic_ancestor,
+                    decay_rate=self.quantum_update_age_decay,
+                )
+            else:
+                self.qpop_net.update_quantum(intensity=self.random)
     
     def go_next_gen(self):
         """ Go to the next generation --> update quantum genes, log data, delete unnecessary
