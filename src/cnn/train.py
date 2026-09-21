@@ -13,7 +13,7 @@ Documentation:
 import logging
 import os
 import time
-from typing import Dict, List, Union, Any
+from typing import Dict, List, Any
 
 import torch
 import torch.nn as nn

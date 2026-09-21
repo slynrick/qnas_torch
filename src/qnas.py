@@ -51,6 +51,7 @@ class QNAS(object):
         self.save_data_freq = np.inf
         self.total_eval = 0
         self.early_stopping_counter = 0
+        self.last_best_so_far = None            # best fitness at the previous early-stopping check
 
         # Quantum update engine selection - see initialize_qnas() docstring.
         self.quantum_update_engine = 'default'
@@ -688,8 +689,14 @@ class QNAS(object):
         Compute the early stopping of the evolution. If the best fitness does not improve 
         by at least 0.005 (0.5%) for `patience` generations, the evolution stops.
         """
-        if self.current_gen > 1:
-            improvement = (self.best_so_far - self.last_best_so_far) / self.last_best_so_far
+        # last_best_so_far is None on the first check of a process - e.g. right after
+        # resuming from a checkpoint at current_gen > 1 - so that check only sets the
+        # baseline instead of comparing against a value that was never recorded.
+        if self.current_gen > 1 and self.last_best_so_far is not None:
+            if self.last_best_so_far > 0:
+                improvement = (self.best_so_far - self.last_best_so_far) / self.last_best_so_far
+            else:
+                improvement = np.inf if self.best_so_far > self.last_best_so_far else 0.0
             if improvement > 0.005:
                 self.early_stopping_counter = 0
             else:
@@ -1117,7 +1124,8 @@ class QNAS(object):
             self.generate_classical()
             self.go_next_gen()
             
-            if self.early_stopping and self.check_early_stopping(): break
+            if self.early_stopping and self.check_early_stopping():
+                break
         
         end_evolution = time.time()
         evolution_hours, evolution_minutes = calculate_time(start_evolution,end_evolution)

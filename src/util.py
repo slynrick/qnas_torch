@@ -4,23 +4,16 @@ import pickle as pkl
 import os
 import re
 import json
-import copy
 
-import time
 import matplotlib.pyplot as plt
 from shutil import rmtree
 import numpy as np
 import seaborn as sns
-import pandas as pd
 import torchvision.datasets
 from torchvision.transforms import ToTensor
 import medmnist
 from medmnist import INFO
 
-import gc
-import torch
-import torch.cuda as cuda
-from cnn import model, input
 import GPUtil
 
 
@@ -97,16 +90,9 @@ def check_file_exists(file_path):
     else:
         return False
 
-def load_retrain_results(experiment_path, retrain_file_name):
-    file_path = os.path.join(experiment_path, retrain_file_name)
-    with open(file_path, 'r') as f:
-        retrain_data = json.load(f)    
-    return retrain_data
-    
 def plot_confusion_matrix(confusion_matrix, labels):
     confusion_matrix= np.array(confusion_matrix)
 
-    df_cm = pd.DataFrame(confusion_matrix, index = labels, columns = labels)
     plt.figure(figsize = (7,6))
     sns.heatmap(confusion_matrix, annot=True, cmap='Blues', cbar=False, fmt='g')
     plt.title('Confusion matrix - Retrained model')
@@ -531,11 +517,9 @@ def download_dataset(params: dict):
         os.makedirs(data_path)
 
         if hasattr(torchvision.datasets, dataset_name.upper()):
-            dataset_family = "pytorch"
             dataset_class = getattr(torchvision.datasets, dataset_name.upper())
             dataset_class(data_path, download=True, transform=ToTensor())
         elif dataset_name in INFO:
-            dataset_family = "medmnist"
             general_info = INFO[dataset_name]
             dataset_class = getattr(medmnist, general_info['python_class'])
             dataset_class(root=data_path, split='train', download=True, transform=ToTensor(), as_rgb=True)

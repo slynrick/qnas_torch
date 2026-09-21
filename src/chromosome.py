@@ -85,7 +85,7 @@ class QChromosomeParams(QChromosome):
             dict with current parameter values.
         """
 
-        params_dict = {self.params_names[i]: np.asscalar(chromosome[i])
+        params_dict = {self.params_names[i]: chromosome[i].item()
                        for i in range(len(chromosome))}
 
         return params_dict

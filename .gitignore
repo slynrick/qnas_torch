@@ -132,3 +132,5 @@ docs/*
 
 # Experiment queue CLI (sqlite db, worker lockfile, job logs)
 .qnas_queue/
+reports/*
+!reports/.gitkeep

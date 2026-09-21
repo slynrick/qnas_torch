@@ -33,3 +33,43 @@ torchaudio = [{ index = "pytorch-cu128" }]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src/ is the import root (flat imports like `import qnas`), not an installed package.
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "e2e: full evolve() runs against a fake evaluator (deselect with -m 'not e2e')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["cifar10_data", "experiment_*", ".qnas_queue"]
+
+[tool.ruff.lint]
+# Correctness-focused only: pyflakes + the pycodestyle error subset + bugbear's
+# mutable-default / raise-from checks. Style rules are intentionally off so the
+# linter flags bugs, not the legacy formatting of the research code.
+select = ["E4", "E7", "E9", "F", "B006", "B904"]
+ignore = [
+    "E741",  # ambiguous variable name (`l`) - pre-existing, harmless
+    "E721",  # `type(x) is list` comparisons in qnas_config.py are deliberate
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Legacy error handling in the atleta dataset branch (bare except, mutable default `info`);
+# fixing them changes behavior, so they are grandfathered rather than silently rewritten.
+"src/cnn/input.py" = ["B006", "E722", "B904"]
+"tests/*" = ["F811"]  # pytest fixtures are re-declared as test arguments

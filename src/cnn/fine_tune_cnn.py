@@ -6,17 +6,15 @@ This script shows how to fine-tune a previously trained model (best_model.pth)
 with a new or extended dataset.
 """
 
-import argparse
 import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Dict, List, Union, Any, List
-import time
+from typing import Dict, List, Any
 
 from cnn import model, input
 from cnn.train_detailed import evaluate
-from util import init_log, load_yaml
+from util import load_yaml
 
 
 # Global cache dictionary

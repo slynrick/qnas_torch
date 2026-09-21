@@ -8,12 +8,10 @@
 import logging
 import os
 import time
-import numpy as np
 import torch
-from medmnist import INFO, Evaluator
+from medmnist import Evaluator
 import torch.nn as nn
 from torch.amp import GradScaler
-from tqdm.notebook import tqdm
 from typing import Dict, List, Union, Any
 from sklearn.metrics import confusion_matrix
 from cnn import model, input, metrics

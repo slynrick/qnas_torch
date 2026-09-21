@@ -86,7 +86,11 @@ class QPopulationParams(QPopulation):
             distance: (float) random distance for arithmetic crossover (range = [0, 1]).
         """
 
-        mask = np.random.rand(self.num_ind * self.repetition, self.chromosome.num_genes)
+        # current_pop can hold fewer individuals than new_pop right after a progressive
+        # transition dropped the ones whose ops did not survive the prune, so only the
+        # rows that have an old counterpart take part in the crossover.
+        num_rows = min(new_pop.shape[0], self.current_pop.shape[0])
+        mask = np.random.rand(num_rows, self.chromosome.num_genes)
         idx = np.where(mask <= self.crossover)
         new_pop[idx] = new_pop[idx] + (self.current_pop[idx] - new_pop[idx]) * distance
 
@@ -385,14 +389,19 @@ class QPopulationNetwork(QPopulation):
             new_probabilities[i] = carried
 
         if new_num_nodes > old_num_nodes:
-            union_ops = sorted(set().union(*new_fn_list[:old_num_nodes]))
+            # Union in order of first appearance, not sorted(): when every existing node
+            # shares one op list (global_op_pruning) the new nodes get exactly that
+            # list, so nodes never look "diverged" to _rank_and_prune_globally /
+            # _nucleus_prune_globally just because of op order.
+            union_ops = list(dict.fromkeys(
+                name for node_ops in new_fn_list[:old_num_nodes] for name in node_ops))
             if not union_ops:
                 raise ValueError(
                     "grow_and_prune_discrete: union of surviving ops across existing "
                     "nodes is empty - cannot seed new nodes."
                 )
             for i in range(old_num_nodes, new_num_nodes):
-                new_fn_list.append(union_ops)
+                new_fn_list.append(list(union_ops))
                 new_probabilities[i] = np.full(
                     (self.num_ind, len(union_ops)), 1.0 / len(union_ops), dtype=self.dtype,
                 )

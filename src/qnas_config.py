@@ -12,9 +12,8 @@ import numpy as np
 import yaml
 import re
 
-from chromosome import QChromosomeNetwork, QChromosomeParams
 from cnn import model, input
-from util import load_yaml, load_pkl, natural_key
+from util import load_yaml, natural_key
 
 
 class ConfigParameters(object):

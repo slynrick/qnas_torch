@@ -8,7 +8,6 @@ import torch
 import random
 import util
 import os
-import numpy as np
 import torchvision.datasets
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision.transforms import ToTensor, Resize, Compose, Normalize, TrivialAugmentWide

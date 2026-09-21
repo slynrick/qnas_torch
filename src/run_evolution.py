@@ -40,7 +40,7 @@ def main(**args):
     config.save_params_logfile()
     
     if config.train_spec['mixed_precision']:
-        logger.info(f"Using mixed precision training ...")
+        logger.info("Using mixed precision training ...")
         
     # Download dataset
     dataset_status = download_dataset(params=config.train_spec)
@@ -70,9 +70,9 @@ def main(**args):
                     f"(best so far: {qnas_cnn.best_so_far_id} -> {qnas_cnn.best_so_far}) ...")
 
     # Start evolution
-    logger.info(f"Starting evolution ...")
+    logger.info("Starting evolution ...")
     qnas_cnn.evolve()
-    logger.info(f"Evolution finished.")
+    logger.info("Evolution finished.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

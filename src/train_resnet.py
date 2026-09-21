@@ -6,8 +6,7 @@
 
 import argparse
 import os
-import qnas_config as cfg
-from util import check_files, init_log, save_results_file
+from util import init_log, save_results_file
 from cnn import input
 from cnn import train_resnet as train
 import time
@@ -25,7 +24,7 @@ def main(**args):
 
     train_params['experiment_path'] = os.path.join(experiment_path, args['retrain_folder'])
     # Load data
-    logger.info(f"Loading data ...")
+    logger.info("Loading data ...")
     data_loader = input.GenericDataLoader(
         params=train_params,
         seed=train_params.get('seed', input.DEFAULT_DATA_SEED),
@@ -54,14 +53,14 @@ def main(**args):
         output_dict[f"{train_params['lr_scheduler']}_{config_code}_retrain_{i}"] = results_dict
 
     # Save results
-    logger.info(f"Saving results ...")
+    logger.info("Saving results ...")
     if train_params['lr_scheduler']  != "None":
         file_name = f"retrain_results_{config_code}_{train_params['lr_scheduler']}.txt"
         save_results_file(out_path=experiment_path, results_dict=output_dict, file_name=file_name)
     else:
         save_results_file(out_path=experiment_path, results_dict=output_dict, file_name=f"retrain_results_{config_code}.txt")
 
-    logger.info(f"Retraining finished.")
+    logger.info("Retraining finished.")
 
 
 if __name__ == '__main__':

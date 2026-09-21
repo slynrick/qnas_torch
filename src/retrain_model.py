@@ -34,7 +34,7 @@ def main(**args):
     config.load_evolved_data(experiment_path=experiment_path)
 
     # Load data
-    logger.info(f"Loading data ...")
+    logger.info("Loading data ...")
     data_loader = input.GenericDataLoader(
         params=config.train_spec,
         seed=config.train_spec.get('seed'),
@@ -68,14 +68,14 @@ def main(**args):
         output_dict[f"{config.train_spec['lr_scheduler']}_{config_code}_retrain_{i}"] = results_dict
 
     # Save results
-    logger.info(f"Saving results ...")
+    logger.info("Saving results ...")
     if config.train_spec['lr_scheduler']  != "None":
         file_name = f"retrain_results_{config_code}_{config.train_spec['lr_scheduler']}.txt"
         save_results_file(out_path=experiment_path, results_dict=output_dict, file_name=file_name)
     else:
         save_results_file(out_path=experiment_path, results_dict=output_dict, file_name=f"retrain_results_{config_code}.txt")
 
-    logger.info(f"Retraining finished.")
+    logger.info("Retraining finished.")
 
 
 if __name__ == '__main__':

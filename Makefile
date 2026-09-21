@@ -16,7 +16,7 @@ ID       ?=
 DATASET  ?= cifar10
 ARGS     ?=
 
-.PHONY: help sync \
+.PHONY: help sync test test-cov lint lint-fix check \
 	queue-add queue-list queue-status queue-start queue-stop \
 	queue-logs queue-logs-summary queue-logs-all queue-remove queue-cancel queue-retry \
 	queue pipeline clean
@@ -33,6 +33,22 @@ help: ## Show this help
 
 sync: ## Install/sync project dependencies with uv
 	uv sync
+
+## --- Quality ------------------------------------------------------------
+
+test: ## Run the test suite (CPU only; ARGS="-k name -x" passes extra pytest args)
+	uv run pytest $(ARGS)
+
+test-cov: ## Run the test suite with a coverage report for src/
+	uv run pytest --cov=src --cov-report=term-missing $(ARGS)
+
+lint: ## Lint with ruff (correctness rules only, see [tool.ruff] in pyproject.toml)
+	uv run ruff check .
+
+lint-fix: ## Lint and apply ruff's safe autofixes
+	uv run ruff check . --fix
+
+check: lint test ## Lint, then run the tests
 
 ## --- Experiment queue (src/qnas_queue) ---------------------------------
 
