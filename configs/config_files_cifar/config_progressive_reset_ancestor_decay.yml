@@ -2,12 +2,14 @@
 # (grows network depth and shrinks the candidate-op menu across stages; based on
 # config8.yml's op menu/hyperparameters, kept fully discrete - no MixedOp).
 #
-# ancestor_decay variant of exp6's configuration (reset_probs_on_stage_change: False,
-# see below) - same run otherwise, only the network quantum-population update engine
-# changes: see QNAS.quantum_update_engine below. It was meant as the exp4 variant, but
-# exp4/exp5 ran with reset_probs_on_stage_change: True; the run made from this file
-# (experiment_cifar10_progressive/exp4_ancestor_decay) is exp6 + ancestor_decay. The
-# exp4/exp5 twin is config_progressive_reset_ancestor_decay.yml.
+# ancestor_decay twin of exp4/exp5 (reset_probs_on_stage_change: True, per-node
+# pruning, 13->8->4 ops, 300 generations): meant to differ from their recorded
+# log_params_evolution.txt only in the quantum update engine. Check before queueing:
+#   make diff-runs A=experiment_cifar10_progressive/exp4 \
+#       B=configs/config_files_cifar/config_progressive_reset_ancestor_decay.yml \
+#       EVOLVE_ARGS="--fitness_metric best_accuracy --en_pop_crossover"
+# Run it with exp4's pipeline flags: -X -m best_accuracy for the search and
+# -g run_best -L multistep -A -R 5 -E 300 for the retrain.
 
 QNAS:
     crossover_rate: 0.5
@@ -52,7 +54,7 @@ QNAS:
         # If True, quantum individuals' probabilities reset to uniform at each stage
         # transition above instead of carrying over/renormalizing what was learned so
         # far on the pre-transition op menu.
-        reset_probs_on_stage_change: False
+        reset_probs_on_stage_change: True
 
         # If True, op pruning at each stage transition ranks ops ONCE network-wide and
         # applies the same surviving op list to every node. If False (default), each

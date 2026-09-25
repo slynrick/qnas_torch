@@ -44,7 +44,8 @@ def _run_job(job):
         db.update_job(conn, job["id"], log_path=str(log_path.relative_to(PROJECT_ROOT)))
         db.set_worker(conn, current_job_id=job["id"])
 
-    argv = build_argv(job["mode"], job["config_path"], job["experiment_path"], job["extra_args"])
+    argv = build_argv(job["mode"], db.config_for_run(job), job["experiment_path"],
+                      job["extra_args"])
 
     with open(log_path, "a") as log_file:
         log_file.write(f"\n=== job {job['id']} started {db.now_iso()} ===\n$ {' '.join(argv)}\n\n")

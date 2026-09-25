@@ -39,6 +39,12 @@ uv run python src/retrain_model.py --experiment_path <exp> --data_path cifar10_d
 uv run python src/generate_infographic.py --experiment_path <exp>
 ```
 
+```bash
+make diff-runs A=<exp dir|log_params|yml> B=<...> [EVOLVE_ARGS="--en_pop_crossover ..."]   # effective-config diff
+```
+
+Use `diff-runs` before labeling any two runs an A/B: run names and report descriptions have diverged from what actually ran (e.g. `exp4_ancestor_decay` is exp6's config + ancestor_decay). It compares recorded `log_params_evolution.txt` files and can render a `.yml` the way an evolve run would record it — some QNAS settings come from CLI flags (`-X` = `--en_pop_crossover`, `-m` = `--fitness_metric`), so pass them in `EVOLVE_ARGS`.
+
 `run_pipeline.sh` flags: `-S evolve,retrain,infographic` skips steps, `-C <path>` continues a run, `-X` enables population crossover, `-M` AMP during retrain, `-T` retrain early stopping. `run_evolution.py` auto-resumes if `experiment_path` already holds a checkpoint (`log_params_evolution.txt`).
 
 ### Experiment queue
@@ -52,7 +58,7 @@ make queue-logs                # follow current job; queue-logs-summary follows 
 make queue-cancel|queue-remove|queue-retry ID=<n>
 ```
 
-The queue runner (`src/qnas_queue/runner.py`) builds `uv run python src/...` / `run_pipeline.sh` argv from the job's mode + `EXTRA`. `scripts/path_config.sh` defines `PROJECT_DIR`/`SRC_DIR`/config dirs for all shell scripts.
+`queue-add` freezes a copy of the config under `.qnas_queue/configs/` and the job runs from that copy, so editing a YAML after queueing does not change queued jobs. The queue runner (`src/qnas_queue/runner.py`) builds `uv run python src/...` / `run_pipeline.sh` argv from the job's mode + `EXTRA`. `scripts/path_config.sh` defines `PROJECT_DIR`/`SRC_DIR`/config dirs for all shell scripts.
 
 ## Architecture
 

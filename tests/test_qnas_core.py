@@ -404,6 +404,39 @@ class TestCheckpoint:
         assert all(np.array_equal(a, b) for a, b in
                    zip(fresh.qpop_net.probabilities, q.qpop_net.probabilities))
 
+    def test_lineage_is_saved_and_restored(self, make_qnas):
+        q = make_qnas(quantum_update_engine='ancestor_decay')
+        for gen in range(3):
+            q.current_gen = gen
+            q.generate_classical()
+            q.go_next_gen()
+        saved = util.load_pkl(q.data_file)[2]
+        assert np.array_equal(saved['classic_age'], q.classic_age)
+        assert np.array_equal(saved['classic_ancestor'], q.classic_ancestor)
+
+        fresh = make_qnas(quantum_update_engine='ancestor_decay')
+        fresh.load_qnas_data(q.data_file)
+        assert np.array_equal(fresh.classic_age, q.classic_age)
+        assert np.array_equal(fresh.classic_ancestor, q.classic_ancestor)
+
+    def test_checkpoint_without_lineage_still_resumes(self, make_qnas):
+        q = make_qnas()
+        for gen in range(2):
+            q.current_gen = gen
+            q.generate_classical()
+            q.go_next_gen()
+        old_format = {g: {k: v for k, v in entry.items()
+                          if k not in ('classic_age', 'classic_ancestor')}
+                      for g, entry in util.load_pkl(q.data_file).items()}
+        q.dump_pkl_data(old_format)
+
+        resumed = make_qnas()
+        resumed.load_qnas_data(q.data_file)
+        assert resumed.classic_age is None and resumed.classic_ancestor is None
+        resumed.current_gen += 1
+        resumed.generate_classical()
+        assert len(resumed.classic_age) == len(resumed.classic_ancestor) == len(resumed.fitnesses)
+
     def test_save_data_accumulates_generations(self, make_qnas):
         q = make_qnas()
         for gen in range(3):

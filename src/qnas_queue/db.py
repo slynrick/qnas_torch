@@ -1,4 +1,5 @@
 import os
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 QUEUE_DIR = PROJECT_ROOT / ".qnas_queue"
 DB_PATH = QUEUE_DIR / "queue.db"
 LOG_DIR = QUEUE_DIR / "logs"
+SNAPSHOT_DIR = QUEUE_DIR / "configs"
 WORKER_PID_FILE = QUEUE_DIR / "worker.pid"
 WORKER_LOG_PATH = QUEUE_DIR / "worker.log"
 
@@ -26,6 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     mode            TEXT NOT NULL CHECK(mode IN ('evolve','retrain','pipeline')),
     config_path     TEXT NOT NULL,
+    config_snapshot TEXT,
     experiment_path TEXT NOT NULL,
     extra_args      TEXT NOT NULL DEFAULT '',
     priority        INTEGER NOT NULL DEFAULT 0,
@@ -80,6 +83,14 @@ def _migrate_jobs_table(conn):
     conn.executescript("DROP TABLE jobs_old;")
 
 
+def _add_missing_columns(conn):
+    """Older DBs predate jobs.config_snapshot; their rows keep it NULL and run from
+    config_path, as they always did."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "config_snapshot" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN config_snapshot TEXT")
+
+
 @contextmanager
 def connect():
     ensure_dirs()
@@ -88,6 +99,7 @@ def connect():
     try:
         conn.executescript(SCHEMA)
         _migrate_jobs_table(conn)
+        _add_missing_columns(conn)
         conn.execute("INSERT OR IGNORE INTO worker (id, status) VALUES (1, 'stopped')")
         yield conn
         conn.commit()
@@ -102,6 +114,32 @@ def add_job(conn, mode, config_path, experiment_path, extra_args, priority):
         (mode, config_path, experiment_path, extra_args, priority, now_iso()),
     )
     return cur.lastrowid
+
+
+def snapshot_config(job_id, config_path):
+    """Copy *config_path* to SNAPSHOT_DIR/job_<id>_<name> and return the copy's path
+    (project-relative when possible). The job runs from this frozen copy, so editing
+    the original YAML after queueing - the queue runs jobs days later - cannot change
+    what the job does."""
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    source = Path(config_path)
+    target = SNAPSHOT_DIR / f"job_{job_id}_{source.name}"
+    shutil.copy2(source, target)
+    try:
+        return str(target.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(target)
+
+
+def config_for_run(job):
+    """The config file a job actually runs with: its snapshot, or config_path for
+    jobs queued before snapshots existed."""
+    return job["config_snapshot"] or job["config_path"]
+
+
+def remove_snapshot(job):
+    if job["config_snapshot"]:
+        resolve_path(job["config_snapshot"]).unlink(missing_ok=True)
 
 
 def list_jobs(conn, status=None):

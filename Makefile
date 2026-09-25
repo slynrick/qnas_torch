@@ -15,11 +15,14 @@ PRIORITY ?= 0
 ID       ?=
 DATASET  ?= cifar10
 ARGS     ?=
+A        ?=
+B        ?=
+EVOLVE_ARGS ?=
 
 .PHONY: help sync test test-cov lint lint-fix check \
 	queue-add queue-list queue-status queue-start queue-stop \
 	queue-logs queue-logs-summary queue-logs-all queue-remove queue-cancel queue-retry \
-	queue pipeline clean
+	queue pipeline diff-runs clean
 
 help: ## Show this help
 	@echo "QNAS-torch project commands"
@@ -116,6 +119,13 @@ pipeline: ## Run evolve -> retrain -> infographic directly, blocking (needs EXP=
 	@test -n "$(EXP)" || (echo "error: EXP=<experiment_path> is required" >&2; exit 1)
 	@test -n "$(CONFIG)" || (echo "error: CONFIG=<path to yml> is required" >&2; exit 1)
 	$(PIPELINE) -e $(EXP) -c $(CONFIG) -d $(DATASET) $(ARGS)
+
+## --- Run comparison ---------------------------------------------------
+
+diff-runs: ## Diff the effective config of two runs/configs (needs A=, B=; EVOLVE_ARGS= flags to render a .yml side)
+	@test -n "$(A)" || (echo "error: A=<experiment dir | log_params file | .yml> is required" >&2; exit 1)
+	@test -n "$(B)" || (echo "error: B=<experiment dir | log_params file | .yml> is required" >&2; exit 1)
+	uv run python src/diff_runs.py $(A) $(B) --evolve-args "$(EVOLVE_ARGS)"
 
 ## --- Housekeeping -------------------------------------------------------
 

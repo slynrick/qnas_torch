@@ -17,6 +17,7 @@ def isolated_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(db, 'QUEUE_DIR', queue)
     monkeypatch.setattr(db, 'DB_PATH', queue / 'queue.db')
     monkeypatch.setattr(db, 'LOG_DIR', queue / 'logs')
+    monkeypatch.setattr(db, 'SNAPSHOT_DIR', queue / 'configs')
     monkeypatch.setattr(db, 'WORKER_PID_FILE', queue / 'worker.pid')
     monkeypatch.setattr(db, 'WORKER_LOG_PATH', queue / 'worker.log')
     root.mkdir()
@@ -143,6 +144,27 @@ class TestDb:
             db.cancel_job(conn, db.list_jobs(conn)[0]['id'])  # would violate the old CHECK
 
 
+    def test_migration_adds_config_snapshot_column(self):
+        db.ensure_dirs()
+        legacy = sqlite3.connect(db.DB_PATH)
+        legacy.executescript(db.SCHEMA.replace('    config_snapshot TEXT,\n', ''))
+        legacy.execute(
+            "INSERT INTO jobs (mode, config_path, experiment_path, created_at) "
+            "VALUES ('evolve', 'c.yml', 'exp', 'now')")
+        legacy.commit()
+        legacy.close()
+        with db.connect() as conn:
+            job = db.list_jobs(conn)[0]
+            assert job['config_snapshot'] is None
+            assert db.config_for_run(job) == 'c.yml'  # pre-snapshot rows run as before
+
+    def test_config_for_run_prefers_snapshot(self):
+        with db.connect() as conn:
+            job_id = add(conn, config='configs/c.yml')
+            db.update_job(conn, job_id, config_snapshot='.qnas_queue/configs/job_1_c.yml')
+            assert db.config_for_run(db.get_job(conn, job_id)) == '.qnas_queue/configs/job_1_c.yml'
+
+
 class TestRunner:
     def test_evolve_argv(self):
         argv = runner.build_argv('evolve', 'cfg.yml', 'exp1', '--dataset cifar10 -x')
@@ -198,6 +220,29 @@ class TestCli:
         assert (job['mode'], job['experiment_path'], job['extra_args'], job['priority']) == \
                ('pipeline', 'exp1', '-M', 3)
         assert 'Queued job' in capsys.readouterr().out
+
+    def test_add_freezes_a_snapshot_of_the_config(self, isolated_queue):
+        cfg = self.make_config(isolated_queue, 'QNAS: {reset: true}\n')
+        cli.cmd_add(self.ns(config=str(cfg), mode='pipeline', experiment_path='exp1',
+                            extra='', priority=0))
+        cfg.write_text('QNAS: {reset: false}\n')  # edited after queueing
+        with db.connect() as conn:
+            job = db.list_jobs(conn)[0]
+        assert job['config_path'] == 'cfg.yml'  # provenance kept
+        assert job['config_snapshot'] == f".qnas_queue/configs/job_{job['id']}_cfg.yml"
+        assert db.config_for_run(job) == job['config_snapshot']
+        assert db.resolve_path(job['config_snapshot']).read_text() == 'QNAS: {reset: true}\n'
+
+    def test_remove_deletes_the_snapshot(self, isolated_queue):
+        cfg = self.make_config(isolated_queue)
+        cli.cmd_add(self.ns(config=str(cfg), mode='evolve', experiment_path='e',
+                            extra='', priority=0))
+        with db.connect() as conn:
+            job = db.list_jobs(conn)[0]
+        snapshot = db.resolve_path(job['config_snapshot'])
+        assert snapshot.is_file()
+        cli.cmd_remove(self.ns(id=job['id']))
+        assert not snapshot.exists()
 
     def test_add_outside_project_keeps_absolute_path(self, tmp_path):
         outside = tmp_path / 'elsewhere.yml'

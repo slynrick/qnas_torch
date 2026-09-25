@@ -391,7 +391,7 @@ passed to `run_pipeline.sh`):
 | File / folder | Written by | Contents |
 |---|---|---|
 | `log_QNAS.txt` | `qnas.py` (`log_data`) | Human-readable per-generation summary: generation number, active progressive-growth stage (if any), **number of new architectures discovered this generation** vs. already-seen ones, best fitness so far, full fitness list. |
-| `data_QNAS.pkl` | `qnas.py` (`save_data`) | Machine-readable, cumulative per-generation snapshot (fitnesses, quantum probabilities, population arrays, current stage) — used to resume a run (`--continue_path`) and to build the infographic. |
+| `data_QNAS.pkl` | `qnas.py` (`save_data`) | Machine-readable, cumulative per-generation snapshot (fitnesses, quantum probabilities, population arrays, current stage, and the population's lineage `classic_ancestor`/`classic_age` — absent in runs before 2026-09-21) — used to resume a run (`--continue_path`) and to build the infographic. |
 | `log_params_evolution.txt` | `qnas_config.py` | A dump of the exact config used for this run (for reproducibility). |
 | `train.log` | `cnn/train.py` + `evaluation.py` | Every training-phase log line (per-individual progress, per-generation timing) — see note below. |
 | `retrain.log` | `retrain_model.py` + `cnn/train_detailed.py` | Every retrain-phase log line. |

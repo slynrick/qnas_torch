@@ -52,7 +52,11 @@ def cmd_add(args):
             experiment_path=args.experiment_path, extra_args=args.extra or "",
             priority=args.priority,
         )
+        # Inside the transaction: if the copy fails, the job row is rolled back too.
+        snapshot = db.snapshot_config(job_id, config_path)
+        db.update_job(conn, job_id, config_snapshot=snapshot)
     print(f"Queued job {job_id} ({args.mode}): {config_path.name} -> {args.experiment_path}")
+    print(f"  config frozen at {snapshot} - later edits to {config_path.name} do not affect this job")
 
 
 def cmd_list(args):
@@ -72,6 +76,7 @@ def cmd_remove(args):
         if job["status"] == "running":
             sys.exit(f"error: job {args.id} is running - stop it first (qnas-queue stop)")
         db.delete_job(conn, args.id)
+        db.remove_snapshot(job)
     print(f"Removed job {args.id}.")
 
 
@@ -98,7 +103,8 @@ def cmd_retry(args):
             conn, args.id, status="queued", started_at=None, finished_at=None,
             exit_code=None, error_message=None, pgid=None,
         )
-    print(f"Job {args.id} re-queued.")
+    note = " (runs its config snapshot from when it was added)" if job["config_snapshot"] else ""
+    print(f"Job {args.id} re-queued{note}.")
 
 
 def cmd_start(args):

@@ -615,8 +615,9 @@ class ConfigParameters(object):
                 if nested_level == 0:
                     print('', file=text_file)
 
-    def save_params_logfile(self):
-        """ Helper function to save the parameters in a txt file. """
+    def logfile_params(self):
+        """ Return (phase, params_dict): what save_params_logfile() writes to
+            log_params_<phase>.txt. """
         # data_dict = {key: value for key, value in self.data_info.__dict__.items()
         #              if key != 'mean_image'}
         
@@ -633,6 +634,11 @@ class ConfigParameters(object):
                             'files': self.files_spec,
                             'fn_dict': self.fn_dict}
                             #'train_data_info': data_dict}
+        return phase, params_dict
+
+    def save_params_logfile(self):
+        """ Helper function to save the parameters in a txt file. """
+        phase, params_dict = self.logfile_params()
 
         params_file_path = os.path.join(self.train_spec['experiment_path'],
                                         f'log_params_{phase}.txt')

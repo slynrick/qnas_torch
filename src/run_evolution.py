@@ -74,7 +74,8 @@ def main(**args):
     qnas_cnn.evolve()
     logger.info("Evolution finished.")
 
-if __name__ == '__main__':
+def build_parser():
+    """CLI of this script; also used by diff_runs.py to render a config exactly as a run would."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--experiment_path', type=str, required=True,
                         help='Directory where to write logs and model files.')
@@ -110,6 +111,10 @@ if __name__ == '__main__':
                         help='Network structure configuration.', default='default',
                         choices=['default', 'dense'])
 
-    arguments = parser.parse_args()
+    return parser
+
+
+if __name__ == '__main__':
+    arguments = build_parser().parse_args()
 
     main(**vars(arguments))

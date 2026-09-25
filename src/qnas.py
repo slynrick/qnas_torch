@@ -597,7 +597,12 @@ class QNAS(object):
                  'params_pop': self.qpop_params.current_pop,
                  'net_probs': self.qpop_net.probabilities,
                  'num_net_nodes': self.qpop_net.chromosome.num_genes,
-                 'net_pop': self.qpop_net.current_pop}
+                 'net_pop': self.qpop_net.current_pop,
+                 # Lineage of current_pop (row-aligned): which quantum individual produced
+                 # each classical individual and for how many generations it survived.
+                 # Used by the ancestor_decay engine and restored on resume.
+                 'classic_age': self.classic_age,
+                 'classic_ancestor': self.classic_ancestor}
 
         if self.progressive_stages:
             entry['current_stage_idx'] = self.current_stage_idx
@@ -655,6 +660,11 @@ class QNAS(object):
 
         self.qpop_params.current_pop = log_data['params_pop']
         self.qpop_net.current_pop = log_data['net_pop']
+
+        # Checkpoints written before lineage was saved have no such keys: leave them
+        # None and replace_pop() re-seeds them positionally, as resume always did.
+        self.classic_age = log_data.get('classic_age')
+        self.classic_ancestor = log_data.get('classic_ancestor')
 
         if self.progressive_stages and 'current_stage_idx' in log_data:
             fn_list = log_data['fn_list']
