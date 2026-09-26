@@ -28,7 +28,7 @@ SYNC_ARGS ?=
 .PHONY: help sync test test-cov lint lint-fix check \
 	queue-add queue-list queue-status queue-start queue-stop \
 	queue-logs queue-logs-summary queue-logs-all queue-logs-running queue-watch queue-remove queue-cancel queue-retry \
-	queue pipeline diff-runs sync-remote clean
+	queue pipeline diff-runs sync-remote queue-watch-remote clean
 
 help: ## Show this help
 	@echo "QNAS-torch project commands"
@@ -146,6 +146,11 @@ sync-remote: ## Pull experiment_*/ and configs/ from a remote copy (needs HOST=<
 	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
 	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
 	scripts/sync-experiments.sh $(SYNC_ARGS) $(HOST) '$(REMOTE)'
+
+queue-watch-remote: ## Live queue-watch dashboard of a remote host's own queue, read over ssh (needs HOST=<ssh alias> REMOTE=<path>)
+	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
+	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
+	ssh -t $(HOST) "cd '$(REMOTE)' && make queue-watch"
 
 clean: ## Remove Python bytecode caches
 	find . -type d -name '__pycache__' -not -path './.venv/*' -prune -exec rm -rf {} +
