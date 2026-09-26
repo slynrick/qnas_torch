@@ -63,6 +63,21 @@ class QNAS(object):
         self.classic_age = None
         self.classic_ancestor = None
 
+        # Rank-based network update and op-pruning criterion - see initialize_qnas().
+        # quantum_lr None keeps the original update rules untouched.
+        self.quantum_lr = None
+        self.quantum_rank_weighting = 'uniform'
+        self.quantum_top_k = 1
+        self.quantum_negative_lr = 0.0
+        self.quantum_prob_floor = 0.0
+        self.prune_criterion = 'pmf'
+        # Per-node mean PMF at the start of the current stage (reference for the 'lift'
+        # criterion and for the KL logged each generation), and the individuals evaluated
+        # since then with their fitnesses (for the 'empirical' criterion).
+        self._stage_start_probs = None
+        self._stage_eval_net = []
+        self._stage_eval_fit = []
+
         self.qpop_params = None
         self.qpop_net = None
 
@@ -93,7 +108,11 @@ class QNAS(object):
                         dynamic_min_ops=2, dynamic_flatness_epsilon=0.0,
                         dynamic_check_every_gen=None, dynamic_growth_patience=1,
                         dynamic_node_growth_amount=1, quantum_update_engine='default',
-                        quantum_update_age_decay=0.5):
+                        quantum_update_age_decay=0.5, quantum_lr=None,
+                        quantum_rank_weighting='uniform', quantum_top_k=1,
+                        quantum_negative_lr=0.0, quantum_prob_floor=0.0,
+                        quantum_max_update=0.05, quantum_max_prob=0.99,
+                        prune_criterion='pmf'):
 
         """ Initialize algorithm with several parameter values.
 
@@ -172,6 +191,29 @@ class QNAS(object):
                 QPopulationNetwork.update_quantum_ancestor_decay() for details.
             quantum_update_age_decay: (float) decay rate used by the
                 'ancestor_decay' engine (ignored by 'default').
+            quantum_lr: (float or None) None (default) keeps the original network update
+                rules (random intensity * quantum_max_update). A value in (0, 1] switches
+                to the rank-based update (QPopulationNetwork.update_quantum_ranked):
+                every update moves each quantum individual this fraction of the way
+                toward its targets. quantum_update_engine still picks the targets:
+                'default' -> ranks q, q + num_ind, ... of current_pop; 'ancestor_decay'
+                -> the best rows of q's own lineage, weighted by exp(-decay * age).
+            quantum_rank_weighting: (str) 'uniform', 'linear' or 'nes' - how the
+                quantum_top_k targets of one quantum individual are weighted.
+            quantum_top_k: (int) targets per quantum individual (rank-based update).
+            quantum_negative_lr: (float) in [0, 1) - rank-based update only: fraction of
+                probability removed from the op of a poor individual (the worst of the
+                lineage for 'ancestor_decay', rank n-1-q for 'default').
+            quantum_prob_floor: (float) in [0, 1) - rank-based update only: every op
+                keeps at least quantum_prob_floor / n_ops of probability.
+            quantum_max_update: (float) max step of the original update rules.
+            quantum_max_prob: (float) ceiling on any op's probability (all update rules).
+            prune_criterion: (str) how progressive op pruning ranks a node's ops
+                (deterministic mode only): 'pmf' (default) - mean quantum probability;
+                'lift' - mean probability divided by its value at the start of the
+                stage, so ops with a large prior (pooling, no_op) don't survive on the
+                prior alone; 'empirical' - mean fitness percentile of the individuals
+                evaluated in the stage that used the op at that node.
         """
 
         self.generations = max_generations
@@ -179,6 +221,9 @@ class QNAS(object):
         self.replace_method = replace_method
         self.quantum_update_engine = quantum_update_engine
         self.quantum_update_age_decay = quantum_update_age_decay
+        self._set_update_and_prune_options(
+            quantum_lr, quantum_rank_weighting, quantum_top_k, quantum_negative_lr,
+            quantum_prob_floor, quantum_max_prob, prune_criterion, progressive_mode)
         self.penalize_number = penalize_number
         self.patience = patience
         self.early_stopping = early_stopping
@@ -255,10 +300,13 @@ class QNAS(object):
                                             update_quantum_rate=update_quantum_rate,
                                             fn_list=fn_list,
                                             initial_probs=initial_probs,
-                                            crossover_method=pop_crossover_method)
+                                            crossover_method=pop_crossover_method,
+                                            max_update=quantum_max_update,
+                                            max_prob=quantum_max_prob)
 
         if self.progressive_mode == 'dynamic':
             self._init_stability_streaks()
+        self._snapshot_stage_start_probs()
 
     def replace_pop(self, new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
                     new_ancestor=None):
@@ -457,6 +505,9 @@ class QNAS(object):
 
         self.logger.info("new population created =%s", new_pop_net)
         new_fitnesses, raw_fitnesses = self.eval_pop(new_pop_params, new_pop_net)
+        if self.prune_criterion == 'empirical':
+            self._stage_eval_net.append(np.array(new_pop_net))
+            self._stage_eval_fit.append(np.array(new_fitnesses, dtype=np.float64))
 
         self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
                         new_ancestor)
@@ -566,10 +617,13 @@ class QNAS(object):
                 f'stable_streak={streak}/{self.dynamic_growth_patience}\n'
             )
 
+        entropy, kl = self._pmf_stats()
         self.logger.info(f'New generation finished running!\n'
                         f'- Generation: {self.current_gen}\n'
                         f'{stage_line}'
                         f'- New architectures discovered: {self.new_architectures_count}\n'
+                        f'- PMF: normalized entropy={entropy:.4f}, '
+                        f'KL to stage start={kl:.4f}\n'
                         f'- Best so far: {self.best_so_far_id} --> {self.best_so_far:.5f}\n'
                         f'- Fitnesses: {self.fitnesses}\n'
                         f'- Fitnesses without penalties: {self.raw_fitnesses}\n')
@@ -602,7 +656,11 @@ class QNAS(object):
                  # each classical individual and for how many generations it survived.
                  # Used by the ancestor_decay engine and restored on resume.
                  'classic_age': self.classic_age,
-                 'classic_ancestor': self.classic_ancestor}
+                 'classic_ancestor': self.classic_ancestor,
+                 # Per-node mean PMF at the start of the current stage ('lift' pruning
+                 # reference, restored on resume) and how far the PMF has moved.
+                 'stage_start_probs': self._stage_start_probs}
+        entry['pmf_entropy'], entry['pmf_kl_stage_start'] = self._pmf_stats()
 
         if self.progressive_stages:
             entry['current_stage_idx'] = self.current_stage_idx
@@ -694,6 +752,16 @@ class QNAS(object):
             if self._stable_streak is None:
                 self._init_stability_streaks()
 
+        # Checkpoints written before the stage-start PMF was recorded get a rebuilt one.
+        # The stage's in-memory evaluation record is not checkpointed: 'empirical'
+        # pruning falls back to cache.json after a resume.
+        stage_start_probs = log_data.get('stage_start_probs')
+        if stage_start_probs is None or len(stage_start_probs) != len(self.qpop_net.probabilities):
+            stage_start_probs = self._reconstruct_stage_start_probs()
+        self._stage_start_probs = stage_start_probs
+        self._stage_eval_net = []
+        self._stage_eval_fit = []
+
     def check_early_stopping(self):
         """
         Compute the early stopping of the evolution. If the best fitness does not improve 
@@ -741,7 +809,14 @@ class QNAS(object):
 
             self.qpop_params.update_quantum(intensity=self.random)
 
-            if self.quantum_update_engine == 'ancestor_decay':
+            if self.quantum_lr is not None:
+                self.qpop_net.update_quantum_ranked(
+                    lr=self.quantum_lr,
+                    targets=self._ranked_update_targets(),
+                    negative_lr=self.quantum_negative_lr,
+                    prob_floor=self.quantum_prob_floor,
+                )
+            elif self.quantum_update_engine == 'ancestor_decay':
                 self.qpop_net.update_quantum_ancestor_decay(
                     intensity=self.random,
                     ages=self.classic_age,
@@ -751,6 +826,207 @@ class QNAS(object):
             else:
                 self.qpop_net.update_quantum(intensity=self.random)
     
+    RANK_WEIGHTINGS = ('uniform', 'linear', 'nes')
+    PRUNE_CRITERIA = ('pmf', 'lift', 'empirical')
+    # Pseudo-count pulling an op's empirical score toward the neutral 0.5 percentile, so
+    # an op seen in only a couple of individuals can't win (or lose) the prune on luck.
+    EMPIRICAL_PRIOR_COUNT = 5
+
+    def _set_update_and_prune_options(self, quantum_lr, rank_weighting, top_k, negative_lr,
+                                      prob_floor, max_prob, prune_criterion,
+                                      progressive_mode):
+        """ Validate and store the rank-based update / prune-criterion options. """
+        if quantum_lr is None:
+            if (rank_weighting, top_k, negative_lr, prob_floor) != ('uniform', 1, 0.0, 0.0):
+                raise ValueError(
+                    "quantum_rank_weighting, quantum_top_k, quantum_negative_lr and "
+                    "quantum_prob_floor only apply to the rank-based update - set "
+                    "quantum_lr to enable it."
+                )
+        elif not 0.0 < quantum_lr <= 1.0:
+            raise ValueError("quantum_lr must be in (0, 1] (or None for the original rules).")
+        if rank_weighting not in self.RANK_WEIGHTINGS:
+            raise ValueError(f"quantum_rank_weighting must be one of {self.RANK_WEIGHTINGS}, "
+                             f"got {rank_weighting!r}")
+        if top_k < 1:
+            raise ValueError("quantum_top_k must be >= 1.")
+        if not 0.0 <= negative_lr < 1.0:
+            raise ValueError("quantum_negative_lr must be in [0, 1).")
+        if not 0.0 <= prob_floor < 1.0:
+            raise ValueError("quantum_prob_floor must be in [0, 1).")
+        if not 0.0 < max_prob <= 1.0:
+            raise ValueError("quantum_max_prob must be in (0, 1].")
+        if prune_criterion not in self.PRUNE_CRITERIA:
+            raise ValueError(f"prune_criterion must be one of {self.PRUNE_CRITERIA}, "
+                             f"got {prune_criterion!r}")
+        if prune_criterion != 'pmf' and progressive_mode == 'dynamic':
+            raise ValueError(
+                "prune_criterion 'lift'/'empirical' is only supported in deterministic "
+                "progressive mode - dynamic nucleus pruning thresholds cumulative "
+                "probability mass, which these scores are not."
+            )
+
+        self.quantum_lr = quantum_lr
+        self.quantum_rank_weighting = rank_weighting
+        self.quantum_top_k = top_k
+        self.quantum_negative_lr = negative_lr
+        self.quantum_prob_floor = prob_floor
+        self.prune_criterion = prune_criterion
+
+    def _rank_weights(self, k):
+        """ Weights (summing to 1) of a quantum individual's k best targets, best first. """
+        j = np.arange(k)
+        if self.quantum_rank_weighting == 'linear':
+            weights = (k - j).astype(np.float64)
+        elif self.quantum_rank_weighting == 'nes':
+            weights = np.maximum(0.0, np.log(k / 2.0 + 1.0) - np.log(j + 1.0))
+        else:
+            weights = np.ones(k, dtype=np.float64)
+        return weights / weights.sum()
+
+    def _ranked_update_targets(self):
+        """ Targets of each quantum individual for QPopulationNetwork.update_quantum_ranked,
+            from current_pop (sorted best first):
+              - 'ancestor_decay': the quantum_top_k best rows of its own lineage, weighted
+                by rank and by exp(-quantum_update_age_decay * age); pushed away from the
+                lineage's worst row when that row is not a target;
+              - 'default': ranks q, q + num_ind, ... (q's rank, as in the original rule,
+                plus further ranks when quantum_top_k > 1); pushed away from rank n-1-q.
+        """
+        pop_size = self.qpop_net.current_pop.shape[0]
+        num_ind = self.qpop_net.num_ind
+        targets = [None] * num_ind
+
+        for q in range(num_ind):
+            if self.quantum_update_engine == 'ancestor_decay':
+                lineage = np.where(self.classic_ancestor == q)[0]
+                if lineage.size == 0:
+                    continue
+                rows = lineage[:self.quantum_top_k]
+                weights = self._rank_weights(rows.size) * np.exp(
+                    -self.quantum_update_age_decay * self.classic_age[rows])
+                worst = lineage[-1] if lineage.size > rows.size else None
+            else:
+                ranks = np.arange(q, pop_size, num_ind)
+                if ranks.size == 0:
+                    continue
+                rows = ranks[:self.quantum_top_k]
+                weights = self._rank_weights(rows.size)
+                worst = pop_size - 1 - q
+                if worst < 0 or worst in rows:
+                    worst = None
+            targets[q] = (rows, weights, worst)
+
+        return targets
+
+    def _snapshot_stage_start_probs(self):
+        """ Record the per-node mean PMF at the start of a stage (after initialization or
+            an op-list change) and restart the stage's evaluation record. """
+        self._stage_start_probs = [p.mean(axis=0).copy() for p in self.qpop_net.probabilities]
+        self._stage_eval_net = []
+        self._stage_eval_fit = []
+
+    def _reconstruct_stage_start_probs(self):
+        """ Best guess of the stage-start PMF for a checkpoint that predates its recording:
+            the configured prior in stage 0, uniform over each node's menu afterwards (exact
+            under reset_probs_on_stage_change, an approximation under carry-over). """
+        if self.current_stage_idx == 0 and not self.progressive_mode == 'dynamic':
+            prior = np.asarray(self.qpop_net.initial_probs, dtype=np.float64)
+            if all(p.shape[1] == prior.shape[0] for p in self.qpop_net.probabilities):
+                return [prior.copy() for _ in self.qpop_net.probabilities]
+        if not self.reset_probs_on_stage_change and self.prune_criterion == 'lift':
+            self.logger.warning(
+                "Checkpoint has no stage-start PMF: 'lift' pruning uses a uniform reference "
+                "for this stage (exact only with reset_probs_on_stage_change)."
+            )
+        return [np.full(p.shape[1], 1.0 / p.shape[1]) for p in self.qpop_net.probabilities]
+
+    def _pmf_stats(self):
+        """ (mean normalized entropy, mean KL to the stage-start PMF) of the network PMF. """
+        entropies, kls = [], []
+        refs = self._stage_start_probs or [None] * len(self.qpop_net.probabilities)
+        for probs, ref in zip(self.qpop_net.probabilities, refs):
+            safe = np.clip(probs, 1e-12, None)
+            n_ops = probs.shape[1]
+            entropies.append(0.0 if n_ops < 2 else
+                             float(np.mean(-(probs * np.log(safe)).sum(axis=1) / np.log(n_ops))))
+            if ref is not None and ref.shape[0] == n_ops:
+                kl = (probs * (np.log(safe) - np.log(np.clip(ref, 1e-12, None)))).sum(axis=1)
+                kls.append(float(np.mean(kl)))
+        return float(np.mean(entropies)), (float(np.mean(kls)) if kls else float('nan'))
+
+    def _op_scores(self):
+        """ Per-node op scores for progressive pruning, aligned with each node's fn_list,
+            or None for the original 'pmf' criterion (the caller keeps its own mean). """
+        if self.prune_criterion == 'pmf':
+            return None
+        if self.prune_criterion == 'empirical':
+            scores = self._empirical_op_scores()
+            if scores is not None:
+                return scores
+            self.logger.warning(
+                "Op pruning: no evaluation recorded for this stage - ranking by 'lift'."
+            )
+        refs = self._stage_start_probs
+        if refs is None or len(refs) != len(self.qpop_net.probabilities):
+            refs = self._reconstruct_stage_start_probs()
+        return [probs.mean(axis=0) / np.clip(ref, 1e-12, None)
+                for probs, ref in zip(self.qpop_net.probabilities, refs)]
+
+    def _empirical_op_scores(self):
+        """ Score of op k at node i = mean fitness percentile (0 worst .. 1 best) of the
+            individuals evaluated in this stage that used k at i, shrunk toward 0.5 by
+            EMPIRICAL_PRIOR_COUNT pseudo-observations. Uses the in-memory record of the
+            stage; after a resume (record lost) falls back to the run's cache.json. """
+        if self._stage_eval_net:
+            net = np.concatenate(self._stage_eval_net)
+            fit = np.concatenate(self._stage_eval_fit)
+        else:
+            net, fit = self._stage_evaluations_from_cache()
+        if net is None or net.shape[0] == 0:
+            return None
+
+        order = np.argsort(fit, kind='stable')
+        ranks = np.empty(fit.shape[0], dtype=np.float64)
+        ranks[order] = np.arange(fit.shape[0])
+        _, tie_group = np.unique(fit, return_inverse=True)
+        ranks = (np.bincount(tie_group, weights=ranks) / np.bincount(tie_group))[tie_group]
+        pct = ranks / (fit.shape[0] - 1) if fit.shape[0] > 1 else np.full(1, 0.5)
+
+        prior = self.EMPIRICAL_PRIOR_COUNT
+        scores = []
+        for node, names in enumerate(self.qpop_net.chromosome.fn_list):
+            genes = net[:, node]
+            valid = genes >= 0
+            sums = np.bincount(genes[valid], weights=pct[valid], minlength=len(names))
+            counts = np.bincount(genes[valid], minlength=len(names))
+            scores.append((sums + 0.5 * prior) / (counts + prior))
+        return scores
+
+    def _stage_evaluations_from_cache(self):
+        """ (net, fitness) of every cached architecture that fits the current depth and
+            per-node op menus - the current stage's evaluations when resuming. Cached
+            fitness is the raw (unpenalized) one. Returns (None, None) without a cache. """
+        cache = getattr(self.eval_func, 'architecture_cache', None)
+        if cache is None:
+            return None, None
+        index = {}
+        cache._locked_read_modify_write(index.update)
+
+        fn_list = self.qpop_net.chromosome.fn_list
+        positions = [{name: k for k, name in enumerate(names)} for names in fn_list]
+        rows, fits = [], []
+        for key, entry in index.items():
+            ops = key.split('|')
+            if len(ops) != len(fn_list) or not all(op in pos for op, pos in zip(ops, positions)):
+                continue
+            rows.append([pos[op] for op, pos in zip(ops, positions)])
+            fits.append(entry['fitness'])
+        if not rows:
+            return None, None
+        self.logger.info(f"Op pruning: using {len(rows)} cached evaluations of this stage.")
+        return np.array(rows, dtype=np.int64), np.array(fits, dtype=np.float64)
+
     def go_next_gen(self):
         """ Go to the next generation --> update quantum genes, log data, delete unnecessary
             training files and update generation counter.
@@ -810,12 +1086,17 @@ class QNAS(object):
         Returns:
             list of length num_genes, each entry that node's pruned op-name list.
         """
+        scores = self._op_scores()
+        label = 'PMF' if scores is None else self.prune_criterion
         new_fn_list = []
         for node_idx, names in enumerate(old_fn_list):
-            mean_weight = self.qpop_net.probabilities[node_idx].mean(axis=0)
+            if scores is None:
+                mean_weight = self.qpop_net.probabilities[node_idx].mean(axis=0)
+            else:
+                mean_weight = scores[node_idx]
             node_new_fn_list = self._rank_and_prune_ops(names, mean_weight, num_ops)
             self.logger.info(
-                f"Op pruning (PMF-ranked), node {node_idx}: {names} -> {node_new_fn_list}"
+                f"Op pruning ({label}-ranked), node {node_idx}: {names} -> {node_new_fn_list}"
             )
             new_fn_list.append(node_new_fn_list)
 
@@ -848,9 +1129,14 @@ class QNAS(object):
                 "stage 0 onward?)."
             )
 
-        mean_weight = np.stack(self.qpop_net.probabilities, axis=1).mean(axis=(0, 1))
+        scores = self._op_scores()
+        if scores is None:
+            mean_weight = np.stack(self.qpop_net.probabilities, axis=1).mean(axis=(0, 1))
+        else:
+            mean_weight = np.mean(scores, axis=0)
+        label = 'PMF' if scores is None else self.prune_criterion
         new_fn_list = self._rank_and_prune_ops(names, mean_weight, num_ops)
-        self.logger.info(f"Op pruning (PMF-ranked, global): {names} -> {new_fn_list}")
+        self.logger.info(f"Op pruning ({label}-ranked, global): {names} -> {new_fn_list}")
 
         return [list(new_fn_list) for _ in old_fn_list]
 
@@ -897,6 +1183,7 @@ class QNAS(object):
 
         self.eval_func.fn_list = self.qpop_net.chromosome.fn_list
         self._just_transitioned = True
+        self._snapshot_stage_start_probs()
 
     def _transition_stage(self, new_stage_idx):
         """Grow depth / prune ops at a progressive-stage boundary (deterministic mode

@@ -18,11 +18,14 @@ ARGS     ?=
 A        ?=
 B        ?=
 EVOLVE_ARGS ?=
+HOST     ?=
+REMOTE   ?=
+SYNC_ARGS ?=
 
 .PHONY: help sync test test-cov lint lint-fix check \
 	queue-add queue-list queue-status queue-start queue-stop \
 	queue-logs queue-logs-summary queue-logs-all queue-remove queue-cancel queue-retry \
-	queue pipeline diff-runs clean
+	queue pipeline diff-runs sync-remote clean
 
 help: ## Show this help
 	@echo "QNAS-torch project commands"
@@ -128,6 +131,11 @@ diff-runs: ## Diff the effective config of two runs/configs (needs A=, B=; EVOLV
 	uv run python src/diff_runs.py $(A) $(B) --evolve-args "$(EVOLVE_ARGS)"
 
 ## --- Housekeeping -------------------------------------------------------
+
+sync-remote: ## Pull experiment_*/ and configs/ from a remote copy (needs HOST=<ssh alias> REMOTE=<path>; SYNC_ARGS="--push -n")
+	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
+	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
+	scripts/sync-experiments.sh $(SYNC_ARGS) $(HOST) '$(REMOTE)'
 
 clean: ## Remove Python bytecode caches
 	find . -type d -name '__pycache__' -not -path './.venv/*' -prune -exec rm -rf {} +

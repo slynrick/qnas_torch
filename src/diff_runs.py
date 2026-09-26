@@ -24,6 +24,8 @@ import sys
 
 import yaml
 
+import option_defaults
+
 IGNORED_SECTIONS = ('files',)
 IGNORED_KEYS = {'train.experiment_path', 'train.data_path', 'train.phase', 'train.log_level'}
 
@@ -73,9 +75,17 @@ def relevant(flat):
             if key.split('.')[0] not in IGNORED_SECTIONS and key not in IGNORED_KEYS}
 
 
+def with_defaults(flat):
+    """ Fill options a run predates with the default it ran with (option_defaults), so an
+        old log and a new one that leaves the option at its default compare equal. """
+    if not any(key.startswith('QNAS.') for key in flat):
+        return flat
+    return {**option_defaults.LOGGED_DEFAULTS, **flat}
+
+
 def diff_params(a, b):
     """ Return (changed, only_a, only_b) between two parsed log_params trees. """
-    fa, fb = relevant(flatten(a)), relevant(flatten(b))
+    fa, fb = with_defaults(relevant(flatten(a))), with_defaults(relevant(flatten(b)))
     changed = {key: (fa[key], fb[key]) for key in fa.keys() & fb.keys() if fa[key] != fb[key]}
     only_a = {key: fa[key] for key in fa.keys() - fb.keys()}
     only_b = {key: fb[key] for key in fb.keys() - fa.keys()}

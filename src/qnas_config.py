@@ -13,6 +13,7 @@ import yaml
 import re
 
 from cnn import model, input
+import option_defaults
 from util import load_yaml, natural_key
 
 
@@ -258,6 +259,22 @@ class ConfigParameters(object):
         self.QNAS_spec['quantum_update_age_decay'] = config_file['QNAS'].get(
             'quantum_update_age_decay', 0.5
         )
+
+        # Rank-based network update + prune criterion (optional, config-file only; see
+        # docs/QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN.md, improvement 1). The defaults in
+        # option_defaults.SEARCH_ENGINE_DEFAULTS are the behavior of runs made before these
+        # options existed, so older configs/run logs mean the same thing. Validated by
+        # QNAS.initialize_qnas.
+        for key, default in option_defaults.SEARCH_ENGINE_DEFAULTS.items():
+            if key == 'prune_criterion':
+                self.QNAS_spec[key] = progressive_cfg.get(key, default)
+            else:
+                self.QNAS_spec[key] = config_file['QNAS'].get(key, default)
+        if self.QNAS_spec['prune_criterion'] != 'pmf' and active and progressive_mode == 'dynamic':
+            raise ValueError(
+                "QNAS.progressive.prune_criterion 'lift'/'empirical' is only supported "
+                "with mode: deterministic"
+            )
 
         if active and progressive_mode == 'dynamic':
             update_quantum_gen = self.QNAS_spec['update_quantum_gen']

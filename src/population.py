@@ -140,7 +140,8 @@ class QPopulationNetwork(QPopulation):
     """ QNAS Chromosomes for the networks to be evolved. """
 
     def __init__(self, num_quantum_ind, max_num_nodes, repetition, update_quantum_rate,
-                fn_list, initial_probs,crossover_method='hux'):
+                fn_list, initial_probs,crossover_method='hux', max_update=0.05,
+                max_prob=0.99):
         """ Initialize QPopulationNetwork.
 
         Args:
@@ -153,14 +154,17 @@ class QPopulationNetwork(QPopulation):
             fn_list: list of possible functions.
             initial_probs: list defining the initial probabilities for each function; if empty,
                 the algorithm will give the same probability for each function.
+            max_update: (float) largest step of the original update rules (update_quantum and
+                update_quantum_ancestor_decay), scaled there by a random intensity.
+            max_prob: (float) ceiling on any single op's probability, for every update rule.
         """
 
         super(QPopulationNetwork, self).__init__(num_quantum_ind, repetition,
                                                 update_quantum_rate)
         self.probabilities = None
 
-        self.max_update = 0.05
-        self.max_prob = 0.99
+        self.max_update = max_update
+        self.max_prob = max_prob
 
         self.chromosome = QChromosomeNetwork(max_num_nodes, fn_list, self.dtype)
 
@@ -328,6 +332,68 @@ class QPopulationNetwork(QPopulation):
                     self.current_pop[row:row + 1, node],
                     update_value,
                 )
+
+    def update_quantum_ranked(self, lr, targets, negative_lr=0.0, prob_floor=0.0):
+        """ Rank-based update engine (PBIL-style), used when QNAS.quantum_lr is set.
+
+        For each node that passes the update_quantum_rate gate, quantum individual q moves
+        toward the ops its target classical individuals chose there:
+        p <- (1 - lr * s) * p + lr * sum_j w_j * onehot(op_j), with s = sum_j w_j <= 1, so
+        the step is a fixed fraction of the distance to the targets instead of the original
+        rules' random intensity * max_update (which barely moves the PMF - see
+        docs/QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN.md). Optionally pushes away from the op of
+        a poor individual (negative learning), then keeps every op within
+        [prob_floor / n_ops, max_prob].
+
+        Args:
+            lr: (float) in (0, 1], learning rate of the positive update.
+            targets: list of length num_ind; entry q is None (no update for q) or a tuple
+                (rows, weights, worst_row): rows/weights are the rows of self.current_pop
+                pulling q and their weights (sum <= 1); worst_row is a row to push q away
+                from, or None.
+            negative_lr: (float) in [0, 1), fraction of the poor op's probability removed.
+            prob_floor: (float) in [0, 1), minimum probability of any op as a fraction of
+                the uniform probability 1 / n_ops (0 disables the floor).
+        """
+
+        for node in range(self.chromosome.num_genes):
+            probs = self.probabilities[node]
+            n_ops = probs.shape[1]
+            gate = np.random.rand(self.num_ind) <= self.update_quantum_rate
+
+            for q in np.where(gate)[0]:
+                if targets[q] is None:
+                    continue
+                rows, weights, worst_row = targets[q]
+                pull = np.zeros(n_ops, dtype=self.dtype)
+                np.add.at(pull, self.current_pop[rows, node], weights)
+                row = (1.0 - lr * np.sum(weights)) * probs[q] + lr * pull
+
+                if negative_lr > 0 and worst_row is not None:
+                    worst_op = self.current_pop[worst_row, node]
+                    if worst_op != self.current_pop[rows[0], node]:
+                        row[worst_op] *= 1.0 - negative_lr
+                        row /= row.sum()
+
+                probs[q] = self._bound_probs(row, prob_floor / n_ops, self.max_prob)
+
+    @staticmethod
+    def _bound_probs(row, low, high):
+        """ Bring a PMF row within [low, high] by mixing it with the uniform distribution
+            as little as needed: sum and op order are kept, and moving toward uniform
+            never breaks the bound already met. Assumes low <= 1/n <= high. """
+        row = np.array(row, dtype=np.float64)
+        n_ops = row.shape[0]
+        if n_ops == 1:
+            return np.ones(1)
+        uniform = 1.0 / n_ops
+        if row.min() < low:
+            alpha = (low - row.min()) / (uniform - row.min())
+            row = (1.0 - alpha) * row + alpha * uniform
+        if row.max() > high:
+            alpha = (row.max() - high) / (row.max() - uniform)
+            row = (1.0 - alpha) * row + alpha * uniform
+        return row
 
     def grow_and_prune_discrete(self, new_num_nodes: int, new_fn_list: list,
                                 reset_probs: bool = False):
