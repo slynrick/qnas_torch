@@ -557,11 +557,36 @@ def _format_elapsed(started_at):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _format_eta(started_at, generation, max_gen):
+    """Rough ETA to *max_gen*, extrapolated from this job's own progress so far
+    (elapsed wall-clock time / generations completed) * generations
+    remaining - no dependency on qnas.py's own periodic (every-5-generations)
+    "Estimated time to finish" log line, so this stays current every time
+    `watch` refreshes rather than only every 5 generations.
+
+    "-" if there isn't enough information yet: job not started, no generation
+    logged yet, max_generations unknown (e.g. a retrain job), or the very
+    first generation (generation 0) - one data point isn't a rate.
+    """
+    if not started_at or generation is None or not max_gen or generation < 1:
+        return "-"
+    completed = generation + 1
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+    if elapsed <= 0:
+        return "-"
+    remaining = max(max_gen - completed, 0)
+    eta_seconds = int((elapsed / completed) * remaining)
+    hours, rem = divmod(eta_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def _job_summary_row(job, gen_cache):
     """One `watch` table row for *job*: (id, mode, gpu, gen, best fitness,
-    best origin, fitness delta, fitness spread, elapsed). "n/a" for gen/fitness
-    on a retrain job (never writes generation blocks); "starting..." for an
-    evolve/pipeline job that hasn't logged its first generation yet.
+    best origin, fitness delta, fitness spread, elapsed, ETA). "n/a" for
+    gen/fitness on a retrain job (never writes generation blocks);
+    "starting..." for an evolve/pipeline job that hasn't logged its first
+    generation yet.
 
     best origin: "gen G/ind I" - which generation/individual produced the
     current best_fitness (parsed from best_so_far_id, e.g. "[1, 13]").
@@ -569,12 +594,13 @@ def _job_summary_row(job, gen_cache):
     generation (a signed value - positive means it just improved).
     fitness spread: max - min across the latest generation's own population,
     i.e. how converged/diverse that generation currently is.
+    ETA: rough time remaining to max_generations - see _format_eta.
     """
     summary = _parse_generation_summary(
         db.resolve_path(job["experiment_path"]) / "log_QNAS.txt")
     if summary is None:
         gen_cell = "n/a" if job["mode"] == "retrain" else "starting..."
-        fitness_cell = origin_cell = delta_cell = spread_cell = "-"
+        fitness_cell = origin_cell = delta_cell = spread_cell = eta_cell = "-"
     else:
         max_gen = _job_max_generations(job, gen_cache)
         gen_cell = (f"{summary['generation']}/{max_gen}" if max_gen is not None
@@ -587,9 +613,10 @@ def _job_summary_row(job, gen_cache):
                      if summary["fitness_delta"] is not None else "-")
         spread_cell = (f"{summary['fitness_spread']:.5f}"
                        if summary["fitness_spread"] is not None else "-")
+        eta_cell = _format_eta(job["started_at"], summary["generation"], max_gen)
     return (str(job["id"]), job["mode"], job["gpu_ids"] or "-", gen_cell,
             fitness_cell, origin_cell, delta_cell, spread_cell,
-            _format_elapsed(job["started_at"]))
+            _format_elapsed(job["started_at"]), eta_cell)
 
 
 def _drain_new_detail_lines(handles, conn, detail_buffer):
@@ -636,7 +663,7 @@ def _watch_layout(console, jobs, gen_cache, detail_buffer):
         # top border + header + separator + bottom border = 5 fixed lines).
         top = Table(title="Running jobs", expand=True)
         for column in ("id", "mode", "gpu", "gen", "best fitness", "best origin",
-                       "Δ best", "spread", "elapsed"):
+                       "Δ best", "spread", "elapsed", "ETA"):
             top.add_column(column)
         for job in jobs:
             top.add_row(*_job_summary_row(job, gen_cache), style=_job_style(job["id"]))

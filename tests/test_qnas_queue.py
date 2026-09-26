@@ -2,6 +2,7 @@ import argparse
 import os
 import sqlite3
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -702,6 +703,7 @@ class TestCli:
         assert row[:6] == (str(job['id']), 'evolve', '0', '5/300', '0.61234',
                           'gen 5/ind 1')
         assert row[8] != '-'  # elapsed, formatted since started_at is set
+        assert row[9] != '-'  # ETA, extrapolated from generation 5's progress
 
     def test_job_summary_row_delta_and_spread(self, isolated_queue):
         job = self.seed_job_with_experiment(
@@ -720,7 +722,21 @@ class TestCli:
     def test_job_summary_row_dashes_when_no_generation_yet(self, isolated_queue):
         job = self.seed_job_with_experiment(isolated_queue, mode='evolve')
         row = cli._job_summary_row(job, {})
-        assert row[4:8] == ('-', '-', '-', '-')
+        assert row[4:7] == ('-', '-', '-')
+        assert row[9] == '-'  # ETA
+
+    def test_format_eta_extrapolates_from_progress_so_far(self):
+        started = (datetime.now(timezone.utc) - timedelta(seconds=100)).isoformat()
+        # 2 generations completed (0 and 1) in 100s -> 50s/gen; 3 remain of max 5.
+        eta = cli._format_eta(started, generation=1, max_gen=5)
+        assert eta == '00:02:30'
+
+    def test_format_eta_dash_without_enough_data(self):
+        now = datetime.now(timezone.utc).isoformat()
+        assert cli._format_eta(None, 1, 5) == '-'
+        assert cli._format_eta(now, None, 5) == '-'
+        assert cli._format_eta(now, 1, None) == '-'
+        assert cli._format_eta(now, 0, 5) == '-'  # generation 0: one data point
 
     def test_watch_layout_renders_every_job_row_without_clipping(self, isolated_queue):
         # Regression: an earlier version wrapped the summary Table in its own
