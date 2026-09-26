@@ -1,11 +1,13 @@
 import argparse
 import os
 import sqlite3
+from collections import deque
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from qnas_queue import cli, db, runner
+from qnas_queue import cli, db, runner, worker
 
 
 @pytest.fixture(autouse=True)
@@ -18,20 +20,19 @@ def isolated_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(db, 'DB_PATH', queue / 'queue.db')
     monkeypatch.setattr(db, 'LOG_DIR', queue / 'logs')
     monkeypatch.setattr(db, 'SNAPSHOT_DIR', queue / 'configs')
-    monkeypatch.setattr(db, 'WORKER_PID_FILE', queue / 'worker.pid')
     monkeypatch.setattr(db, 'WORKER_LOG_PATH', queue / 'worker.log')
     root.mkdir()
     return root
 
 
-def add(conn, mode='pipeline', config='c.yml', exp='exp1', extra='', priority=0):
-    return db.add_job(conn, mode, config, exp, extra, priority)
+def add(conn, mode='pipeline', config='c.yml', exp='exp1', extra='', priority=0, gpu_ids=None):
+    return db.add_job(conn, mode, config, exp, extra, priority, gpu_ids=gpu_ids)
 
 
 class TestDb:
-    def test_connect_creates_schema_and_worker_row(self):
+    def test_connect_creates_schema_with_no_workers(self):
         with db.connect() as conn:
-            assert db.get_worker(conn)['status'] == 'stopped'
+            assert db.list_workers(conn) == []
             assert db.list_jobs(conn) == []
         assert db.DB_PATH.is_file() and db.LOG_DIR.is_dir()
 
@@ -64,15 +65,57 @@ class TestDb:
             low = add(conn, priority=0)
             high = add(conn, priority=5)
             low2 = add(conn, priority=0)
-            claimed = [db.claim_next_job(conn)['id'] for _ in range(3)]
+            claimed = [db.claim_next_job(conn, 111)['id'] for _ in range(3)]
             assert claimed == [high, low, low2]
-            assert db.claim_next_job(conn) is None
+            assert db.claim_next_job(conn, 111) is None
 
-    def test_claim_marks_running_with_start_time(self):
+    def test_claim_marks_running_with_start_time_and_worker_pid(self):
         with db.connect() as conn:
             add(conn)
-            job = db.claim_next_job(conn)
+            job = db.claim_next_job(conn, 111)
         assert job['status'] == 'running' and job['started_at']
+
+    def test_claim_with_gpu_pool_assigns_lowest_free_id(self):
+        with db.connect() as conn:
+            add(conn)
+            job = db.claim_next_job(conn, 111, gpu_pool={0, 1, 2})
+        assert job['gpu_ids'] == '0'
+
+    def test_claim_with_gpu_pool_skips_ids_already_in_use(self):
+        with db.connect() as conn:
+            a = add(conn)
+            db.update_job(conn, a, status='running', gpu_ids='0')
+            b = add(conn)
+            job = db.claim_next_job(conn, 111, gpu_pool={0, 1})
+        assert job['id'] == b and job['gpu_ids'] == '1'
+
+    def test_claim_with_gpu_pool_fully_occupied_returns_none(self):
+        with db.connect() as conn:
+            a = add(conn)
+            db.update_job(conn, a, status='running', gpu_ids='0')
+            add(conn)  # b - queued, would also need the pool
+            assert db.claim_next_job(conn, 111, gpu_pool={0}) is None
+
+    def test_claim_with_gpu_pool_leaves_a_manually_pinned_job_untouched(self):
+        with db.connect() as conn:
+            job_id = add(conn, gpu_ids='0')
+            job = db.claim_next_job(conn, 111, gpu_pool={5, 6})
+        assert job['id'] == job_id and job['gpu_ids'] == '0'  # pin kept, not drawn from pool
+
+    def test_claim_with_gpu_pool_skips_exhausted_front_job_for_a_pinned_one_behind_it(self):
+        with db.connect() as conn:
+            a = add(conn)  # front of queue, priority 0, needs the pool
+            db.update_job(conn, a, status='running', gpu_ids='0')  # the only pool GPU is taken
+            b = add(conn, gpu_ids='7')  # behind it, but pinned - doesn't need the pool
+            job = db.claim_next_job(conn, 111, gpu_pool={0})
+        assert job['id'] == b and job['gpu_ids'] == '7'
+
+    def test_claim_without_gpu_pool_ignores_gpu_ids_column(self):
+        with db.connect() as conn:
+            add(conn)
+            job = db.claim_next_job(conn, 111)  # gpu_pool=None, same as before this feature
+        assert job['gpu_ids'] is None
+        assert job['worker_pid'] == 111
 
     def test_cancel_and_delete(self):
         with db.connect() as conn:
@@ -106,11 +149,49 @@ class TestDb:
             db.update_job(conn, a, status='running')
             assert [r['id'] for r in db.list_running_jobs(conn)] == [a]
 
+    def test_register_worker_creates_row(self):
+        with db.connect() as conn:
+            db.register_worker(conn, 123)
+            worker = db.get_worker(conn, 123)
+        assert worker['pid'] == 123 and worker['status'] == 'running'
+        assert worker['current_job_id'] is None and worker['started_at']
+
+    def test_register_worker_is_idempotent_and_resets_current_job(self):
+        with db.connect() as conn:
+            db.register_worker(conn, 123)
+            db.set_worker(conn, 123, current_job_id=7)
+            db.register_worker(conn, 123)  # e.g. a restarted process reusing the pid
+            worker = db.get_worker(conn, 123)
+        assert worker['current_job_id'] is None
+
     def test_set_worker_updates_timestamp(self):
         with db.connect() as conn:
-            db.set_worker(conn, pid=123, status='running')
-            worker = db.get_worker(conn)
-        assert worker['pid'] == 123 and worker['updated_at']
+            db.register_worker(conn, 123)
+            db.set_worker(conn, 123, current_job_id=5)
+            worker = db.get_worker(conn, 123)
+        assert worker['current_job_id'] == 5 and worker['updated_at']
+
+    def test_list_workers_orders_by_pid(self):
+        with db.connect() as conn:
+            db.register_worker(conn, 200)
+            db.register_worker(conn, 100)
+            assert [w['pid'] for w in db.list_workers(conn)] == [100, 200]
+
+    def test_remove_worker(self):
+        with db.connect() as conn:
+            db.register_worker(conn, 123)
+            db.remove_worker(conn, 123)
+            assert db.list_workers(conn) == []
+
+    def test_add_job_stores_gpu_ids(self):
+        with db.connect() as conn:
+            job_id = add(conn, gpu_ids='0,1')
+            assert db.get_job(conn, job_id)['gpu_ids'] == '0,1'
+
+    def test_add_job_gpu_ids_defaults_to_none(self):
+        with db.connect() as conn:
+            job_id = add(conn)
+            assert db.get_job(conn, job_id)['gpu_ids'] is None
 
     def test_changes_are_committed_on_context_exit(self):
         with db.connect() as conn:
@@ -164,6 +245,47 @@ class TestDb:
             db.update_job(conn, job_id, config_snapshot='.qnas_queue/configs/job_1_c.yml')
             assert db.config_for_run(db.get_job(conn, job_id)) == '.qnas_queue/configs/job_1_c.yml'
 
+    def test_migration_adds_gpu_ids_and_worker_pid_columns(self):
+        db.ensure_dirs()
+        legacy = sqlite3.connect(db.DB_PATH)
+        legacy.executescript(
+            db.SCHEMA.replace('    gpu_ids         TEXT,\n', '')
+                     .replace('    worker_pid      INTEGER,\n', '')
+        )
+        legacy.execute(
+            "INSERT INTO jobs (mode, config_path, experiment_path, created_at) "
+            "VALUES ('evolve', 'c.yml', 'exp', 'now')")
+        legacy.commit()
+        legacy.close()
+        with db.connect() as conn:
+            job = db.list_jobs(conn)[0]
+            assert job['gpu_ids'] is None and job['worker_pid'] is None
+
+    def test_migration_drops_legacy_singleton_worker_table(self):
+        db.ensure_dirs()
+        legacy = sqlite3.connect(db.DB_PATH)
+        legacy.executescript(
+            "CREATE TABLE worker (id INTEGER PRIMARY KEY CHECK (id = 1), pid INTEGER, "
+            "status TEXT, current_job_id INTEGER, started_at TEXT, updated_at TEXT);"
+        )
+        legacy.execute("INSERT INTO worker (id, pid, status) VALUES (1, 999, 'running')")
+        legacy.commit()
+        legacy.close()
+        with db.connect() as conn:
+            tables = {r['name'] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert 'worker' not in tables and 'workers' in tables
+            assert db.list_workers(conn) == []
+
+
+class TestWorkerGpuPool:
+    def test_gpu_pool_from_env_parses_comma_separated_ids(self, monkeypatch):
+        monkeypatch.setenv('QNAS_QUEUE_GPU_POOL', '0,1,2')
+        assert worker._gpu_pool_from_env() == {0, 1, 2}
+
+    def test_gpu_pool_from_env_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv('QNAS_QUEUE_GPU_POOL', raising=False)
+        assert worker._gpu_pool_from_env() is None
+
 
 class TestRunner:
     def test_evolve_argv(self):
@@ -203,6 +325,8 @@ class TestRunner:
 
 class TestCli:
     def ns(self, **kw):
+        kw.setdefault('gpu_ids', None)
+        kw.setdefault('gpu_pool', None)
         return argparse.Namespace(**kw)
 
     def make_config(self, root, text='QNAS: {}\n'):
@@ -311,7 +435,243 @@ class TestCli:
         cli.cmd_stop(self.ns())
         with db.connect() as conn:
             assert db.get_job(conn, job_id)['status'] == 'stopped'
-        assert 'not running' in capsys.readouterr().out
+        assert 'No worker is running' in capsys.readouterr().out
+
+    def test_add_with_valid_gpu_ids(self, isolated_queue):
+        cfg = self.make_config(isolated_queue)
+        cli.cmd_add(self.ns(config=str(cfg), mode='evolve', experiment_path='e',
+                            extra='', priority=0, gpu_ids='0, 1'))
+        with db.connect() as conn:
+            assert db.list_jobs(conn)[0]['gpu_ids'] == '0,1'
+
+    def test_add_with_invalid_gpu_ids_exits(self, isolated_queue):
+        cfg = self.make_config(isolated_queue)
+        with pytest.raises(SystemExit, match='gpu-ids'):
+            cli.cmd_add(self.ns(config=str(cfg), mode='evolve', experiment_path='e',
+                                extra='', priority=0, gpu_ids='0,x'))
+
+    def test_list_shows_gpu_column(self, isolated_queue, capsys):
+        cfg = self.make_config(isolated_queue)
+        cli.cmd_add(self.ns(config=str(cfg), mode='evolve', experiment_path='e',
+                            extra='', priority=0, gpu_ids='0'))
+        cli.cmd_list(self.ns(status=None))
+        out = capsys.readouterr().out
+        assert 'gpus' in out and '0' in out
+
+    def test_start_tops_up_to_target_worker_count(self, isolated_queue, monkeypatch):
+        spawned = []
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+        def fake_popen(*args, **kwargs):
+            pid = 1000 + len(spawned)
+            spawned.append(pid)
+            return FakeProc(pid)
+
+        monkeypatch.setattr(cli.subprocess, 'Popen', fake_popen)
+        cli.cmd_start(self.ns(workers=2))
+        assert len(spawned) == 2
+        with db.connect() as conn:
+            # cmd_start only spawns processes; it does not register them in `workers`
+            # itself - that happens inside worker.run() once each process starts.
+            assert db.list_workers(conn) == []
+
+    def test_start_forwards_gpu_pool_into_each_worker_env(self, isolated_queue, monkeypatch):
+        seen_envs = []
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+        def fake_popen(*args, **kwargs):
+            seen_envs.append(kwargs['env'])
+            return FakeProc(1000 + len(seen_envs))
+
+        monkeypatch.setattr(cli.subprocess, 'Popen', fake_popen)
+        cli.cmd_start(self.ns(workers=2, gpu_pool='0, 1'))
+        assert len(seen_envs) == 2
+        assert all(env['QNAS_QUEUE_GPU_POOL'] == '0,1' for env in seen_envs)
+
+    def test_start_without_gpu_pool_does_not_set_env_var(self, isolated_queue, monkeypatch):
+        seen_envs = []
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+        monkeypatch.setattr(cli.subprocess, 'Popen',
+                             lambda *a, **kw: (seen_envs.append(kw['env']), FakeProc(1))[1])
+        cli.cmd_start(self.ns(workers=1))
+        assert 'QNAS_QUEUE_GPU_POOL' not in seen_envs[0]
+
+    def test_start_with_invalid_gpu_pool_exits(self):
+        with pytest.raises(SystemExit, match='gpu-pool'):
+            cli.cmd_start(self.ns(workers=1, gpu_pool='0,x'))
+
+    def test_start_does_not_spawn_past_target_when_workers_already_alive(
+            self, isolated_queue, monkeypatch):
+        with db.connect() as conn:
+            db.register_worker(conn, os.getpid())  # a real, alive pid
+
+        spawned = []
+        monkeypatch.setattr(cli.subprocess, 'Popen',
+                             lambda *a, **kw: spawned.append(1) or None)
+        cli.cmd_start(self.ns(workers=1))
+        assert spawned == []
+
+    def test_stop_signals_every_alive_worker(self, isolated_queue, monkeypatch):
+        with db.connect() as conn:
+            db.register_worker(conn, os.getpid())
+
+        real_kill = os.kill
+        killed = []
+
+        def fake_kill(pid, sig):
+            if sig == 0:  # db.pid_alive's liveness probe - let it through for real
+                return real_kill(pid, sig)
+            killed.append((pid, sig))
+
+        monkeypatch.setattr(cli.os, 'kill', fake_kill)
+        cli.cmd_stop(self.ns())
+        assert killed == [(os.getpid(), cli.signal.SIGTERM)]
+
+    def seed_running_with_log(self, isolated_queue, lines):
+        job_id = self.seed('running')
+        log_path = isolated_queue / '.qnas_queue' / 'logs' / f'job_{job_id}.log'
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(lines)
+        with db.connect() as conn:
+            db.update_job(conn, job_id, log_path=f'.qnas_queue/logs/job_{job_id}.log')
+        return job_id
+
+    def test_logs_all_jobs_shows_each_running_job(self, isolated_queue, capsys):
+        # Non-follow mode reuses _tail_sources, which headers each source with
+        # "==> label <==" rather than prefixing every line (that per-line
+        # [label] prefix is _tail_follow's follow-mode behavior instead).
+        a = self.seed_running_with_log(isolated_queue, 'from a\n')
+        b = self.seed_running_with_log(isolated_queue, 'from b\n')
+        cli.cmd_logs(self.ns(id=None, follow=False, lines=50, all_jobs=True))
+        out = capsys.readouterr().out
+        assert f'job {a}' in out and 'from a' in out
+        assert f'job {b}' in out and 'from b' in out
+
+    def test_logs_all_jobs_follow_prefixes_each_line_by_job_id(
+            self, isolated_queue, capsys, monkeypatch):
+        a = self.seed_running_with_log(isolated_queue, 'from a\n')
+        b = self.seed_running_with_log(isolated_queue, 'from b\n')
+        monkeypatch.setattr(cli.time, 'sleep', lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+        cli.cmd_logs(self.ns(id=None, follow=True, lines=50, all_jobs=True))
+        out = capsys.readouterr().out
+        assert f'[job {a}] from a' in out
+        assert f'[job {b}] from b' in out
+
+    def test_logs_all_jobs_with_no_running_jobs(self, capsys):
+        cli.cmd_logs(self.ns(id=None, follow=False, lines=50, all_jobs=True))
+        assert 'No jobs currently running' in capsys.readouterr().out
+
+    def test_logs_all_jobs_rejects_explicit_id(self):
+        with pytest.raises(SystemExit, match='all-jobs'):
+            cli.cmd_logs(self.ns(id=5, follow=False, lines=50, all_jobs=True))
+
+    def seed_job_with_experiment(self, isolated_queue, mode='evolve', log_qnas_text=None,
+                                 max_generations=300, gpu_ids=None):
+        """A running job with a real experiment dir (for log_QNAS.txt) and a real
+        frozen config snapshot (for max_generations) - what `watch`'s summary row
+        needs, as opposed to seed()'s bare row with no files behind it."""
+        with db.connect() as conn:
+            job_id = add(conn, mode=mode, gpu_ids=gpu_ids)
+            db.update_job(conn, job_id, status='running', started_at=db.now_iso())
+        exp_dir = isolated_queue / f'exp_{job_id}'
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        if log_qnas_text is not None:
+            (exp_dir / 'log_QNAS.txt').write_text(log_qnas_text)
+        snapshot = isolated_queue / '.qnas_queue' / 'configs' / f'job_{job_id}_cfg.yml'
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(f'QNAS:\n  max_generations: {max_generations}\n')
+        with db.connect() as conn:
+            db.update_job(conn, job_id, experiment_path=f'exp_{job_id}',
+                          config_snapshot=f'.qnas_queue/configs/job_{job_id}_cfg.yml')
+            return db.get_job(conn, job_id)
+
+    def test_parse_generation_summary_returns_last_block(self, tmp_path):
+        log = tmp_path / 'log_QNAS.txt'
+        log.write_text(
+            "INFO: qnas: 2026-01-01 00:00:00,000 - New generation finished running!\n"
+            "- Generation: 1\n"
+            "- Best so far: 1_0 --> 0.50000\n"
+            "- Fitnesses: [0.5]\n"
+            "INFO: qnas: 2026-01-01 00:01:00,000 - New generation finished running!\n"
+            "- Generation: 2\n"
+            "- Best so far: 2_3 --> 0.77123\n"
+            "- Fitnesses: [0.6, 0.77123]\n"
+        )
+        assert cli._parse_generation_summary(log) == {
+            'generation': 2, 'best_id': '2_3', 'best_fitness': 0.77123,
+        }
+
+    def test_parse_generation_summary_missing_or_empty_file_returns_none(self, tmp_path):
+        assert cli._parse_generation_summary(tmp_path / 'missing.txt') is None
+        empty = tmp_path / 'log_QNAS.txt'
+        empty.write_text('')
+        assert cli._parse_generation_summary(empty) is None
+
+    def test_job_max_generations_reads_config_snapshot(self, isolated_queue):
+        cfg = isolated_queue / 'cfg.yml'
+        cfg.write_text('QNAS:\n  max_generations: 150\n')
+        with db.connect() as conn:
+            job_id = add(conn, config='cfg.yml')
+            job = db.get_job(conn, job_id)
+        cache = {}
+        assert cli._job_max_generations(job, cache) == 150
+        assert cache[job_id] == 150  # cached, so a 2nd call would not re-read the file
+
+    def test_job_max_generations_missing_config_returns_none(self, isolated_queue):
+        with db.connect() as conn:
+            job_id = add(conn, config='does-not-exist.yml')
+            job = db.get_job(conn, job_id)
+        assert cli._job_max_generations(job, {}) is None
+
+    def test_job_summary_row_starting_when_no_generation_yet(self, isolated_queue):
+        job = self.seed_job_with_experiment(isolated_queue, mode='evolve')
+        row = cli._job_summary_row(job, {})
+        assert row[3] == 'starting...' and row[4] == '-'
+
+    def test_job_summary_row_retrain_shows_na_instead_of_starting(self, isolated_queue):
+        job = self.seed_job_with_experiment(isolated_queue, mode='retrain')
+        row = cli._job_summary_row(job, {})
+        assert row[3] == 'n/a'
+
+    def test_job_summary_row_formats_generation_fitness_and_gpu(self, isolated_queue):
+        job = self.seed_job_with_experiment(
+            isolated_queue, mode='evolve', gpu_ids='0',
+            log_qnas_text='- Generation: 5\n- Best so far: 5_1 --> 0.61234\n',
+            max_generations=300,
+        )
+        row = cli._job_summary_row(job, {})
+        assert row[:5] == (str(job['id']), 'evolve', '0', '5/300', '0.61234')
+        assert row[5] != '-'  # elapsed, formatted since started_at is set
+
+    def test_watch_layout_renders_every_job_row_without_clipping(self, isolated_queue):
+        # Regression: an earlier version wrapped the summary Table in its own
+        # Panel and under-counted the combined border/header/title height, so
+        # the Layout's fixed `size` clipped exactly the data row(s) - headers
+        # rendered, but every job's actual gen/fitness numbers were cut off.
+        jobs = [self.seed_job_with_experiment(isolated_queue, gpu_ids=str(i))
+                for i in range(3)]
+        console = Console(width=100, height=40)
+        layout = cli._watch_layout(console, jobs, {}, deque())
+        with console.capture() as cap:
+            console.print(layout)
+        out = cap.get()
+        for job in jobs:
+            assert f"{job['id']}" in out and "starting..." in out
+
+    def test_cmd_watch_requires_a_tty(self, monkeypatch):
+        monkeypatch.setattr(cli.sys.stdout, 'isatty', lambda: False)
+        with pytest.raises(SystemExit, match='interactive terminal'):
+            cli.cmd_watch(self.ns())
 
     def test_parser_wires_every_subcommand(self, monkeypatch):
         seen = {}

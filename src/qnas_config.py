@@ -155,7 +155,13 @@ class ConfigParameters(object):
         ranges = self._get_ranges(config_file)
         self.QNAS_spec['params_ranges'] = OrderedDict(sorted(ranges.items()))
         self.QNAS_spec['early_stopping'] = self.args['early_stopping']
-        self.QNAS_spec['en_pop_crossover'] = self.args['en_pop_crossover']
+        # Unlike crossover_frequency/pop_crossover_rate/pop_crossover_method above
+        # (config-only), this on/off switch historically only came from the CLI
+        # (--en_pop_crossover/-X). QNAS.en_pop_crossover in the config, when present,
+        # now takes precedence, so a config can turn it on without relying on every
+        # caller remembering to pass the flag; omit it to keep the CLI-only behavior.
+        self.QNAS_spec['en_pop_crossover'] = config_file['QNAS'].get(
+            'en_pop_crossover', self.args['en_pop_crossover'])
 
         # P-DARTS-style progressive depth growth + operation pruning (optional).
         # Everything related lives under QNAS.progressive so one block documents

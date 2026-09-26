@@ -22,14 +22,20 @@ snapshot can go stale and no concurrent write can corrupt the file or lose an up
 """
 
 import fcntl
-import json
+import math
 import os
 from typing import List, Optional
+
+import orjson
 
 
 def net_list_signature(net_list: List[str]) -> str:
     """Convert a decoded network (list of op names) to a stable string key."""
     return "|".join(net_list)
+
+
+def _finite_or_none(x: float) -> Optional[float]:
+    return x if math.isfinite(x) else None
 
 
 class ArchitectureCache:
@@ -63,16 +69,16 @@ class ArchitectureCache:
         Returns:
             Whatever *mutate* returned.
         """
-        with open(self.cache_path, "r+") as f:
+        with open(self.cache_path, "rb+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
                 f.seek(0)
                 content = f.read()
-                index = json.loads(content) if content else {}
+                index = orjson.loads(content) if content else {}
                 result = mutate(index)
                 f.seek(0)
                 f.truncate()
-                json.dump(index, f, indent=2)
+                f.write(orjson.dumps(index))
                 # Flush the write to the OS before releasing the lock - otherwise the
                 # lock could be released (letting another process in) while these
                 # bytes are still sitting in Python's userspace buffer, unflushed.
@@ -110,15 +116,19 @@ class ArchitectureCache:
         whatever other worker processes have already written (locked read-modify-write
         of the shared cache.json - safe to call concurrently from multiple processes).
         Preserves the existing hit_count if this architecture was already registered.
+
+        A diverged individual can produce a non-finite fitness (NaN/Inf); orjson (unlike
+        stdlib json) raises on those instead of silently writing the literal, so they are
+        stored as None here rather than crashing the write.
         """
         key = net_list_signature(net_list)
 
         def mutate(index):
             existing = index.get(key, {})
             index[key] = {
-                "fitness": fitness,
-                "params_m": params_m,
-                "inference_us": inference_us,
+                "fitness": _finite_or_none(fitness),
+                "params_m": _finite_or_none(params_m),
+                "inference_us": _finite_or_none(inference_us),
                 "hit_count": existing.get("hit_count", 0),
             }
 

@@ -12,7 +12,7 @@ Paths and provenance (the files section, experiment/data paths, phase, log level
 ignored. Exit status is 0 when the configurations match and 1 otherwise, like diff.
 
     uv run python src/diff_runs.py experiment_cifar10_progressive/exp4 experiment_cifar10_progressive/exp5
-    uv run python src/diff_runs.py configs/config_files_cifar/config_progressive.yml \\
+    uv run python src/diff_runs.py configs/config_files_cifar/01_deterministic_13-8-4.yml \\
         experiment_cifar10_progressive/exp4 --evolve-args "--fitness_metric best_accuracy --en_pop_crossover"
 """
 

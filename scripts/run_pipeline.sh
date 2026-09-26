@@ -4,7 +4,7 @@
 #
 # Usage:
 #   scripts/run_pipeline.sh -e experiment_cifar10_progressive/exp1 \
-#       -c configs/config_files_cifar/config_progressive.yml -d cifar10
+#       -c configs/config_files_cifar/01_deterministic_13-8-4.yml -d cifar10
 #
 # Required:
 #   -e  experiment_path (also used for retrain and infographic)

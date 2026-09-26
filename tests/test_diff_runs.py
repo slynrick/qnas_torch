@@ -10,7 +10,7 @@ import qnas_config as cfg
 from conftest import ROOT_DIR
 from test_config import make_args
 
-CONFIG = os.path.join(ROOT_DIR, 'configs', 'config_files_cifar', 'config_progressive.yml')
+CONFIG = os.path.join(ROOT_DIR, 'configs', 'config_files_cifar', '01_deterministic_13-8-4.yml')
 
 
 def write_log(directory, tree):
@@ -64,5 +64,13 @@ class TestRender:
         assert diff_runs.diff_params(rendered, diff_runs.load_params(str(tmp_path))) == ({}, {}, {})
 
     @pytest.mark.parametrize('flag, expected', [('', False), ('--en_pop_crossover', True)])
-    def test_cli_flags_reach_the_rendered_qnas_block(self, flag, expected):
-        assert diff_runs.render_config(CONFIG, flag)['QNAS']['en_pop_crossover'] is expected
+    def test_cli_flags_reach_the_rendered_qnas_block(self, tmp_path, flag, expected):
+        # CONFIG itself sets QNAS.en_pop_crossover: True, which wins over the CLI flag
+        # (see qnas_config.py) - render a variant without it, so the flag's effect on
+        # the rendered block is what's actually under test here.
+        with open(CONFIG) as f:
+            data = yaml.safe_load(f)
+        data['QNAS'].pop('en_pop_crossover', None)
+        variant = tmp_path / 'variant.yml'
+        variant.write_text(yaml.safe_dump(data))
+        assert diff_runs.render_config(str(variant), flag)['QNAS']['en_pop_crossover'] is expected

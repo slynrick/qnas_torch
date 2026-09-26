@@ -1,12 +1,17 @@
-# Configuration file: discrete Q-NAS with P-DARTS-style progressive growth
-# (grows network depth and shrinks the candidate-op menu across stages; based on
-# config8.yml's op menu/hyperparameters, kept fully discrete - no MixedOp).
+# Step 03 - ancestor_decay twin of exp4/exp5 (reset_probs_on_stage_change: True,
+# per-node pruning, 13->8->4 ops, 300 generations). exp4/exp5's own base config
+# (without ancestor_decay) predates this renumbering and is no longer in this
+# directory - this file is the only surviving record of that setup, now carrying
+# the ancestor_decay engine as its one deliberate difference.
 #
-# ancestor_decay twin of exp4/exp5 (reset_probs_on_stage_change: True, per-node
-# pruning, 13->8->4 ops, 300 generations): meant to differ from their recorded
-# log_params_evolution.txt only in the quantum update engine. Check before queueing:
+# Discrete Q-NAS with P-DARTS-style progressive growth (grows network depth and
+# shrinks the candidate-op menu across stages; based on old/config8.yml's op
+# menu/hyperparameters, kept fully discrete - no MixedOp).
+#
+# Meant to differ from exp4/exp5's recorded log_params_evolution.txt only in the
+# quantum update engine. Check before queueing:
 #   make diff-runs A=experiment_cifar10_progressive/exp4 \
-#       B=configs/config_files_cifar/config_progressive_reset_ancestor_decay.yml \
+#       B=configs/config_files_cifar/03_deterministic_13-8-4_reset_ancestor-decay.yml \
 #       EVOLVE_ARGS="--fitness_metric best_accuracy --en_pop_crossover"
 # Run it with exp4's pipeline flags: -X -m best_accuracy for the search and
 # -g run_best -L multistep -A -R 5 -E 300 for the retrain.
@@ -24,6 +29,7 @@ QNAS:
     quantum_update_engine: ancestor_decay # default (unchanged) or ancestor_decay
     quantum_update_age_decay: 0.5 # only used by ancestor_decay
     save_data_freq: 10
+    en_pop_crossover: True # gates the three settings below
     crossover_frequency: 5
     pop_crossover_rate: 0.4 # offspring replacement proportion in the population
     pop_crossover_method: hux # hux, uniform
@@ -37,12 +43,12 @@ QNAS:
         # mode: deterministic (default) prunes to each stage's fixed num_ops below, at
         # each stage's gen_start. mode: dynamic instead determines stage change, op
         # count and node growth during the search itself (see
-        # config_progressive_dynamic.yml) - stages/deterministic below is unused then.
+        # 06_dynamic_v1.yml) - stages/deterministic below is unused then.
         mode: deterministic
 
         # Deterministic-mode-only: stage list, unused under mode: dynamic (dynamic mode
         # computes stage change/op-pruning/node-growth during the search instead - see
-        # progressive.dynamic in config_progressive_dynamic.yml).
+        # progressive.dynamic in 06_dynamic_v1.yml).
         deterministic:
             # Stage 0 must start at gen_start: 0 and use the full op menu (13 ops below).
             # Op pruning between stages ranks ops by mean quantum probability mass.

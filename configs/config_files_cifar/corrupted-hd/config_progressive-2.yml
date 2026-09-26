@@ -1,6 +1,13 @@
-# Configuration file: discrete Q-NAS with P-DARTS-style progressive growth
-# (grows network depth and shrinks the candidate-op menu across stages; based on
-# config8.yml's op menu/hyperparameters, kept fully discrete - no MixedOp).
+# Step 04 - deterministic progressive growth, stages 13->10->8 ops,
+# reset_probs_on_stage_change: True. Ran as exp7 - best deterministic result so
+# far, 77.20% best accuracy.
+#
+# Discrete Q-NAS with P-DARTS-style progressive growth (grows network depth and
+# shrinks the candidate-op menu across stages; based on old/config8.yml's op
+# menu/hyperparameters, kept fully discrete - no MixedOp). Widens the op menu
+# kept at each stage compared to 01_deterministic_13-8-4.yml (13->8->4) and
+# resets quantum probabilities on stage change instead of carrying them over.
+# ancestor_decay variant of this file: 05_deterministic_13-10-8_reset_ancestor-decay.yml.
 
 QNAS:
     crossover_rate: 0.5
@@ -13,6 +20,7 @@ QNAS:
     update_quantum_gen: 5
     update_quantum_rate: 0.1
     save_data_freq: 10
+    en_pop_crossover: True # gates the three settings below
     crossover_frequency: 5
     pop_crossover_rate: 0.4 # offspring replacement proportion in the population
     pop_crossover_method: hux # hux, uniform

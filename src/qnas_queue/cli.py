@@ -1,24 +1,33 @@
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from qnas_queue import db
 
-_COLUMNS = ["id", "mode", "status", "config", "experiment_path", "created_at", "started_at", "finished_at"]
+_COLUMNS = ["id", "mode", "status", "gpus", "config", "experiment_path",
+            "created_at", "started_at", "finished_at"]
 
 
 def _row_values(row):
     return [
-        row["id"], row["mode"], row["status"], Path(row["config_path"]).name,
-        row["experiment_path"], row["created_at"] or "", row["started_at"] or "",
-        row["finished_at"] or "",
+        row["id"], row["mode"], row["status"], row["gpu_ids"] or "-",
+        Path(row["config_path"]).name, row["experiment_path"],
+        row["created_at"] or "", row["started_at"] or "", row["finished_at"] or "",
     ]
 
 
@@ -31,6 +40,22 @@ def _print_table(rows):
             print("  ".join("-" * w for w in widths))
 
 
+def _parse_gpu_ids(value, flag="--gpu-ids"):
+    """Normalizes a GPU list ("0,1", "0, 1", "" or None) to a canonical
+    comma-separated string of indices, or None if not given. Exits on anything
+    that isn't a list of non-negative integers, so a typo is caught at `add`/
+    `start` time rather than surfacing as a CUDA error deep in a queued job's
+    log. Shared by `add --gpu-ids` and `start --gpu-pool` - *flag* names
+    whichever one is being parsed, for the error message."""
+    if not value:
+        return None
+    ids = [x.strip() for x in value.split(",") if x.strip()]
+    if not ids or not all(x.isdigit() for x in ids):
+        sys.exit(f"error: {flag} must be a comma-separated list of GPU indices "
+                  f"(e.g. \"0,1\"), got: {value!r}")
+    return ",".join(ids)
+
+
 def cmd_add(args):
     config_path = Path(args.config).resolve()
     if not config_path.is_file():
@@ -41,6 +66,8 @@ def cmd_add(args):
     except yaml.YAMLError as e:
         sys.exit(f"error: config file is not valid YAML: {e}")
 
+    gpu_ids = _parse_gpu_ids(args.gpu_ids)
+
     try:
         stored_config_path = str(config_path.relative_to(db.PROJECT_ROOT))
     except ValueError:
@@ -50,12 +77,14 @@ def cmd_add(args):
         job_id = db.add_job(
             conn, mode=args.mode, config_path=stored_config_path,
             experiment_path=args.experiment_path, extra_args=args.extra or "",
-            priority=args.priority,
+            priority=args.priority, gpu_ids=gpu_ids,
         )
         # Inside the transaction: if the copy fails, the job row is rolled back too.
         snapshot = db.snapshot_config(job_id, config_path)
         db.update_job(conn, job_id, config_snapshot=snapshot)
-    print(f"Queued job {job_id} ({args.mode}): {config_path.name} -> {args.experiment_path}")
+    gpu_note = f" on GPU(s) {gpu_ids}" if gpu_ids else ""
+    print(f"Queued job {job_id} ({args.mode}): {config_path.name} -> "
+          f"{args.experiment_path}{gpu_note}")
     print(f"  config frozen at {snapshot} - later edits to {config_path.name} do not affect this job")
 
 
@@ -107,72 +136,102 @@ def cmd_retry(args):
     print(f"Job {args.id} re-queued{note}.")
 
 
+def _requeue_orphaned_jobs(conn):
+    """A job still marked 'running' whose worker_pid is no longer alive is stale
+    (that worker died, or was killed, without cleaning up). Mark it 'stopped' -
+    the same state a graceful stop leaves - so the next `start` resumes it, and
+    terminate its process group if the subprocess outlived its worker. A job
+    with no worker_pid on record (pre-multi-worker row) is treated the same way
+    whenever no worker at all is alive, matching the old single-worker
+    behavior."""
+
+    workers_alive = any(db.pid_alive(w["pid"]) for w in db.list_workers(conn))
+    for job in db.list_running_jobs(conn):
+        worker_pid = job["worker_pid"]
+        orphaned = not db.pid_alive(worker_pid) if worker_pid else not workers_alive
+        if not orphaned:
+            continue
+        pgid = job["pgid"]
+        if pgid and db.pid_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        db.update_job(conn, job["id"], status="stopped", finished_at=db.now_iso(), pgid=None)
+        print(f"Job {job['id']} was marked running under a worker that is no longer "
+              f"alive - set to stopped; it will be retried on the next start.")
+
+
 def cmd_start(args):
+    gpu_pool = _parse_gpu_ids(args.gpu_pool, flag="--gpu-pool")
+
     with db.connect() as conn:
-        worker = db.get_worker(conn)
-    if worker and db.pid_alive(worker["pid"]):
-        print(f"Worker already running (pid {worker['pid']}).")
+        for worker in db.list_workers(conn):
+            if not db.pid_alive(worker["pid"]):
+                db.remove_worker(conn, worker["pid"])
+        _requeue_orphaned_jobs(conn)
+        alive = [w["pid"] for w in db.list_workers(conn)]
+
+    target = args.workers
+    if len(alive) >= target:
+        print(f"{len(alive)} worker(s) already running (pid(s) "
+              f"{', '.join(map(str, alive))}); target concurrency is {target}.")
         return
 
     db.ensure_dirs()
     log_file = open(db.WORKER_LOG_PATH, "a")
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "qnas_queue.worker"],
-        cwd=str(db.PROJECT_ROOT), env=os.environ.copy(),
-        stdout=log_file, stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    db.WORKER_PID_FILE.write_text(str(proc.pid))
-    print(f"Worker started (pid {proc.pid}). Worker log: {db.WORKER_LOG_PATH}")
-
-
-def _stop_orphaned_jobs():
-    """With no live worker, a job still marked 'running' is stale (the worker died
-    or was killed without cleaning up). Mark it 'stopped' - the same state a
-    graceful stop leaves - so the next `start` resumes it, and terminate its
-    process group if the subprocess outlived the worker."""
-
-    with db.connect() as conn:
-        for job in db.list_running_jobs(conn):
-            pgid = job["pgid"]
-            if pgid and db.pid_alive(pgid):
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            db.update_job(conn, job["id"], status="stopped", finished_at=db.now_iso(), pgid=None)
-            print(f"Job {job['id']} was marked running without a worker - "
-                  f"set to stopped; it will be retried on the next start.")
+    env = os.environ.copy()
+    if gpu_pool:
+        env["QNAS_QUEUE_GPU_POOL"] = gpu_pool
+    started = []
+    for _ in range(target - len(alive)):
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "qnas_queue.worker"],
+            cwd=str(db.PROJECT_ROOT), env=env,
+            stdout=log_file, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        started.append(proc.pid)
+    pool_note = f" sharing GPU pool {gpu_pool}" if gpu_pool else ""
+    print(f"Started {len(started)} worker(s) (pid(s) {', '.join(map(str, started))}){pool_note}. "
+          f"Worker log: {db.WORKER_LOG_PATH}")
 
 
 def cmd_stop(args):
     with db.connect() as conn:
-        worker = db.get_worker(conn)
-    pid = worker["pid"] if worker else None
-    if not pid or not db.pid_alive(pid):
-        print("Worker is not running.")
-        _stop_orphaned_jobs()
+        alive = [w["pid"] for w in db.list_workers(conn) if db.pid_alive(w["pid"])]
+    if not alive:
+        print("No worker is running.")
+        with db.connect() as conn:
+            _requeue_orphaned_jobs(conn)
         return
-    os.kill(pid, signal.SIGTERM)
-    print(f"Sent stop signal to worker (pid {pid}). Current job will be terminated.")
+    for pid in alive:
+        os.kill(pid, signal.SIGTERM)
+    print(f"Sent stop signal to {len(alive)} worker(s) (pid(s) {', '.join(map(str, alive))}). "
+          f"Their running jobs will be terminated.")
 
 
 def cmd_status(args):
     with db.connect() as conn:
-        worker = db.get_worker(conn)
+        workers = db.list_workers(conn)
         counts = {
             row["status"]: row["n"]
             for row in conn.execute("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status")
         }
-        current = db.get_job(conn, worker["current_job_id"]) if worker else None
+        running_by_id = {job["id"]: job for job in db.list_running_jobs(conn)}
 
-    alive = worker is not None and db.pid_alive(worker["pid"])
-    print(f"Worker: {'running' if alive else 'stopped'}" + (f" (pid {worker['pid']})" if alive else ""))
-    if current:
-        print(f"Current job: {current['id']} [{current['mode']}] "
-              f"{Path(current['config_path']).name} -> {current['experiment_path']}")
-        print(f"  started: {current['started_at']}")
-        print(f"  log: {current['log_path']}")
+    alive = [w for w in workers if db.pid_alive(w["pid"])]
+    print(f"Workers: {len(alive)} running" +
+          (f" (pid(s) {', '.join(str(w['pid']) for w in alive)})" if alive else ""))
+    for worker in alive:
+        job = running_by_id.get(worker["current_job_id"])
+        if job is None:
+            print(f"  worker {worker['pid']}: idle")
+            continue
+        gpu_note = f" [GPU {job['gpu_ids']}]" if job["gpu_ids"] else ""
+        print(f"  worker {worker['pid']}: job {job['id']} [{job['mode']}] "
+              f"{Path(job['config_path']).name} -> {job['experiment_path']}{gpu_note}")
+        print(f"    started: {job['started_at']}  log: {job['log_path']}")
     print("Queue counts: " + ", ".join(
         f"{status}={counts.get(status, 0)}"
         for status in ("queued", "running", "done", "failed", "stopped", "cancelled")
@@ -186,21 +245,23 @@ def _tail_lines(path, n):
 
 
 def _resolve_job(conn, job_id):
-    """Picks the job `logs` should show: *job_id* if given, else the worker's
-    current job, else the most recently touched non-queued job."""
+    """Picks the job `logs` should show: *job_id* if given, else the most
+    recently started currently-running job (with several workers, several
+    jobs may be running at once - the newest one is the most likely one the
+    caller just queued and is waiting on), else the most recently touched
+    non-queued job."""
 
     if job_id:
         job = db.get_job(conn, job_id)
         if job is None:
             sys.exit(f"error: no job with id {job_id}")
         return job
-    worker = db.get_worker(conn)
-    job = db.get_job(conn, worker["current_job_id"]) if worker else None
-    if job is None:
-        job = conn.execute(
-            "SELECT * FROM jobs WHERE status != 'queued' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    return job
+    running = db.list_running_jobs(conn)
+    if running:
+        return running[-1]
+    return conn.execute(
+        "SELECT * FROM jobs WHERE status != 'queued' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
 
 
 def _job_log_sources(job, view):
@@ -305,7 +366,232 @@ def _wait_for_log(log_path, job_id):
     return True
 
 
+def _running_log_sources(conn):
+    """[(label, path)] for every job currently 'running' that has a log path
+    yet - one entry per concurrently running job, as opposed to
+    _job_log_sources's several views of a single job."""
+    return [
+        (f"job {job['id']}", db.resolve_path(job["log_path"]))
+        for job in db.list_running_jobs(conn) if job["log_path"]
+    ]
+
+
+def _tail_all_running(args):
+    """`logs --all-jobs`: with several workers, several jobs can be running at
+    once - _resolve_job's single "current job" pick would only show one of
+    them. This instead tails/follows every running job's detail log
+    simultaneously, each line prefixed by its job id, and picks up newly
+    started jobs (and drops finished ones) as the queue moves on."""
+
+    with db.connect() as conn:
+        sources = _running_log_sources(conn)
+    if not sources:
+        print("No jobs currently running.")
+        return
+
+    if not args.follow:
+        _tail_sources(sources, args.lines)
+        return
+
+    handles = {}
+
+    def open_new(conn):
+        for label, path in _running_log_sources(conn):
+            if path in handles or not path.exists():
+                continue
+            f = open(path)
+            handles[path] = (label, f)
+            for line in deque(f, maxlen=20):
+                print(f"[{label}] {line}", end="")
+
+    with db.connect() as conn:
+        open_new(conn)
+    try:
+        while True:
+            progressed = False
+            for label, f in handles.values():
+                line = f.readline()
+                if line:
+                    print(f"[{label}] {line}", end="")
+                    progressed = True
+            with db.connect() as conn:
+                open_new(conn)
+            if not progressed:
+                sys.stdout.flush()
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for _, f in handles.values():
+            f.close()
+
+
+# Matches the per-generation message qnas.py's evolve loop logs to log_QNAS.txt
+# (src/qnas.py:569-575: "- Generation: N" / "- Best so far: id --> fitness").
+# `watch`'s summary table is coupled to this exact text on purpose (see the
+# plan/PR for this feature) - update both together if that message ever changes.
+_GENERATION_RE = re.compile(r"- Generation: (\d+)")
+_BEST_SO_FAR_RE = re.compile(r"- Best so far: (\S+) --> ([\d.]+)")
+
+
+def _parse_generation_summary(log_qnas_path):
+    """The latest generation logged to *log_qnas_path*, as {'generation': int,
+    'best_id': str, 'best_fitness': float}, or None if the file doesn't exist
+    yet or has no generation block yet (job just started, or a retrain-only
+    job that never writes one). Reads only the tail of the file - one block
+    is ~7 lines, 200 is a wide margin - and keeps the LAST match of each
+    regex, since a job's own log only ever grows."""
+    if not log_qnas_path.exists():
+        return None
+    with open(log_qnas_path) as f:
+        tail = deque(f, maxlen=200)
+    generation, best = None, None
+    for line in tail:
+        m = _GENERATION_RE.search(line)
+        if m:
+            generation = int(m.group(1))
+        m = _BEST_SO_FAR_RE.search(line)
+        if m:
+            best = (m.group(1), float(m.group(2)))
+    if generation is None and best is None:
+        return None
+    return {
+        "generation": generation,
+        "best_id": best[0] if best else None,
+        "best_fitness": best[1] if best else None,
+    }
+
+
+def _job_max_generations(job, cache):
+    """QNAS.max_generations from *job*'s frozen config snapshot, cached per job
+    id for the life of the `watch` process - a snapshot never changes once
+    queued (db.snapshot_config), so it only needs reading once."""
+    if job["id"] not in cache:
+        try:
+            config = yaml.safe_load(db.resolve_path(db.config_for_run(job)).read_text())
+            cache[job["id"]] = (config or {}).get("QNAS", {}).get("max_generations")
+        except (OSError, yaml.YAMLError):
+            cache[job["id"]] = None
+    return cache[job["id"]]
+
+
+def _format_elapsed(started_at):
+    if not started_at:
+        return "-"
+    elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(started_at)
+    hours, rem = divmod(int(elapsed.total_seconds()), 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _job_summary_row(job, gen_cache):
+    """One `watch` table row for *job*: (id, mode, gpu, gen, best fitness,
+    elapsed). "n/a" for gen/fitness on a retrain job (never writes generation
+    blocks); "starting..." for an evolve/pipeline job that hasn't logged its
+    first generation yet."""
+    summary = _parse_generation_summary(
+        db.resolve_path(job["experiment_path"]) / "log_QNAS.txt")
+    if summary is None:
+        gen_cell = "n/a" if job["mode"] == "retrain" else "starting..."
+        fitness_cell = "-"
+    else:
+        max_gen = _job_max_generations(job, gen_cache)
+        gen_cell = (f"{summary['generation']}/{max_gen}" if max_gen is not None
+                    else str(summary["generation"])) if summary["generation"] is not None else "-"
+        fitness_cell = (f"{summary['best_fitness']:.5f}"
+                         if summary["best_fitness"] is not None else "-")
+    return (str(job["id"]), job["mode"], job["gpu_ids"] or "-",
+            gen_cell, fitness_cell, _format_elapsed(job["started_at"]))
+
+
+def _drain_new_detail_lines(handles, conn, detail_buffer):
+    """Feeds newly-available lines from every running job's detail log into
+    *detail_buffer* (a bounded deque), tagged "[job N] ...". Adapted from
+    _running_log_sources/open_new in _tail_all_running, but also closes and
+    drops handles for jobs that stopped running, so a long `watch` session
+    doesn't accumulate open file descriptors for finished jobs."""
+    current = _running_log_sources(conn)
+    current_paths = {path for _, path in current}
+    for path in [p for p in handles if p not in current_paths]:
+        _, f = handles.pop(path)
+        f.close()
+    for label, path in current:
+        if path not in handles and path.exists():
+            handles[path] = (label, open(path))
+    for label, f in handles.values():
+        line = f.readline()
+        while line:
+            detail_buffer.append(f"[{label}] {line.rstrip()}")
+            line = f.readline()
+
+
+def _watch_layout(console, jobs, gen_cache, detail_buffer):
+    if jobs:
+        # Table's own title/box, not wrapped in a Panel - a table row wrapped in
+        # its own Panel needs the height of BOTH sets of borders accounted for,
+        # which is easy to under-count and clip the last data row (title line +
+        # top border + header + separator + bottom border = 5 fixed lines).
+        top = Table(title="Running jobs", expand=True)
+        for column in ("id", "mode", "gpu", "gen", "best fitness", "elapsed"):
+            top.add_column(column)
+        for job in jobs:
+            top.add_row(*_job_summary_row(job, gen_cache))
+        top_height = len(jobs) + 5
+    else:
+        top = Panel("No jobs currently running - waiting...", title="Running jobs")
+        top_height = 3
+
+    available = max(console.size.height - top_height - 2, 3)
+    detail_text = Text("\n".join(list(detail_buffer)[-available:]))
+
+    layout = Layout()
+    layout.split_column(
+        Layout(top, size=top_height),
+        Layout(Panel(detail_text, title="Detail")),
+    )
+    return layout
+
+
+def cmd_watch(args):
+    """Live dashboard (like `docker stats`/`htop`): a summary table of every
+    running job's current generation/best fitness, updating in place, with
+    every job's detail log tailed underneath, tagged by job id. Needs a real
+    terminal - `logs --all-jobs` is the streaming equivalent for redirected
+    or non-interactive output."""
+    if not sys.stdout.isatty():
+        sys.exit("error: `watch` needs an interactive terminal - "
+                  "use `qnas-queue logs --all-jobs` for redirected/non-tty output.")
+
+    console = Console()
+    gen_cache = {}
+    handles = {}
+    detail_buffer = deque(maxlen=500)
+
+    def render():
+        with db.connect() as conn:
+            jobs = db.list_running_jobs(conn)
+            _drain_new_detail_lines(handles, conn, detail_buffer)
+        return _watch_layout(console, jobs, gen_cache, detail_buffer)
+
+    try:
+        with Live(render(), console=console, refresh_per_second=2) as live:
+            while True:
+                time.sleep(0.5)
+                live.update(render())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for _, f in handles.values():
+            f.close()
+
+
 def cmd_logs(args):
+    if args.all_jobs:
+        if args.id:
+            sys.exit("error: --all-jobs shows every running job and takes no job id")
+        _tail_all_running(args)
+        return
+
     with db.connect() as conn:
         job = _resolve_job(conn, args.id)
 
@@ -354,6 +640,9 @@ def main():
                         help="Extra args appended verbatim to the underlying command "
                              "(e.g. \"--dataset cifar10 --network_config default\").")
     p_add.add_argument("--priority", type=int, default=0)
+    p_add.add_argument("--gpu-ids", dest="gpu_ids", default=None,
+                        help="Restrict this job to specific GPU(s) via CUDA_VISIBLE_DEVICES "
+                             "(e.g. \"0\" or \"0,1\"). Omit to let it see every GPU (default).")
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list", help="List queued/past jobs.")
@@ -376,10 +665,23 @@ def main():
     p_retry.set_defaults(func=cmd_retry)
 
     p_start = sub.add_parser(
-        "start", help="Start the background worker (also resumes any stopped job).")
+        "start", help="Start background worker(s) (also resumes any stopped job).")
+    p_start.add_argument(
+        "--workers", type=int, default=int(os.environ.get("QNAS_QUEUE_WORKERS", "1")),
+        help="Target number of concurrent worker processes, each running at most one "
+             "job at a time (default: 1, or $QNAS_QUEUE_WORKERS). Running this again "
+             "with a higher number tops up to the new target instead of restarting "
+             "existing workers.")
+    p_start.add_argument(
+        "--gpu-pool", default=os.environ.get("QNAS_QUEUE_GPU_POOL"),
+        help="Shared pool of GPU indices (e.g. \"0,1,2,3\", or $QNAS_QUEUE_GPU_POOL) "
+             "every started worker draws from: each worker picks a currently-free GPU "
+             "from the pool for whatever job it claims next, instead of the job "
+             "declaring one. Jobs queued with their own `add --gpu-ids` are left alone "
+             "either way - the pool only fills in jobs that didn't pin a GPU.")
     p_start.set_defaults(func=cmd_start)
 
-    p_stop = sub.add_parser("stop", help="Stop the worker and the currently running job.")
+    p_stop = sub.add_parser("stop", help="Stop every worker and the jobs it is running.")
     p_stop.set_defaults(func=cmd_stop)
 
     p_status = sub.add_parser("status", help="Show worker and queue status.")
@@ -390,6 +692,13 @@ def main():
                          help="Job id (defaults to the current/most recent job).")
     p_logs.add_argument("--follow", "-f", action="store_true")
     p_logs.add_argument("--lines", "-n", type=int, default=50)
+    p_logs.add_argument("--all-jobs", "-a", action="store_true",
+                         help="Show/follow every currently running job's detail log at "
+                              "once, each line prefixed by its job id - useful with "
+                              "`start --workers` > 1, where several jobs can run "
+                              "concurrently and the default single-job view only shows "
+                              "one of them. Takes no job id and ignores --detail/"
+                              "--summary/--both (always the detail log).")
     log_view = p_logs.add_mutually_exclusive_group()
     log_view.add_argument("--detail", dest="view", action="store_const", const="detail",
                            help="Raw subprocess stdout/stderr log (default).")
@@ -401,6 +710,11 @@ def main():
                            help="Detail and summary logs together, each line "
                                 "prefixed with [detail] / [summary].")
     p_logs.set_defaults(func=cmd_logs, view="detail")
+
+    p_watch = sub.add_parser(
+        "watch", help="Live dashboard: every running job's generation/best "
+                      "fitness updating in place, detail logs tailed below.")
+    p_watch.set_defaults(func=cmd_watch)
 
     args = parser.parse_args()
     args.func(args)
