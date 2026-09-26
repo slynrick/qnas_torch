@@ -616,7 +616,6 @@ class TestCli:
         assert cli._parse_generation_summary(log) == {
             'generation': 2, 'best_id': '[2, 3]', 'best_fitness': 0.77123,
             'best_gen': 2, 'best_ind': 3,
-            'fitness_delta': pytest.approx(0.77123 - 0.5),
             'fitness_spread': pytest.approx(0.77123 - 0.6),
         }
 
@@ -646,20 +645,32 @@ class TestCli:
         summary = cli._parse_generation_summary(log)
         assert summary['fitness_spread'] == pytest.approx(66.5 - 7.98)
 
-    def test_fitness_delta_between_last_two_generations(self, tmp_path):
-        log = tmp_path / 'log_QNAS.txt'
-        log.write_text(
-            "- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n- Fitnesses: [60.0]\n"
-            "- Generation: 1\n- Best so far: [1, 5] --> 63.50000\n- Fitnesses: [63.5]\n"
+    def test_job_first_best_fitness_reads_the_earliest_logged_generation(self, isolated_queue):
+        job = self.seed_job_with_experiment(
+            isolated_queue, mode='evolve',
+            log_qnas_text=(
+                "- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n"
+                "- Generation: 1\n- Best so far: [1, 5] --> 63.50000\n"
+            ),
         )
-        summary = cli._parse_generation_summary(log)
-        assert summary['fitness_delta'] == pytest.approx(3.5)
+        assert cli._job_first_best_fitness(job, {}) == 60.0
 
-    def test_fitness_delta_is_none_on_the_first_generation(self, tmp_path):
-        log = tmp_path / 'log_QNAS.txt'
-        log.write_text("- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n")
-        summary = cli._parse_generation_summary(log)
-        assert summary['fitness_delta'] is None
+    def test_job_first_best_fitness_caches_and_ignores_later_changes(self, isolated_queue):
+        job = self.seed_job_with_experiment(
+            isolated_queue, mode='evolve',
+            log_qnas_text="- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n",
+        )
+        cache = {}
+        assert cli._job_first_best_fitness(job, cache) == 60.0
+        # Log file changes underneath (job kept running) - cached value must
+        # NOT be re-read, since generation 0's own value never changes.
+        (isolated_queue / job['experiment_path'] / 'log_QNAS.txt').write_text(
+            "- Generation: 0\n- Best so far: [0, 0] --> 999.0\n")
+        assert cli._job_first_best_fitness(job, cache) == 60.0
+
+    def test_job_first_best_fitness_none_before_any_generation_logged(self, isolated_queue):
+        job = self.seed_job_with_experiment(isolated_queue, mode='evolve')
+        assert cli._job_first_best_fitness(job, {}) is None
 
     def test_parse_generation_summary_missing_or_empty_file_returns_none(self, tmp_path):
         assert cli._parse_generation_summary(tmp_path / 'missing.txt') is None
@@ -685,12 +696,12 @@ class TestCli:
 
     def test_job_summary_row_starting_when_no_generation_yet(self, isolated_queue):
         job = self.seed_job_with_experiment(isolated_queue, mode='evolve')
-        row = cli._job_summary_row(job, {})
+        row = cli._job_summary_row(job, {}, {})
         assert row[3] == 'starting...' and row[4] == '-'
 
     def test_job_summary_row_retrain_shows_na_instead_of_starting(self, isolated_queue):
         job = self.seed_job_with_experiment(isolated_queue, mode='retrain')
-        row = cli._job_summary_row(job, {})
+        row = cli._job_summary_row(job, {}, {})
         assert row[3] == 'n/a'
 
     def test_job_summary_row_formats_generation_fitness_and_gpu(self, isolated_queue):
@@ -699,7 +710,7 @@ class TestCli:
             log_qnas_text='- Generation: 5\n- Best so far: [5, 1] --> 0.61234\n',
             max_generations=300,
         )
-        row = cli._job_summary_row(job, {})
+        row = cli._job_summary_row(job, {}, {})
         assert row[:6] == (str(job['id']), 'evolve', '0', '5/300', '0.61234',
                           'gen 5/ind 1')
         assert row[8] != '-'  # elapsed, formatted since started_at is set
@@ -715,13 +726,13 @@ class TestCli:
                 '- Fitnesses: [63.5, 61.0]\n'
             ),
         )
-        row = cli._job_summary_row(job, {})
-        assert row[6] == '+3.50000'  # fitness delta vs the previous generation
+        row = cli._job_summary_row(job, {}, {})
+        assert row[6] == '+3.50000'  # fitness delta vs the first logged generation
         assert row[7] == '2.50000'  # spread within generation 1 (63.5 - 61.0)
 
     def test_job_summary_row_dashes_when_no_generation_yet(self, isolated_queue):
         job = self.seed_job_with_experiment(isolated_queue, mode='evolve')
-        row = cli._job_summary_row(job, {})
+        row = cli._job_summary_row(job, {}, {})
         assert row[4:7] == ('-', '-', '-')
         assert row[9] == '-'  # ETA
 
@@ -746,7 +757,7 @@ class TestCli:
         jobs = [self.seed_job_with_experiment(isolated_queue, gpu_ids=str(i))
                 for i in range(3)]
         console = Console(width=100, height=40)
-        layout = cli._watch_layout(console, jobs, {}, deque())
+        layout = cli._watch_layout(console, jobs, {}, {}, deque())
         with console.capture() as cap:
             console.print(layout)
         out = cap.get()
@@ -765,7 +776,7 @@ class TestCli:
         # prefixes in the detail panel must still line up.
         console = Console(width=100, height=40)
         detail_buffer = deque([(2, 'from job two'), (10, 'from job ten')])
-        layout = cli._watch_layout(console, [], {}, detail_buffer)
+        layout = cli._watch_layout(console, [], {}, {}, detail_buffer)
         with console.capture() as cap:
             console.print(layout)
         out = cap.get()
@@ -777,7 +788,7 @@ class TestCli:
                 for i in range(2)]
         assert cli._job_style(jobs[0]['id']) != cli._job_style(jobs[1]['id'])
         console = Console(width=100, height=40, force_terminal=True, color_system='standard')
-        layout = cli._watch_layout(console, jobs, {}, deque())
+        layout = cli._watch_layout(console, jobs, {}, {}, deque())
         with console.capture() as cap:
             console.print(layout)
         out = cap.get()

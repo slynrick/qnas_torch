@@ -450,87 +450,75 @@ _FLOAT_RE = re.compile(r"-?\d+\.?\d*")
 def _parse_generation_summary(log_qnas_path):
     """The latest generation logged to *log_qnas_path*, as {'generation': int,
     'best_id': str, 'best_fitness': float, 'best_gen': int or None,
-    'best_ind': int or None, 'fitness_delta': float or None,
-    'fitness_spread': float or None}, or None if the file doesn't exist yet or
-    has no generation block yet (job just started, or a retrain-only job that
-    never writes one).
+    'best_ind': int or None, 'fitness_spread': float or None}, or None if the
+    file doesn't exist yet or has no generation block yet (job just started,
+    or a retrain-only job that never writes one).
 
-    'fitness_delta' is how much best_fitness changed versus the PREVIOUS
-    logged generation (None if there isn't one yet in the tail read below).
     'fitness_spread' is max - min across the latest generation's own
     population ("- Fitnesses: [...]", which may itself wrap across several
     lines - numpy's default array repr).
 
-    Reads only the tail of the file - a generous margin so at least the last
-    two generation blocks are present even for a large population (each
-    block, plus the population-matrix dump logged between them, is roughly
-    30-40 lines) - and keeps the LAST two complete blocks, since a job's own
-    log only ever grows.
+    (`Δ best` in the watch table is NOT computed here - it's measured against
+    the job's first logged generation, not the previous one, since most
+    generations don't produce a new best individual; see
+    _job_first_best_fitness, which needs its own read of the file's START,
+    the opposite end from the tail read below.)
+
+    Reads only the tail of the file - a generous margin so the whole latest
+    generation block (plus the population-matrix dump logged right after it)
+    is present even for a large population - and keeps the LAST block, since
+    a job's own log only ever grows.
     """
     if not log_qnas_path.exists():
         return None
     with open(log_qnas_path) as f:
         tail = deque(f, maxlen=4000)
 
-    blocks = []
-    current = None
+    generation = best_id = best_fitness = fitnesses = None
     fitness_chunks = None
     for line in tail:
         m = _GENERATION_RE.match(line)
         if m:
-            current = {"generation": int(m.group(1)), "best_id": None,
-                       "best_fitness": None, "fitnesses": None}
-            blocks.append(current)
-            fitness_chunks = None
-            continue
-        if current is None:
+            generation = int(m.group(1))
+            best_id = best_fitness = fitnesses = fitness_chunks = None
             continue
         m = _BEST_SO_FAR_RE.match(line)
         if m:
-            current["best_id"] = m.group(1)
-            current["best_fitness"] = float(m.group(2))
+            best_id = m.group(1)
+            best_fitness = float(m.group(2))
             continue
         m = _FITNESSES_RE.match(line)
         if m:
             fitness_chunks = [m.group(1)]
             if "]" in m.group(1):
-                current["fitnesses"] = [float(x) for x in _FLOAT_RE.findall(fitness_chunks[0])]
+                fitnesses = [float(x) for x in _FLOAT_RE.findall(fitness_chunks[0])]
                 fitness_chunks = None
             continue
         if fitness_chunks is not None:
             fitness_chunks.append(line)
             if "]" in line:
-                current["fitnesses"] = [float(x) for x in
-                                        _FLOAT_RE.findall("".join(fitness_chunks))]
+                fitnesses = [float(x) for x in _FLOAT_RE.findall("".join(fitness_chunks))]
                 fitness_chunks = None
 
-    if not blocks:
+    if generation is None and best_id is None:
         return None
-    latest = blocks[-1]
-    previous = blocks[-2] if len(blocks) >= 2 else None
 
     best_gen = best_ind = None
-    if latest["best_id"] is not None:
-        m = _BEST_ID_GEN_IND_RE.search(latest["best_id"])
+    if best_id is not None:
+        m = _BEST_ID_GEN_IND_RE.search(best_id)
         if m:
             best_gen, best_ind = int(m.group(1)), int(m.group(2))
 
-    fitness_delta = None
-    if (previous is not None and latest["best_fitness"] is not None
-            and previous["best_fitness"] is not None):
-        fitness_delta = latest["best_fitness"] - previous["best_fitness"]
-
     fitness_spread = None
-    if latest["fitnesses"]:
-        fitness_spread = max(latest["fitnesses"]) - min(latest["fitnesses"])
+    if fitnesses:
+        fitness_spread = max(fitnesses) - min(fitnesses)
 
     return {
-        "generation": latest["generation"],
-        "best_id": latest["best_id"],
-        "best_fitness": latest["best_fitness"],
+        "generation": generation,
+        "best_id": best_id,
+        "best_fitness": best_fitness,
         "best_gen": best_gen,
         "best_ind": best_ind,
-        "fitness_delta": fitness_delta,
         "fitness_spread": fitness_spread,
     }
 
@@ -546,6 +534,37 @@ def _job_max_generations(job, cache):
         except (OSError, yaml.YAMLError):
             cache[job["id"]] = None
     return cache[job["id"]]
+
+
+def _job_first_best_fitness(job, cache):
+    """The best_fitness logged for the first generation THIS job's log_QNAS.txt
+    records (normally generation 0 - unless resumed into a fresh experiment
+    path whose own log starts partway through a run, in which case it's that
+    log's own first entry). `Δ best` is measured against this fixed baseline
+    rather than the previous generation, since most generations don't
+    actually produce a new best individual - a gen-over-gen delta would read
+    0.00000 most of the time and rarely say anything useful.
+
+    Cached per job id for the life of the `watch` process once available -
+    unlike _job_max_generations, this can't be cached before the job has
+    actually logged its first generation, so a miss is retried on every call
+    until it succeeds.
+    """
+    if job["id"] in cache:
+        return cache[job["id"]]
+    log_path = db.resolve_path(job["experiment_path"]) / "log_QNAS.txt"
+    if not log_path.exists():
+        return None
+    best = None
+    with open(log_path) as f:
+        for line in f:
+            m = _BEST_SO_FAR_RE.match(line)
+            if m:
+                best = float(m.group(2))
+                break
+    if best is not None:
+        cache[job["id"]] = best
+    return best
 
 
 def _format_elapsed(started_at):
@@ -581,7 +600,7 @@ def _format_eta(started_at, generation, max_gen):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def _job_summary_row(job, gen_cache):
+def _job_summary_row(job, gen_cache, first_best_cache):
     """One `watch` table row for *job*: (id, mode, gpu, gen, best fitness,
     best origin, fitness delta, fitness spread, elapsed, ETA). "n/a" for
     gen/fitness on a retrain job (never writes generation blocks);
@@ -590,8 +609,10 @@ def _job_summary_row(job, gen_cache):
 
     best origin: "gen G/ind I" - which generation/individual produced the
     current best_fitness (parsed from best_so_far_id, e.g. "[1, 13]").
-    fitness delta: best_fitness's change versus the previous logged
-    generation (a signed value - positive means it just improved).
+    fitness delta: best_fitness's change versus the job's FIRST logged
+    generation (see _job_first_best_fitness) - not the previous one, since
+    most generations don't produce a new best individual and a gen-over-gen
+    delta would read 0.00000 almost every time.
     fitness spread: max - min across the latest generation's own population,
     i.e. how converged/diverse that generation currently is.
     ETA: rough time remaining to max_generations - see _format_eta.
@@ -609,8 +630,10 @@ def _job_summary_row(job, gen_cache):
                          if summary["best_fitness"] is not None else "-")
         origin_cell = (f"gen {summary['best_gen']}/ind {summary['best_ind']}"
                        if summary["best_gen"] is not None else "-")
-        delta_cell = (f"{summary['fitness_delta']:+.5f}"
-                     if summary["fitness_delta"] is not None else "-")
+        first_best = _job_first_best_fitness(job, first_best_cache)
+        delta_cell = (f"{summary['best_fitness'] - first_best:+.5f}"
+                     if summary["best_fitness"] is not None and first_best is not None
+                     else "-")
         spread_cell = (f"{summary['fitness_spread']:.5f}"
                        if summary["fitness_spread"] is not None else "-")
         eta_cell = _format_eta(job["started_at"], summary["generation"], max_gen)
@@ -655,7 +678,7 @@ def _job_style(job_id):
     return _JOB_COLOR_PALETTE[job_id % len(_JOB_COLOR_PALETTE)]
 
 
-def _watch_layout(console, jobs, gen_cache, detail_buffer):
+def _watch_layout(console, jobs, gen_cache, first_best_cache, detail_buffer):
     if jobs:
         # Table's own title/box, not wrapped in a Panel - a table row wrapped in
         # its own Panel needs the height of BOTH sets of borders accounted for,
@@ -666,7 +689,8 @@ def _watch_layout(console, jobs, gen_cache, detail_buffer):
                        "Δ best", "spread", "elapsed", "ETA"):
             top.add_column(column)
         for job in jobs:
-            top.add_row(*_job_summary_row(job, gen_cache), style=_job_style(job["id"]))
+            top.add_row(*_job_summary_row(job, gen_cache, first_best_cache),
+                       style=_job_style(job["id"]))
         top_height = len(jobs) + 5
     else:
         top = Panel("No jobs currently running - waiting...", title="Running jobs")
@@ -704,6 +728,7 @@ def cmd_watch(args):
 
     console = Console()
     gen_cache = {}
+    first_best_cache = {}
     handles = {}
     detail_buffer = deque(maxlen=500)
 
@@ -711,7 +736,7 @@ def cmd_watch(args):
         with db.connect() as conn:
             jobs = db.list_running_jobs(conn)
             _drain_new_detail_lines(handles, conn, detail_buffer)
-        return _watch_layout(console, jobs, gen_cache, detail_buffer)
+        return _watch_layout(console, jobs, gen_cache, first_best_cache, detail_buffer)
 
     try:
         with Live(render(), console=console, refresh_per_second=2) as live:
