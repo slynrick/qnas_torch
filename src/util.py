@@ -40,19 +40,33 @@ def load_yaml(file_path):
     return file
 
 def load_pkl(file_path):
-    """ Load a pickle file.
+    """ Load a pickle file written as one or more dict records, merging every
+    record into a single dict (a later record replaces an earlier one's value
+    for the same top-level key, in file order).
+
+    This supports both an older single-record file (one pkl.dump() call of the
+    whole dict - the loop below reads it once and stops at EOF, same result as
+    before) and qnas.py's incremental format (one small {generation: entry}
+    record appended per generation, via 'ab' - see QNAS.save_data) without the
+    caller needing to know which one it's reading.
 
     Args:
         file_path: (str) path to the file to load.
 
     Returns:
-        loaded data.
+        loaded data (dict).
     """
 
+    data = {}
     with open(file_path, 'rb') as f:
-        file = pkl.load(f)
+        while True:
+            try:
+                record = pkl.load(f)
+            except EOFError:
+                break
+            data.update(record)
 
-    return file
+    return data
 
 def create_info_file(out_path, info_dict, file_name='data_info.txt'):
     """ Saves info in *info_dict* in a txt file.

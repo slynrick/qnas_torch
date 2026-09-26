@@ -1,6 +1,10 @@
-# Configuration file: discrete Q-NAS with P-DARTS-style progressive growth
-# (grows network depth and shrinks the candidate-op menu across stages; based on
-# config8.yml's op menu/hyperparameters, kept fully discrete - no MixedOp).
+# Step 05 - ancestor_decay variant of 04_deterministic_13-10-8_reset.yml
+# (77.20% best, exp7) - same run otherwise, only the network quantum-population
+# update engine changes: see QNAS.quantum_update_engine below.
+#
+# Discrete Q-NAS with P-DARTS-style progressive growth (grows network depth and
+# shrinks the candidate-op menu across stages; based on old/config8.yml's op
+# menu/hyperparameters, kept fully discrete - no MixedOp).
 
 QNAS:
     crossover_rate: 0.5
@@ -12,7 +16,10 @@ QNAS:
     replace_method: best
     update_quantum_gen: 5
     update_quantum_rate: 0.1
+    quantum_update_engine: ancestor_decay # default (unchanged) or ancestor_decay
+    quantum_update_age_decay: 0.5 # only used by ancestor_decay
     save_data_freq: 10
+    en_pop_crossover: True # gates the three settings below
     crossover_frequency: 5
     pop_crossover_rate: 0.4 # offspring replacement proportion in the population
     pop_crossover_method: hux # hux, uniform
@@ -22,28 +29,20 @@ QNAS:
     # False to run plain (non-progressive) QNAS without deleting the stage list.
     progressive:
         enabled: True
-
-        # mode: deterministic (default) prunes to each stage's fixed num_ops below, at
-        # each stage's gen_start. mode: dynamic instead determines stage change, op
-        # count and node growth during the search itself (see
-        # config_progressive_dynamic.yml) - stages/deterministic below is unused then.
         mode: deterministic
 
-        # Deterministic-mode-only: stage list, unused under mode: dynamic (dynamic mode
-        # computes stage change/op-pruning/node-growth during the search instead - see
-        # progressive.dynamic in config_progressive_dynamic.yml).
         deterministic:
             # Stage 0 must start at gen_start: 0 and use the full op menu (13 ops below).
             # Op pruning between stages ranks ops by mean quantum probability mass.
             stages:
                 - {gen_start: 0,   num_nodes: 7,  num_ops: 13}
-                - {gen_start: 100, num_nodes: 13, num_ops: 8}
-                - {gen_start: 200, num_nodes: 20, num_ops: 4}
+                - {gen_start: 100, num_nodes: 13, num_ops: 10}
+                - {gen_start: 200, num_nodes: 20, num_ops: 8}
 
         # If True, quantum individuals' probabilities reset to uniform at each stage
         # transition above instead of carrying over/renormalizing what was learned so
         # far on the pre-transition op menu.
-        reset_probs_on_stage_change: False
+        reset_probs_on_stage_change: True
 
         # If True, op pruning at each stage transition ranks ops ONCE network-wide and
         # applies the same surviving op list to every node. If False (default), each

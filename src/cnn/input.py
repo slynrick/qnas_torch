@@ -123,10 +123,16 @@ class GenericDataLoader:
     torch.manual_seed(seed)
     self.info_dict = {'dataset': f'{self.params["dataset"]}'}
     self.info_dict['seed'] = seed
-    self.download_status = not os.path.exists(self.params['data_path'])
-    
-    if self.download_status:
-      os.makedirs(self.params['data_path'])
+    # Always pass download=True below instead of gating on directory existence:
+    # torchvision/medmnist's own download() already skips re-downloading when the
+    # files are already present and pass an integrity check, so this is a cheap
+    # no-op on a warm data_path. Gating on os.path.exists() instead (the previous
+    # approach) breaks as soon as ANY process - e.g. a concurrent queue worker
+    # sharing the same data_path - has created the directory, even if that other
+    # process hasn't finished downloading yet: every other process then sees the
+    # directory as "already there", skips its own download, and crashes with
+    # "Dataset not found or corrupted" once it tries to actually load it.
+    os.makedirs(self.params['data_path'], exist_ok=True)
 
     if not info:
         # Check if the dataset is available in the available_datasets dict
@@ -151,7 +157,7 @@ class GenericDataLoader:
             self.task = info_dataset['task']
           else:
             dataset_class = getattr(torchvision.datasets, self.params['dataset'].upper())
-            dataset_ = dataset_class(self.params['data_path'], download=self.download_status, transform=ToTensor())
+            dataset_ = dataset_class(self.params['data_path'], download=True, transform=ToTensor())
             loader = DataLoader(dataset_, batch_size=len(dataset_), num_workers=0, shuffle=False)
             data = next(iter(loader))
             mean = data[0].mean(dim=(0, 2, 3)).tolist()
@@ -172,7 +178,7 @@ class GenericDataLoader:
             self.task = info_dataset['task']
           else:
             dataset_class = getattr(medmnist, general_info['python_class'])
-            dataset_ = dataset_class(root=self.params['data_path'], split='train', download=self.download_status, transform=ToTensor(), as_rgb=True)
+            dataset_ = dataset_class(root=self.params['data_path'], split='train', download=True, transform=ToTensor(), as_rgb=True)
             loader = DataLoader(dataset_, batch_size=len(dataset_), num_workers=0, shuffle=False)
             data = next(iter(loader))
             mean = data[0].mean(dim=(0, 2, 3)).tolist()
@@ -233,16 +239,14 @@ class GenericDataLoader:
     # create the dataset
     if hasattr(torchvision.datasets, self.params['dataset'].upper()):
       dataset_class = getattr(torchvision.datasets, self.params['dataset'].upper())
-      full_dataset = dataset_class(self.params['data_path'], train=True, download=self.download_status)
-      test_dataset = dataset_class(self.params['data_path'], train=False, download=self.download_status,transform=self.transform)
-      self.download_status = not os.path.exists(self.params['data_path'])
-      
+      full_dataset = dataset_class(self.params['data_path'], train=True, download=True)
+      test_dataset = dataset_class(self.params['data_path'], train=False, download=True, transform=self.transform)
+
     elif self.params['dataset'].lower() in INFO and hasattr(medmnist, INFO[self.params['dataset'].lower()]['python_class']):
       dataset_class = getattr(medmnist, INFO[self.params['dataset'].lower()]['python_class'])
-      train_dataset = dataset_class(root=self.params['data_path'], split='train', download=self.download_status, transform=self.train_transform, as_rgb=True)
-      valid_dataset = dataset_class(root=self.params['data_path'], split='val', download=self.download_status, transform=self.transform, as_rgb=True)
-      test_dataset = dataset_class(root=self.params['data_path'], split='test', download=self.download_status, transform=self.transform, as_rgb=True)
-      self.download_status = not os.path.exists(self.params['data_path'])
+      train_dataset = dataset_class(root=self.params['data_path'], split='train', download=True, transform=self.train_transform, as_rgb=True)
+      valid_dataset = dataset_class(root=self.params['data_path'], split='val', download=True, transform=self.transform, as_rgb=True)
+      test_dataset = dataset_class(root=self.params['data_path'], split='test', download=True, transform=self.transform, as_rgb=True)
     elif self.params['dataset'].lower() == 'atleta_axial' or self.params['dataset'].lower() == 'atleta_coronal':
       try:
         train_dataset =torchvision.datasets.ImageFolder(root=f"{self.params['data_path']}/train", transform=self.train_transform)

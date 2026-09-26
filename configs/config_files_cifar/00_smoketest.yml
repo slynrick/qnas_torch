@@ -1,5 +1,7 @@
-# Tiny/fast variant of config_progressive.yml, for smoke-testing the discrete
-# progressive-growth pipeline end-to-end (evolve -> retrain -> infographic).
+# Step 00 - not part of the numbered experiment lineage below. Tiny/fast variant
+# of 01_deterministic_13-8-4.yml, for smoke-testing the discrete progressive-growth
+# pipeline end-to-end (evolve -> retrain -> infographic) in seconds. Run this
+# first whenever the pipeline code changes, before trusting any real config.
 
 QNAS:
     crossover_rate: 0.5

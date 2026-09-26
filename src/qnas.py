@@ -6,7 +6,8 @@
 
 import datetime
 import os
-from pickle import dump, HIGHEST_PROTOCOL
+import shutil
+from pickle import dump, load, HIGHEST_PROTOCOL, UnpicklingError
 
 import numpy as np
 import time
@@ -575,16 +576,12 @@ class QNAS(object):
                         f'- Fitnesses without penalties: {self.raw_fitnesses}\n')
 
     def save_data(self):
-        """ Save QNAS data in a pickle file for logging and reloading purposes, including
-            chromosomes, generation number, evaluation score and number of evaluations. Note
-            that the data in the file is loaded and updated with the current generation, so that
-            we keep track of the entire evolutionary process.
+        """ Save this generation's QNAS data (chromosomes, generation number, evaluation
+            score, number of evaluations, ...) as one incremental record appended to
+            self.data_file - previous generations' records are never read back or rewritten
+            (see append_pkl_entry / util.load_pkl, which reassembles the full per-generation
+            history on read by merging every appended record).
         """
-
-        if self.current_gen == 0:
-            data = dict()
-        else:
-            data = load_pkl(self.data_file)
 
         entry = {'time': str(datetime.datetime.now()),
                  'total_eval': self.total_eval,
@@ -616,12 +613,41 @@ class QNAS(object):
                 self._stable_streak if self.global_op_pruning else list(self._stable_streak)
             )
 
-        data[self.current_gen] = entry
+        self.append_pkl_entry(self.current_gen, entry)
 
-        self.dump_pkl_data(data)
+    @staticmethod
+    def _sidecar_path(data_file):
+        """ Path to the small 'latest generation only' companion file kept next to
+        *data_file* - see append_pkl_entry/load_qnas_data.
+        """
+
+        root, ext = os.path.splitext(data_file)
+        return f'{root}_latest{ext}'
+
+    def append_pkl_entry(self, generation, entry):
+        """ Appends one generation's *entry* to *self.data_file* without touching
+        whatever earlier generations' records are already there. Also overwrites a
+        small sidecar file with just this record, so a later resume (load_qnas_data)
+        can read the latest generation in O(1) instead of replaying the whole history
+        through util.load_pkl.
+
+        Args:
+            generation: (int) generation number this entry belongs to.
+            entry: dict of this generation's data.
+        """
+
+        with open(self.data_file, 'ab') as f:
+            dump({generation: entry}, f, protocol=HIGHEST_PROTOCOL)
+
+        with open(self._sidecar_path(self.data_file), 'wb') as f:
+            dump({generation: entry}, f, protocol=HIGHEST_PROTOCOL)
 
     def dump_pkl_data(self, new_data):
-        """ Saves *new_data* into *self.data_file* pickle file.
+        """ Overwrites *self.data_file* with *new_data* in one shot - used to seed a new
+        data file with a previously resumed run's full history (load_qnas_data) or to
+        write a complete, already-assembled dict; not part of the per-generation path
+        (see append_pkl_entry/save_data), so this does not reintroduce a full
+        read-modify-write on every generation.
 
         Args:
             new_data: dict containing data to save.
@@ -630,21 +656,52 @@ class QNAS(object):
         with open(self.data_file, 'wb') as f:
             dump(new_data, f, protocol=HIGHEST_PROTOCOL)
 
+        # This overwrite makes *new_data* the sole authority on data_file's content -
+        # drop the sidecar (rather than risk it going stale) so load_qnas_data falls
+        # back to reading data_file itself next time.
+        sidecar_path = self._sidecar_path(self.data_file)
+        if os.path.exists(sidecar_path):
+            os.remove(sidecar_path)
+
     def load_qnas_data(self, file_path):
         """ Read pkl data in *file_path* and load its information to current QNAS. It also saves
             its info into the new pkl data file *self.data_file*.
+
+            Only the latest generation's record is actually needed here (unlike
+            generate_infographic.py, which needs every generation) - tries the small
+            '_latest' sidecar first (a single O(1) record) instead of replaying the
+            whole history through util.load_pkl. Falls back to the full merge for
+            experiment directories written before this sidecar existed.
 
         Args:
             file_path: (str) path to the pkl data file.
         """
 
-        log_data = load_pkl(file_path)
+        sidecar_path = self._sidecar_path(file_path)
+        log_data = None
+        if os.path.exists(sidecar_path):
+            try:
+                with open(sidecar_path, 'rb') as f:
+                    sidecar_record = load(f)
+                generation = max(sidecar_record.keys())
+                log_data = sidecar_record[generation]
+            except (EOFError, UnpicklingError, OSError):
+                log_data = None
 
-        if not os.path.exists(self.data_file):
-            self.dump_pkl_data(log_data)
+        if log_data is not None:
+            if not os.path.exists(self.data_file):
+                # Same on-disk format either way (an appendable pickle stream), so a
+                # raw byte copy preserves the whole history for generate_infographic.py
+                # without deserializing/reserializing any of it.
+                shutil.copyfile(file_path, self.data_file)
+                shutil.copyfile(sidecar_path, self._sidecar_path(self.data_file))
+        else:
+            full_data = load_pkl(file_path)
+            generation = max(full_data.keys())
+            log_data = full_data[generation]
 
-        generation = max(log_data.keys())
-        log_data = log_data[generation]
+            if not os.path.exists(self.data_file):
+                self.dump_pkl_data(full_data)
 
         self.current_gen = generation
         self.total_eval = log_data['total_eval']

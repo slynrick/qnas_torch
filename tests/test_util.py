@@ -31,6 +31,20 @@ class TestFileHelpers:
         path.write_bytes(pickle.dumps({0: [1, 2]}))
         assert util.load_pkl(str(path)) == {0: [1, 2]}
 
+    def test_load_pkl_merges_several_appended_records(self, tmp_path):
+        path = tmp_path / 'a.pkl'
+        with open(path, 'ab') as f:
+            pickle.dump({0: 'first'}, f)
+            pickle.dump({1: 'second'}, f)
+        assert util.load_pkl(str(path)) == {0: 'first', 1: 'second'}
+
+    def test_load_pkl_later_record_wins_for_the_same_key(self, tmp_path):
+        path = tmp_path / 'a.pkl'
+        with open(path, 'ab') as f:
+            pickle.dump({0: 'stale'}, f)
+            pickle.dump({0: 'fresh'}, f)
+        assert util.load_pkl(str(path)) == {0: 'fresh'}
+
     def test_create_info_file_roundtrip(self, tmp_path):
         util.create_info_file(str(tmp_path), {'x': 1, 'y': 'z'})
         assert yaml.safe_load((tmp_path / 'data_info.txt').read_text()) == {'x': 1, 'y': 'z'}

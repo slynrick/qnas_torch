@@ -20,7 +20,6 @@ CONFIGS = sorted(glob.glob(os.path.join(ROOT_DIR, 'configs', '*', '*.yml')))
 # here must keep loading.
 STALE_CONFIGS = {
     *(f'configs/config_files_atleta/config{i}.yml' for i in (0, 1, 2, 3, 4, 6, 7, 10)),
-    *(f'configs/config_files_cifar/config{i}.yml' for i in (1, 2, 3, 4, 5, 6, 7, 8, 11, 12)),
     *(f'configs/config_files_med/config{i}.yml' for i in (1, 4, 6, 7, 10)),
     *(f'configs/config_files_medmnist/config{i}.yml' for i in (1, 2, 3, 4)),
 }
@@ -73,7 +72,7 @@ def test_shipped_config_loads_and_builds_qnas(path, tmp_path):
 
 
 def _progressive_config():
-    return os.path.join(ROOT_DIR, 'configs', 'config_files_cifar', 'config_progressive.yml')
+    return os.path.join(ROOT_DIR, 'configs', 'config_files_cifar', '01_deterministic_13-8-4.yml')
 
 
 def _base_yaml():
@@ -175,12 +174,28 @@ class TestQuantumUpdateEngineSetting:
         with pytest.raises(ValueError, match="'default' or 'ancestor_decay'"):
             load(path, tmp_path)
 
+    # decay config -> its non-decay base, per each file's own header comment
+    # (config_files_cifar/*.yml). 03's base predates the 01-08 renumbering and
+    # is no longer in this directory (see 03's header) - mapped to None, so
+    # there is nothing to diff it against, but it's still accounted for below.
+    _ANCESTOR_DECAY_TWINS = {
+        '02_deterministic_13-8-4_ancestor-decay.yml': '01_deterministic_13-8-4.yml',
+        '03_deterministic_13-8-4_reset_ancestor-decay.yml': None,
+        '05_deterministic_13-10-8_reset_ancestor-decay.yml': '04_deterministic_13-10-8_reset.yml',
+        '08_dynamic_v2_ancestor-decay.yml': '07_dynamic_v2.yml',
+    }
+
     def test_ancestor_decay_configs_only_differ_in_engine(self):
         base_dir = os.path.join(ROOT_DIR, 'configs', 'config_files_cifar')
-        for path in glob.glob(os.path.join(base_dir, '*_ancestor_decay.yml')):
-            twin = path.replace('_ancestor_decay', '')
-            if not os.path.exists(twin):
+        decay_files = {os.path.basename(p)
+                        for p in glob.glob(os.path.join(base_dir, '*ancestor-decay.yml'))}
+        assert decay_files == set(self._ANCESTOR_DECAY_TWINS), (
+            'a config was added/renamed without updating _ANCESTOR_DECAY_TWINS')
+        for decay_name, base_name in self._ANCESTOR_DECAY_TWINS.items():
+            if base_name is None:
                 continue
+            path = os.path.join(base_dir, decay_name)
+            twin = os.path.join(base_dir, base_name)
             with open(path) as f, open(twin) as g:
                 a, b = yaml.safe_load(f), yaml.safe_load(g)
             a_q, b_q = copy.deepcopy(a['QNAS']), copy.deepcopy(b['QNAS'])
@@ -189,6 +204,27 @@ class TestQuantumUpdateEngineSetting:
             b_q.pop('quantum_update_engine', None)
             b_q.pop('quantum_update_age_decay', None)
             assert a_q == b_q, f'{os.path.basename(path)} drifted from {os.path.basename(twin)}'
+
+
+class TestEnPopCrossoverSetting:
+    def test_absent_from_config_falls_back_to_cli_arg(self, tmp_path):
+        # _progressive_config() (01) itself sets QNAS.en_pop_crossover: True - use a
+        # variant without the key, so the CLI-arg fallback is actually exercised.
+        path = write_variant(tmp_path, lambda d: d['QNAS'].pop('en_pop_crossover', None))
+        spec_default = load(path, tmp_path).QNAS_spec
+        assert spec_default['en_pop_crossover'] is False
+        spec_cli_on = load(path, tmp_path, en_pop_crossover=True).QNAS_spec
+        assert spec_cli_on['en_pop_crossover'] is True
+
+    def test_config_true_wins_over_cli_arg_false(self, tmp_path):
+        path = write_variant(tmp_path, lambda d: d['QNAS'].update(en_pop_crossover=True))
+        spec = load(path, tmp_path, en_pop_crossover=False).QNAS_spec
+        assert spec['en_pop_crossover'] is True
+
+    def test_config_false_wins_over_cli_arg_true(self, tmp_path):
+        path = write_variant(tmp_path, lambda d: d['QNAS'].update(en_pop_crossover=False))
+        spec = load(path, tmp_path, en_pop_crossover=True).QNAS_spec
+        assert spec['en_pop_crossover'] is False
 
 
 class TestValidation:
@@ -224,7 +260,7 @@ class TestValidation:
     def test_fixed_params_are_not_evolved(self, tmp_path):
         spec_config = load(_progressive_config(), tmp_path)
         ranges = spec_config.QNAS_spec['params_ranges']
-        # config_progressive.yml pins every hyperparameter to a scalar
+        # 01_deterministic_13-8-4.yml pins every hyperparameter to a scalar
         assert all(isinstance(v, list) for v in ranges.values())
         for name in ('learning_rate', 'weight_decay'):
             if name not in ranges:

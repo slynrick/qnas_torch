@@ -15,8 +15,8 @@ NUM_CLASSES = 10
 INPUT = (2, 3, 32, 32)
 
 MENU_CONFIGS = [
-    'configs/config_files_cifar/config_progressive.yml',
-    'configs/config_files_cifar/config_progressive_dynamic_v2.yml',
+    'configs/config_files_cifar/01_deterministic_13-8-4.yml',
+    'configs/config_files_cifar/07_dynamic_v2.yml',
 ]
 
 

@@ -1,3 +1,6 @@
+import os
+import pickle
+
 import numpy as np
 import pytest
 
@@ -444,6 +447,91 @@ class TestCheckpoint:
             q.generate_classical()
             q.save_data()
         assert sorted(util.load_pkl(q.data_file)) == [0, 1, 2]
+
+    def test_save_data_appends_without_rewriting_earlier_generations(self, make_qnas):
+        """save_data() must never read back and rewrite previous generations - each
+        call only appends its own small record (see qnas.py::append_pkl_entry)."""
+        q = make_qnas()
+        q.current_gen = 0
+        q.generate_classical()
+        q.save_data()
+        with open(q.data_file, 'rb') as f:
+            after_gen0 = f.read()
+
+        q.current_gen = 1
+        q.generate_classical()
+        q.save_data()
+        with open(q.data_file, 'rb') as f:
+            after_gen1 = f.read()
+
+        assert after_gen1.startswith(after_gen0)
+        assert len(after_gen1) > len(after_gen0)
+
+    def test_load_qnas_data_uses_sidecar_not_full_history(self, make_qnas):
+        """load_qnas_data must restore state from the small '_latest' sidecar alone,
+        not by replaying the whole data_file through util.load_pkl - proven by
+        corrupting data_file itself after the fact and confirming resume still
+        works from the sidecar."""
+        q = make_qnas()
+        for gen in range(3):
+            q.current_gen = gen
+            q.generate_classical()
+            q.go_next_gen()
+
+        sidecar = qnas.QNAS._sidecar_path(q.data_file)
+        assert os.path.exists(sidecar)
+        assert sorted(util.load_pkl(sidecar)) == [2]
+
+        with open(q.data_file, 'wb') as f:
+            f.write(b'not a valid pickle stream')
+
+        fresh = make_qnas()
+        fresh.load_qnas_data(q.data_file)
+        assert fresh.current_gen == 2
+        assert fresh.best_so_far == q.best_so_far
+        assert fresh.total_eval == q.total_eval
+
+    def test_load_qnas_data_falls_back_without_sidecar(self, make_qnas, tmp_path):
+        """A legacy experiment directory (single-record data_file, no sidecar ever
+        written) must still resume correctly via the full-merge fallback."""
+        q = make_qnas()
+        for gen in range(2):
+            q.current_gen = gen
+            q.generate_classical()
+            q.go_next_gen()
+
+        legacy_path = tmp_path / 'legacy' / 'data_QNAS.pkl'
+        os.makedirs(legacy_path.parent, exist_ok=True)
+        with open(legacy_path, 'wb') as f:
+            pickle.dump(util.load_pkl(q.data_file), f)
+
+        fresh = make_qnas()
+        fresh.data_file = str(tmp_path / 'legacy2' / 'data_QNAS.pkl')
+        os.makedirs(os.path.dirname(fresh.data_file), exist_ok=True)
+        fresh.load_qnas_data(str(legacy_path))
+        assert fresh.current_gen == 1
+        assert fresh.best_so_far == q.best_so_far
+        assert fresh.total_eval == q.total_eval
+
+    def test_load_qnas_data_reseeds_new_path_via_raw_copy(self, make_qnas, tmp_path):
+        """Continuing into a NEW experiment path (continue_path != experiment_path)
+        must preserve the whole prior history in the new data_file without
+        deserializing/reserializing it - a raw byte copy of the old file."""
+        q = make_qnas()
+        for gen in range(3):
+            q.current_gen = gen
+            q.generate_classical()
+            q.go_next_gen()
+
+        fresh = make_qnas()
+        fresh.data_file = str(tmp_path / 'continued' / 'data_QNAS.pkl')
+        os.makedirs(os.path.dirname(fresh.data_file), exist_ok=True)
+        fresh.load_qnas_data(q.data_file)
+
+        assert fresh.current_gen == 2
+        assert os.path.exists(fresh.data_file)
+        assert sorted(util.load_pkl(fresh.data_file)) == [0, 1, 2]
+        assert os.path.exists(qnas.QNAS._sidecar_path(fresh.data_file))
 
     def test_flat_fn_list_checkpoint_rejected_for_progressive(self, make_qnas):
         stages = [{'gen_start': 0, 'num_nodes': 3, 'num_ops': len(FN_LIST)}]

@@ -5,13 +5,16 @@ QUEUE := scripts/qnas-queue.sh
 PIPELINE := scripts/run_pipeline.sh
 
 # Overridable on the command line, e.g.:
-#   make queue-add CONFIG=configs/config_files_cifar/config_progressive.yml \
+#   make queue-add CONFIG=configs/config_files_cifar/01_deterministic_13-8-4.yml \
 #       EXP=experiment_cifar10_progressive/exp8 EXTRA="-d cifar10 -M -T -X"
 MODE     ?= pipeline
 CONFIG   ?=
 EXP      ?=
 EXTRA    ?=
 PRIORITY ?= 0
+GPU_IDS  ?=
+WORKERS  ?= 1
+GPU_POOL ?=
 ID       ?=
 DATASET  ?= cifar10
 ARGS     ?=
@@ -21,7 +24,7 @@ EVOLVE_ARGS ?=
 
 .PHONY: help sync test test-cov lint lint-fix check \
 	queue-add queue-list queue-status queue-start queue-stop \
-	queue-logs queue-logs-summary queue-logs-all queue-remove queue-cancel queue-retry \
+	queue-logs queue-logs-summary queue-logs-all queue-logs-running queue-watch queue-remove queue-cancel queue-retry \
 	queue pipeline diff-runs clean
 
 help: ## Show this help
@@ -30,9 +33,10 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Common variables: CONFIG, EXP, EXTRA, ID, MODE (default: pipeline)"
-	@echo "Example: make queue-add CONFIG=configs/config_files_cifar/config_progressive.yml \\"
+	@echo "Common variables: CONFIG, EXP, EXTRA, ID, MODE (default: pipeline), GPU_IDS, WORKERS (default: 1), GPU_POOL"
+	@echo "Example: make queue-add CONFIG=configs/config_files_cifar/01_deterministic_13-8-4.yml \\"
 	@echo "             EXP=experiment_cifar10_progressive/exp8 EXTRA=\"-d cifar10 -M -T -X\""
+	@echo "         make queue-start WORKERS=2 GPU_POOL=\"0,1\"   # workers pick a free pool GPU per job"
 
 sync: ## Install/sync project dependencies with uv
 	uv sync
@@ -58,7 +62,7 @@ check: lint test ## Lint, then run the tests
 # `make queue <sub>` is an alias for `make queue-<sub>` (e.g. `make queue list`).
 # The word after `queue` is a goal make would otherwise reject, so it is
 # swallowed by an empty phony rule and dispatched from the `queue` recipe.
-QUEUE_SUBS := add list status start stop logs logs-summary logs-all remove cancel retry
+QUEUE_SUBS := add list status start stop logs logs-summary logs-all logs-running watch remove cancel retry
 ifeq ($(firstword $(MAKECMDGOALS)),queue)
 QUEUE_SUB := $(word 2,$(MAKECMDGOALS))
 ifneq ($(QUEUE_SUB),)
@@ -68,17 +72,17 @@ $(QUEUE_SUB):
 endif
 endif
 
-queue: ## Alias: make queue <add|list|status|start|stop|logs|logs-summary|logs-all|remove|cancel|retry>
+queue: ## Alias: make queue <add|list|status|start|stop|logs|logs-summary|logs-all|logs-running|watch|remove|cancel|retry>
 	@case " $(QUEUE_SUBS) " in \
 		*" $(QUEUE_SUB) "*) $(MAKE) --no-print-directory queue-$(QUEUE_SUB) ;; \
 		*) echo "usage: make queue <$(subst $(space),|,$(QUEUE_SUBS))>" >&2; exit 1 ;; \
 	esac
 
-queue-add: ## Queue a job (needs CONFIG=, EXP=; optional MODE=, EXTRA=, PRIORITY=)
+queue-add: ## Queue a job (needs CONFIG=, EXP=; optional MODE=, EXTRA=, PRIORITY=, GPU_IDS=)
 	@test -n "$(CONFIG)" || (echo "error: CONFIG=<path to yml> is required" >&2; exit 1)
 	@test -n "$(EXP)" || (echo "error: EXP=<experiment_path> is required" >&2; exit 1)
 	$(QUEUE) add --mode $(MODE) --config $(CONFIG) --experiment-path $(EXP) \
-		--extra "$(EXTRA)" --priority $(PRIORITY)
+		--extra "$(EXTRA)" --priority $(PRIORITY) $(if $(GPU_IDS),--gpu-ids "$(GPU_IDS)")
 
 queue-list: ## List queued/running/past jobs
 	$(QUEUE) list
@@ -86,10 +90,10 @@ queue-list: ## List queued/running/past jobs
 queue-status: ## Show worker and queue status
 	$(QUEUE) status
 
-queue-start: ## Start the background worker (also resumes any stopped job)
-	$(QUEUE) start
+queue-start: ## Start background worker(s) (also resumes stopped jobs); WORKERS= concurrency, GPU_POOL= shared GPU pool
+	$(QUEUE) start --workers $(WORKERS) $(if $(GPU_POOL),--gpu-pool "$(GPU_POOL)")
 
-queue-stop: ## Stop the worker and the currently running job
+queue-stop: ## Stop every worker and the jobs it is running
 	$(QUEUE) stop
 
 queue-logs: ## Follow logs of the current (or ID=) job; auto-continues into the next queued job
@@ -100,6 +104,12 @@ queue-logs-summary: ## Follow the evolution-level summary log (log_QNAS.txt) ins
 
 queue-logs-all: ## Follow the raw log and the summary log together, prefixed [detail]/[summary]
 	$(QUEUE) logs $(ID) -f --both
+
+queue-logs-running: ## Follow every currently running job's log at once, prefixed by job id (WORKERS > 1)
+	$(QUEUE) logs -f --all-jobs
+
+queue-watch: ## Live dashboard: every running job's generation/best fitness updating in place, detail logs below
+	$(QUEUE) watch
 
 queue-remove: ## Delete a job from the queue/history (needs ID=)
 	@test -n "$(ID)" || (echo "error: ID=<job id> is required" >&2; exit 1)

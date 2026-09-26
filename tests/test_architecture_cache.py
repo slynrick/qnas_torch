@@ -78,6 +78,16 @@ def _register_many(path, worker_id, n):
         cache.register([f'w{worker_id}', f'i{i}'], float(i), 1.0, 1.0)
 
 
+def test_register_with_nan_fitness_stores_none_instead_of_raising(cache):
+    cache.register(NET_A, fitness=float('nan'), params_m=1.0, inference_us=1.0)
+    assert cache.find_cached_result(NET_A)['fitness'] is None
+
+
+def test_register_with_infinite_value_stores_none_instead_of_raising(cache):
+    cache.register(NET_A, fitness=1.0, params_m=1.0, inference_us=float('inf'))
+    assert cache.find_cached_result(NET_A)['inference_us'] is None
+
+
 def test_concurrent_processes_lose_no_updates(tmp_path):
     """The flock-protected read-modify-write must serialize writers across processes."""
     path = str(tmp_path / 'cache.json')
