@@ -372,17 +372,27 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     if architecture_cache is not None:
         cache_hit = architecture_cache.find_cached_result(net_list)
         if cache_hit is not None:
-            return_val[0] = cache_hit['fitness']
-            return_val[1] = cache_hit['params_m']
-            return_val[2] = cache_hit['inference_us']
+            # A diverged individual is cached with fitness/params_m/inference_us as None
+            # (architecture_cache.py can't store NaN/Inf) - convert back to NaN so this
+            # cache hit still flows as a plain float everywhere downstream (return_val is
+            # a fixed-type multiprocessing.Array, and both the log line below and
+            # evaluation.py's round() on return_val assume a real number).
+            fitness = cache_hit['fitness'] if cache_hit['fitness'] is not None else float('nan')
+            params_m = cache_hit['params_m'] if cache_hit['params_m'] is not None else float('nan')
+            inference_us = (
+                cache_hit['inference_us'] if cache_hit['inference_us'] is not None else float('nan')
+            )
+            return_val[0] = fitness
+            return_val[1] = params_m
+            return_val[2] = inference_us
             return_val[3] = 1.0  # cache hit - NOT a new architecture this generation
             params['weight_reuse_applied'] = True
             params['cache_hit'] = True
             params['training_time'] = 0.0
-            params['total_trainable_params'] = cache_hit['params_m'] * 1e6
-            params['cuda_inference_time'] = cache_hit['inference_us']
+            params['total_trainable_params'] = params_m * 1e6
+            params['cuda_inference_time'] = inference_us
             params['cache_hit_count'] = cache_hit.get('hit_count', 0)
-            LOGGER.info(f"Cache hit for {id_num}: reusing fitness {cache_hit['fitness']:.3f} "
+            LOGGER.info(f"Cache hit for {id_num}: reusing fitness {fitness:.3f} "
                         f"for architecture {net_list} (hit #{cache_hit.get('hit_count', 0)})")
             create_info_file(model_path, params, 'training_params.txt')
             return

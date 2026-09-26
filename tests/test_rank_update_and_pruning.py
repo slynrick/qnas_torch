@@ -164,6 +164,31 @@ class TestPruneCriteria:
         names = q.qpop_net.chromosome.fn_list[0]
         assert scores[0][names.index('skip')] > scores[0][names.index('pool')]
 
+    def test_empirical_drops_diverged_individuals_in_memory(self, make_qnas):
+        # A diverged individual's fitness is NaN; argsort puts NaN last, i.e. it would
+        # rank as the single BEST evaluation unless explicitly dropped (regression test
+        # for that bug - see QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN.md).
+        q = make_qnas(progressive_stages=STAGES, noop_fn_name=NOOP,
+                      progressive_mode='deterministic', prune_criterion='empirical')
+        q._stage_eval_net = [np.array([[3, 3, 3], [3, 0, 3], [2, 2, 2], [2, 1, 2]])]
+        q._stage_eval_fit = [np.array([9.0, 8.0, 1.0, np.nan])]  # pool diverged, not best
+        new = q._rank_and_prune_all_nodes(q.qpop_net.chromosome.fn_list, 2)
+        assert new[0] == ['skip', NOOP] and new[2] == ['skip', NOOP]
+
+    def test_empirical_falls_back_to_cache_drops_diverged(self, make_qnas, tmp_path):
+        # A diverged architecture is cached with fitness=None (architecture_cache.py
+        # can't store NaN/Inf) - same regression as the in-memory case above, via the
+        # cache fallback used after a resume.
+        q = make_qnas(progressive_stages=STAGES, noop_fn_name=NOOP,
+                      progressive_mode='deterministic', prune_criterion='empirical')
+        q.eval_func.architecture_cache = ArchitectureCache(str(tmp_path / 'c' / 'cache.json'))
+        q.eval_func.architecture_cache.register(['skip', 'skip', 'skip'], 9.0, 0.1, 1.0)
+        q.eval_func.architecture_cache.register(['pool', 'pool', 'pool'], 1.0, 0.1, 1.0)
+        q.eval_func.architecture_cache.register(['pool', 'skip', 'pool'], float('nan'), 0.1, 1.0)
+        scores = q._empirical_op_scores()
+        names = q.qpop_net.chromosome.fn_list[0]
+        assert scores[0][names.index('skip')] > scores[0][names.index('pool')]
+
     def test_stage_record_restarts_after_transition(self, make_qnas):
         q = make_qnas(**RANKED, progressive_stages=STAGES, noop_fn_name=NOOP,
                       progressive_mode='deterministic', prune_criterion='empirical',

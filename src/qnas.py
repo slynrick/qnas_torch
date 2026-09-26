@@ -1043,6 +1043,21 @@ class QNAS(object):
         if net is None or net.shape[0] == 0:
             return None
 
+        # A diverged individual's fitness is NaN (in-memory) or None, normalized to NaN
+        # by _stage_evaluations_from_cache's np.float64 cast (cache fallback) - argsort
+        # puts NaN last, i.e. ranked as the single BEST evaluation, so it must be dropped
+        # rather than scored.
+        finite = np.isfinite(fit)
+        if not finite.all():
+            self.logger.warning(
+                "Op pruning: dropping %d diverged (non-finite fitness) evaluation(s) out "
+                "of %d from the empirical op-score calculation.",
+                int((~finite).sum()), fit.shape[0],
+            )
+            net, fit = net[finite], fit[finite]
+        if fit.shape[0] == 0:
+            return None
+
         order = np.argsort(fit, kind='stable')
         ranks = np.empty(fit.shape[0], dtype=np.float64)
         ranks[order] = np.arange(fit.shape[0])
