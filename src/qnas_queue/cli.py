@@ -367,11 +367,14 @@ def _wait_for_log(log_path, job_id):
 
 
 def _running_log_sources(conn):
-    """[(label, path)] for every job currently 'running' that has a log path
+    """[(job_id, path)] for every job currently 'running' that has a log path
     yet - one entry per concurrently running job, as opposed to
-    _job_log_sources's several views of a single job."""
+    _job_log_sources's several views of a single job. Returns the raw job id
+    (not a pre-formatted label) so each caller can format/align/style it as
+    it needs - `watch`'s detail panel pads and colors it, `logs --all-jobs`
+    keeps the plain unpadded "job N" text."""
     return [
-        (f"job {job['id']}", db.resolve_path(job["log_path"]))
+        (job["id"], db.resolve_path(job["log_path"]))
         for job in db.list_running_jobs(conn) if job["log_path"]
     ]
 
@@ -390,15 +393,16 @@ def _tail_all_running(args):
         return
 
     if not args.follow:
-        _tail_sources(sources, args.lines)
+        _tail_sources([(f"job {jid}", path) for jid, path in sources], args.lines)
         return
 
     handles = {}
 
     def open_new(conn):
-        for label, path in _running_log_sources(conn):
+        for job_id, path in _running_log_sources(conn):
             if path in handles or not path.exists():
                 continue
+            label = f"job {job_id}"
             f = open(path)
             handles[path] = (label, f)
             for line in deque(f, maxlen=20):
@@ -427,38 +431,107 @@ def _tail_all_running(args):
 
 
 # Matches the per-generation message qnas.py's evolve loop logs to log_QNAS.txt
-# (src/qnas.py:569-575: "- Generation: N" / "- Best so far: id --> fitness").
-# `watch`'s summary table is coupled to this exact text on purpose (see the
-# plan/PR for this feature) - update both together if that message ever changes.
-_GENERATION_RE = re.compile(r"- Generation: (\d+)")
-_BEST_SO_FAR_RE = re.compile(r"- Best so far: (\S+) --> ([\d.]+)")
+# (src/qnas.py:569-575: "- Generation: N" / "- Best so far: id --> fitness" /
+# "- Fitnesses: [...]"). `watch`'s summary table is coupled to this exact text
+# on purpose (see the plan/PR for this feature) - update both together if that
+# message ever changes.
+_GENERATION_RE = re.compile(r"^- Generation: (\d+)")
+# best_so_far_id is logged as a Python list, e.g. "[1, 13]" - the comma-space
+# inside it means `\S+` never matches (it stops at the space, leaving " --> "
+# unable to follow immediately), so this must allow whitespace in the id.
+_BEST_SO_FAR_RE = re.compile(r"^- Best so far: (.+) --> ([\d.]+)")
+_BEST_ID_GEN_IND_RE = re.compile(r"\[(\d+),\s*(\d+)\]")
+# "- Fitnesses: " (colon right after the word) - deliberately does NOT match
+# "- Fitnesses without penalties: [...]", the very next line qnas.py logs.
+_FITNESSES_RE = re.compile(r"^- Fitnesses: (.*)")
+_FLOAT_RE = re.compile(r"-?\d+\.?\d*")
 
 
 def _parse_generation_summary(log_qnas_path):
     """The latest generation logged to *log_qnas_path*, as {'generation': int,
-    'best_id': str, 'best_fitness': float}, or None if the file doesn't exist
-    yet or has no generation block yet (job just started, or a retrain-only
-    job that never writes one). Reads only the tail of the file - one block
-    is ~7 lines, 200 is a wide margin - and keeps the LAST match of each
-    regex, since a job's own log only ever grows."""
+    'best_id': str, 'best_fitness': float, 'best_gen': int or None,
+    'best_ind': int or None, 'fitness_delta': float or None,
+    'fitness_spread': float or None}, or None if the file doesn't exist yet or
+    has no generation block yet (job just started, or a retrain-only job that
+    never writes one).
+
+    'fitness_delta' is how much best_fitness changed versus the PREVIOUS
+    logged generation (None if there isn't one yet in the tail read below).
+    'fitness_spread' is max - min across the latest generation's own
+    population ("- Fitnesses: [...]", which may itself wrap across several
+    lines - numpy's default array repr).
+
+    Reads only the tail of the file - a generous margin so at least the last
+    two generation blocks are present even for a large population (each
+    block, plus the population-matrix dump logged between them, is roughly
+    30-40 lines) - and keeps the LAST two complete blocks, since a job's own
+    log only ever grows.
+    """
     if not log_qnas_path.exists():
         return None
     with open(log_qnas_path) as f:
-        tail = deque(f, maxlen=200)
-    generation, best = None, None
+        tail = deque(f, maxlen=4000)
+
+    blocks = []
+    current = None
+    fitness_chunks = None
     for line in tail:
-        m = _GENERATION_RE.search(line)
+        m = _GENERATION_RE.match(line)
         if m:
-            generation = int(m.group(1))
-        m = _BEST_SO_FAR_RE.search(line)
+            current = {"generation": int(m.group(1)), "best_id": None,
+                       "best_fitness": None, "fitnesses": None}
+            blocks.append(current)
+            fitness_chunks = None
+            continue
+        if current is None:
+            continue
+        m = _BEST_SO_FAR_RE.match(line)
         if m:
-            best = (m.group(1), float(m.group(2)))
-    if generation is None and best is None:
+            current["best_id"] = m.group(1)
+            current["best_fitness"] = float(m.group(2))
+            continue
+        m = _FITNESSES_RE.match(line)
+        if m:
+            fitness_chunks = [m.group(1)]
+            if "]" in m.group(1):
+                current["fitnesses"] = [float(x) for x in _FLOAT_RE.findall(fitness_chunks[0])]
+                fitness_chunks = None
+            continue
+        if fitness_chunks is not None:
+            fitness_chunks.append(line)
+            if "]" in line:
+                current["fitnesses"] = [float(x) for x in
+                                        _FLOAT_RE.findall("".join(fitness_chunks))]
+                fitness_chunks = None
+
+    if not blocks:
         return None
+    latest = blocks[-1]
+    previous = blocks[-2] if len(blocks) >= 2 else None
+
+    best_gen = best_ind = None
+    if latest["best_id"] is not None:
+        m = _BEST_ID_GEN_IND_RE.search(latest["best_id"])
+        if m:
+            best_gen, best_ind = int(m.group(1)), int(m.group(2))
+
+    fitness_delta = None
+    if (previous is not None and latest["best_fitness"] is not None
+            and previous["best_fitness"] is not None):
+        fitness_delta = latest["best_fitness"] - previous["best_fitness"]
+
+    fitness_spread = None
+    if latest["fitnesses"]:
+        fitness_spread = max(latest["fitnesses"]) - min(latest["fitnesses"])
+
     return {
-        "generation": generation,
-        "best_id": best[0] if best else None,
-        "best_fitness": best[1] if best else None,
+        "generation": latest["generation"],
+        "best_id": latest["best_id"],
+        "best_fitness": latest["best_fitness"],
+        "best_gen": best_gen,
+        "best_ind": best_ind,
+        "fitness_delta": fitness_delta,
+        "fitness_spread": fitness_spread,
     }
 
 
@@ -486,43 +559,73 @@ def _format_elapsed(started_at):
 
 def _job_summary_row(job, gen_cache):
     """One `watch` table row for *job*: (id, mode, gpu, gen, best fitness,
-    elapsed). "n/a" for gen/fitness on a retrain job (never writes generation
-    blocks); "starting..." for an evolve/pipeline job that hasn't logged its
-    first generation yet."""
+    best origin, fitness delta, fitness spread, elapsed). "n/a" for gen/fitness
+    on a retrain job (never writes generation blocks); "starting..." for an
+    evolve/pipeline job that hasn't logged its first generation yet.
+
+    best origin: "gen G/ind I" - which generation/individual produced the
+    current best_fitness (parsed from best_so_far_id, e.g. "[1, 13]").
+    fitness delta: best_fitness's change versus the previous logged
+    generation (a signed value - positive means it just improved).
+    fitness spread: max - min across the latest generation's own population,
+    i.e. how converged/diverse that generation currently is.
+    """
     summary = _parse_generation_summary(
         db.resolve_path(job["experiment_path"]) / "log_QNAS.txt")
     if summary is None:
         gen_cell = "n/a" if job["mode"] == "retrain" else "starting..."
-        fitness_cell = "-"
+        fitness_cell = origin_cell = delta_cell = spread_cell = "-"
     else:
         max_gen = _job_max_generations(job, gen_cache)
         gen_cell = (f"{summary['generation']}/{max_gen}" if max_gen is not None
                     else str(summary["generation"])) if summary["generation"] is not None else "-"
         fitness_cell = (f"{summary['best_fitness']:.5f}"
                          if summary["best_fitness"] is not None else "-")
-    return (str(job["id"]), job["mode"], job["gpu_ids"] or "-",
-            gen_cell, fitness_cell, _format_elapsed(job["started_at"]))
+        origin_cell = (f"gen {summary['best_gen']}/ind {summary['best_ind']}"
+                       if summary["best_gen"] is not None else "-")
+        delta_cell = (f"{summary['fitness_delta']:+.5f}"
+                     if summary["fitness_delta"] is not None else "-")
+        spread_cell = (f"{summary['fitness_spread']:.5f}"
+                       if summary["fitness_spread"] is not None else "-")
+    return (str(job["id"]), job["mode"], job["gpu_ids"] or "-", gen_cell,
+            fitness_cell, origin_cell, delta_cell, spread_cell,
+            _format_elapsed(job["started_at"]))
 
 
 def _drain_new_detail_lines(handles, conn, detail_buffer):
     """Feeds newly-available lines from every running job's detail log into
-    *detail_buffer* (a bounded deque), tagged "[job N] ...". Adapted from
-    _running_log_sources/open_new in _tail_all_running, but also closes and
-    drops handles for jobs that stopped running, so a long `watch` session
-    doesn't accumulate open file descriptors for finished jobs."""
+    *detail_buffer* (a bounded deque of (job_id, line) tuples - kept raw,
+    rather than a pre-formatted "[job N] ..." string, so _watch_layout can
+    align/color the "[job N]" prefix consistently across every buffered line
+    at render time, including ones appended before a job id's digit count
+    changed). Adapted from _running_log_sources/open_new in
+    _tail_all_running, but also closes and drops handles for jobs that
+    stopped running, so a long `watch` session doesn't accumulate open file
+    descriptors for finished jobs."""
     current = _running_log_sources(conn)
     current_paths = {path for _, path in current}
     for path in [p for p in handles if p not in current_paths]:
         _, f = handles.pop(path)
         f.close()
-    for label, path in current:
+    for job_id, path in current:
         if path not in handles and path.exists():
-            handles[path] = (label, open(path))
-    for label, f in handles.values():
+            handles[path] = (job_id, open(path))
+    for job_id, f in handles.values():
         line = f.readline()
         while line:
-            detail_buffer.append(f"[{label}] {line.rstrip()}")
+            detail_buffer.append((job_id, line.rstrip()))
             line = f.readline()
+
+
+# A stable color per job id, cycling through this fixed palette - used for both
+# the summary table's rows and the detail panel's "[job N]" prefixes below, so
+# the same job reads as the same color in both places.
+_JOB_COLOR_PALETTE = ("cyan", "magenta", "yellow", "green", "bright_blue",
+                     "bright_red", "bright_cyan", "bright_magenta")
+
+
+def _job_style(job_id):
+    return _JOB_COLOR_PALETTE[job_id % len(_JOB_COLOR_PALETTE)]
 
 
 def _watch_layout(console, jobs, gen_cache, detail_buffer):
@@ -532,17 +635,27 @@ def _watch_layout(console, jobs, gen_cache, detail_buffer):
         # which is easy to under-count and clip the last data row (title line +
         # top border + header + separator + bottom border = 5 fixed lines).
         top = Table(title="Running jobs", expand=True)
-        for column in ("id", "mode", "gpu", "gen", "best fitness", "elapsed"):
+        for column in ("id", "mode", "gpu", "gen", "best fitness", "best origin",
+                       "Δ best", "spread", "elapsed"):
             top.add_column(column)
         for job in jobs:
-            top.add_row(*_job_summary_row(job, gen_cache))
+            top.add_row(*_job_summary_row(job, gen_cache), style=_job_style(job["id"]))
         top_height = len(jobs) + 5
     else:
         top = Panel("No jobs currently running - waiting...", title="Running jobs")
         top_height = 3
 
     available = max(console.size.height - top_height - 2, 3)
-    detail_text = Text("\n".join(list(detail_buffer)[-available:]))
+    recent = list(detail_buffer)[-available:]
+    # Pad every "[job N]" prefix in this render to the widest job id currently
+    # visible, so lines from different jobs (e.g. job 2 and job 10) line up
+    # instead of the log text after the bracket starting at different columns
+    # depending on how many digits that job's id happens to have.
+    label_width = max((len(str(job_id)) for job_id, _ in recent), default=1)
+    detail_text = Text()
+    for job_id, line in recent:
+        detail_text.append(f"[job {job_id:>{label_width}}] ", style=_job_style(job_id))
+        detail_text.append(line + "\n")
 
     layout = Layout()
     layout.split_column(

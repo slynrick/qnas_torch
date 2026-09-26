@@ -596,20 +596,69 @@ class TestCli:
             return db.get_job(conn, job_id)
 
     def test_parse_generation_summary_returns_last_block(self, tmp_path):
+        # best_so_far_id is logged as a Python list ("[gen, ind]", comma-SPACE
+        # included) - see qnas.py's log_data() - not an underscore-joined string;
+        # the fixture must match that exactly, or a regex regression that breaks
+        # on the embedded space (see test_best_so_far_id_with_embedded_space_is_
+        # still_parsed below) would go unnoticed.
         log = tmp_path / 'log_QNAS.txt'
         log.write_text(
             "INFO: qnas: 2026-01-01 00:00:00,000 - New generation finished running!\n"
             "- Generation: 1\n"
-            "- Best so far: 1_0 --> 0.50000\n"
+            "- Best so far: [0, 0] --> 0.50000\n"
             "- Fitnesses: [0.5]\n"
             "INFO: qnas: 2026-01-01 00:01:00,000 - New generation finished running!\n"
             "- Generation: 2\n"
-            "- Best so far: 2_3 --> 0.77123\n"
+            "- Best so far: [2, 3] --> 0.77123\n"
             "- Fitnesses: [0.6, 0.77123]\n"
         )
         assert cli._parse_generation_summary(log) == {
-            'generation': 2, 'best_id': '2_3', 'best_fitness': 0.77123,
+            'generation': 2, 'best_id': '[2, 3]', 'best_fitness': 0.77123,
+            'best_gen': 2, 'best_ind': 3,
+            'fitness_delta': pytest.approx(0.77123 - 0.5),
+            'fitness_spread': pytest.approx(0.77123 - 0.6),
         }
+
+    def test_best_so_far_id_with_embedded_space_is_still_parsed(self, tmp_path):
+        """Regression: `\\S+` in _BEST_SO_FAR_RE could never match "[1, 13]" (the
+        real on-disk format) because of the comma-space inside the brackets,
+        silently leaving best_fitness as None in the watch dashboard."""
+        log = tmp_path / 'log_QNAS.txt'
+        log.write_text("- Generation: 1\n- Best so far: [1, 13] --> 70.00000\n")
+        summary = cli._parse_generation_summary(log)
+        assert summary['best_id'] == '[1, 13]'
+        assert summary['best_fitness'] == 70.0
+        assert (summary['best_gen'], summary['best_ind']) == (1, 13)
+
+    def test_fitnesses_array_wrapped_across_lines_is_parsed(self, tmp_path):
+        """numpy's default repr wraps a long fitness array across several lines -
+        the spread calc must still see every value, not just the first line."""
+        log = tmp_path / 'log_QNAS.txt'
+        log.write_text(
+            "- Generation: 0\n"
+            "- Best so far: [0, 10] --> 66.50000\n"
+            "- Fitnesses: [66.5  65.5  61.7  61.1  60.5  59.1  58.8  58.1  57.9  57.5\n"
+            " 56.6  52.4  50.8  49.69 46.4  34.9  21.17  7.98]\n"
+            "- Fitnesses without penalties: [66.5 65.5 61.7 61.1 60.5 59.1 58.8 58.1\n"
+            " 57.9 57.5 56.6 52.4 50.8 49.7 46.4 34.9 21.2  8. ]\n"
+        )
+        summary = cli._parse_generation_summary(log)
+        assert summary['fitness_spread'] == pytest.approx(66.5 - 7.98)
+
+    def test_fitness_delta_between_last_two_generations(self, tmp_path):
+        log = tmp_path / 'log_QNAS.txt'
+        log.write_text(
+            "- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n- Fitnesses: [60.0]\n"
+            "- Generation: 1\n- Best so far: [1, 5] --> 63.50000\n- Fitnesses: [63.5]\n"
+        )
+        summary = cli._parse_generation_summary(log)
+        assert summary['fitness_delta'] == pytest.approx(3.5)
+
+    def test_fitness_delta_is_none_on_the_first_generation(self, tmp_path):
+        log = tmp_path / 'log_QNAS.txt'
+        log.write_text("- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n")
+        summary = cli._parse_generation_summary(log)
+        assert summary['fitness_delta'] is None
 
     def test_parse_generation_summary_missing_or_empty_file_returns_none(self, tmp_path):
         assert cli._parse_generation_summary(tmp_path / 'missing.txt') is None
@@ -646,12 +695,32 @@ class TestCli:
     def test_job_summary_row_formats_generation_fitness_and_gpu(self, isolated_queue):
         job = self.seed_job_with_experiment(
             isolated_queue, mode='evolve', gpu_ids='0',
-            log_qnas_text='- Generation: 5\n- Best so far: 5_1 --> 0.61234\n',
+            log_qnas_text='- Generation: 5\n- Best so far: [5, 1] --> 0.61234\n',
             max_generations=300,
         )
         row = cli._job_summary_row(job, {})
-        assert row[:5] == (str(job['id']), 'evolve', '0', '5/300', '0.61234')
-        assert row[5] != '-'  # elapsed, formatted since started_at is set
+        assert row[:6] == (str(job['id']), 'evolve', '0', '5/300', '0.61234',
+                          'gen 5/ind 1')
+        assert row[8] != '-'  # elapsed, formatted since started_at is set
+
+    def test_job_summary_row_delta_and_spread(self, isolated_queue):
+        job = self.seed_job_with_experiment(
+            isolated_queue, mode='evolve',
+            log_qnas_text=(
+                '- Generation: 0\n- Best so far: [0, 0] --> 60.00000\n'
+                '- Fitnesses: [60.0, 55.0]\n'
+                '- Generation: 1\n- Best so far: [1, 2] --> 63.50000\n'
+                '- Fitnesses: [63.5, 61.0]\n'
+            ),
+        )
+        row = cli._job_summary_row(job, {})
+        assert row[6] == '+3.50000'  # fitness delta vs the previous generation
+        assert row[7] == '2.50000'  # spread within generation 1 (63.5 - 61.0)
+
+    def test_job_summary_row_dashes_when_no_generation_yet(self, isolated_queue):
+        job = self.seed_job_with_experiment(isolated_queue, mode='evolve')
+        row = cli._job_summary_row(job, {})
+        assert row[4:8] == ('-', '-', '-', '-')
 
     def test_watch_layout_renders_every_job_row_without_clipping(self, isolated_queue):
         # Regression: an earlier version wrapped the summary Table in its own
@@ -667,6 +736,36 @@ class TestCli:
         out = cap.get()
         for job in jobs:
             assert f"{job['id']}" in out and "starting..." in out
+
+    def test_drain_new_detail_lines_buffers_raw_job_id_tuples(self, isolated_queue):
+        job = self.seed_running_with_log(isolated_queue, 'hello\n')
+        detail_buffer = deque(maxlen=10)
+        with db.connect() as conn:
+            cli._drain_new_detail_lines({}, conn, detail_buffer)
+        assert list(detail_buffer) == [(job, 'hello')]
+
+    def test_watch_layout_pads_job_id_prefixes_to_a_common_width(self, isolated_queue):
+        # job ids 2 and 10 have different digit counts - their "[job N]"
+        # prefixes in the detail panel must still line up.
+        console = Console(width=100, height=40)
+        detail_buffer = deque([(2, 'from job two'), (10, 'from job ten')])
+        layout = cli._watch_layout(console, [], {}, detail_buffer)
+        with console.capture() as cap:
+            console.print(layout)
+        out = cap.get()
+        assert '[job  2] from job two' in out
+        assert '[job 10] from job ten' in out
+
+    def test_watch_layout_colors_rows_by_job_id(self, isolated_queue):
+        jobs = [self.seed_job_with_experiment(isolated_queue, gpu_ids=str(i))
+                for i in range(2)]
+        assert cli._job_style(jobs[0]['id']) != cli._job_style(jobs[1]['id'])
+        console = Console(width=100, height=40, force_terminal=True, color_system='standard')
+        layout = cli._watch_layout(console, jobs, {}, deque())
+        with console.capture() as cap:
+            console.print(layout)
+        out = cap.get()
+        assert '\x1b[' in out  # ANSI escapes present - rows are actually styled
 
     def test_cmd_watch_requires_a_tty(self, monkeypatch):
         monkeypatch.setattr(cli.sys.stdout, 'isatty', lambda: False)
