@@ -28,7 +28,7 @@ SYNC_ARGS ?=
 .PHONY: help sync test test-cov lint lint-fix check \
 	queue-add queue-list queue-status queue-start queue-stop \
 	queue-logs queue-logs-summary queue-logs-all queue-logs-running queue-watch queue-remove queue-cancel queue-retry \
-	queue pipeline diff-runs sync-remote queue-watch-remote clean
+	queue pipeline diff-runs sync-remote queue-add-remote sync-config-remote sync-exp-remote queue-watch-remote clean
 
 help: ## Show this help
 	@echo "QNAS-torch project commands"
@@ -146,6 +146,23 @@ sync-remote: ## Pull experiment_*/ and configs/ from a remote copy (needs HOST=<
 	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
 	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
 	scripts/sync-experiments.sh $(SYNC_ARGS) $(HOST) '$(REMOTE)'
+
+queue-add-remote: ## Queue a job on the remote host's queue over ssh (needs HOST=, REMOTE=, CONFIG=, EXP=; optional MODE=, EXTRA=, PRIORITY=, GPU_IDS=)
+	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
+	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
+	@test -n "$(CONFIG)" || (echo "error: CONFIG=<path to yml> is required" >&2; exit 1)
+	@test -n "$(EXP)" || (echo "error: EXP=<experiment_path> is required" >&2; exit 1)
+	ssh $(HOST) "cd $(REMOTE) && make queue-add MODE='$(MODE)' CONFIG='$(CONFIG)' EXP='$(EXP)' EXTRA='$(EXTRA)' PRIORITY='$(PRIORITY)' GPU_IDS='$(GPU_IDS)'"
+
+sync-config-remote: ## Push configs/ to the remote copy (needs HOST=, REMOTE=; SYNC_ARGS="-n" for a dry run)
+	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
+	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
+	scripts/sync-experiments.sh --push --configs-only $(SYNC_ARGS) $(HOST) '$(REMOTE)'
+
+sync-exp-remote: ## Pull experiment_*/ from the remote, deleting local files absent there (needs HOST=, REMOTE=; SYNC_ARGS="-n" to preview)
+	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
+	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
+	scripts/sync-experiments.sh --pull --experiments-only --delete $(SYNC_ARGS) $(HOST) '$(REMOTE)'
 
 queue-watch-remote: ## Live queue-watch dashboard of a remote host's own queue, read over ssh (needs HOST=<ssh alias> REMOTE=<path>)
 	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)

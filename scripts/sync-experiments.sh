@@ -25,10 +25,12 @@
 #   --queue              also sync .qnas_queue/ (queue.db, logs/, configs/ snapshots);
 #                        worker.pid is always skipped since it names a process on one
 #                        specific host and is meaningless copied elsewhere
+#   --delete             also delete files on the receiving side that no longer exist on the
+#                        sending side (only within the synced paths; use with -n first)
 #   --exclude PATTERN    extra rsync exclude pattern (repeatable), e.g. --exclude '*.pth'
 #   -h, --help           show this help
 #
-# Safety: files are never deleted on the receiving side, and a file that is newer on the
+# Safety: files are never deleted on the receiving side unless --delete is given, and a file that is newer on the
 # receiving side is never overwritten (rsync --update).
 
 set -euo pipefail
@@ -43,6 +45,7 @@ dry_run=()
 sync_experiments=true
 sync_configs=true
 sync_queue=false
+delete=()
 extra_excludes=()
 positional=()
 
@@ -54,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --experiments-only) sync_configs=false; shift ;;
         --configs-only) sync_experiments=false; shift ;;
         --queue) sync_queue=true; shift ;;
+        --delete) delete=(--delete); shift ;;
         --exclude) extra_excludes+=(--exclude "$2"); shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "error: unknown option $1" >&2; usage >&2; exit 1 ;;
@@ -112,4 +116,4 @@ fi
 
 echo "sync (${direction}): ${src} -> ${dst}"
 rsync -a --update --human-readable --info=stats1,progress2 --partial \
-    "${dry_run[@]}" "${filters[@]}" "$src" "$dst"
+    "${dry_run[@]}" "${delete[@]}" "${filters[@]}" "$src" "$dst"
