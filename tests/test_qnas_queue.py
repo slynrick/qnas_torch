@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from rich.panel import Panel
 
 from qnas_queue import cli, db, runner, worker
 
@@ -793,6 +794,20 @@ class TestCli:
             console.print(layout)
         out = cap.get()
         assert '\x1b[' in out  # ANSI escapes present - rows are actually styled
+
+    def test_frame_update_sends_only_changed_rows(self):
+        console = Console(width=40, height=6, force_terminal=True)
+        first = cli._frame_lines(Panel("hi"), console)
+        assert len(first) == 6
+        full = cli._frame_update(first, None)
+        assert full.startswith(cli._SYNC_BEGIN) and full.endswith(cli._SYNC_END)
+        assert '\x1b[2J' not in full  # never blank the screen up front
+        assert cli._frame_update(first, first).count('\x1b[') == 2  # sync markers only
+        second = list(first)
+        second[2] = "changed"
+        update = cli._frame_update(second, first)
+        assert "\x1b[3;1Hchanged" in update
+        assert update.count(';1H') == 1
 
     def test_cmd_watch_requires_a_tty(self, monkeypatch):
         monkeypatch.setattr(cli.sys.stdout, 'isatty', lambda: False)

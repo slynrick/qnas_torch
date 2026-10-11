@@ -136,3 +136,6 @@ reports/*
 !reports/.gitkeep
 .render_tmp/
 tests/data
+.claude/
+.pytest_cache/
+.ruff_cache/

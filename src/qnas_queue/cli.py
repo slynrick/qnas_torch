@@ -1,7 +1,9 @@
 import argparse
+import io
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -12,7 +14,6 @@ from pathlib import Path
 import yaml
 from rich.console import Console
 from rich.layout import Layout
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -738,16 +739,66 @@ def cmd_watch(args):
             _drain_new_detail_lines(handles, conn, detail_buffer)
         return _watch_layout(console, jobs, gen_cache, first_best_cache, detail_buffer)
 
+    out = sys.stdout
+    last_lines = None
     try:
-        with Live(render(), console=console, refresh_per_second=2) as live:
-            while True:
-                time.sleep(0.5)
-                live.update(render())
+        out.write(_ALT_SCREEN_ON)
+        out.flush()
+        while True:
+            try:
+                lines = _frame_lines(render(), console)
+            except (OSError, sqlite3.Error):
+                lines = None  # transient (e.g. db locked) - keep the last frame
+            if lines is not None and lines != last_lines:
+                out.write(_frame_update(lines, last_lines))
+                out.flush()
+                last_lines = lines
+            time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
     finally:
+        out.write(_ALT_SCREEN_OFF)
+        out.flush()
         for _, f in handles.values():
             f.close()
+
+
+# `watch` draws without rich.Live: Live erases the old frame and then reprints
+# it as several writes, which over a laggy ssh link (`queue-watch-remote`)
+# shows up as the dashboard blanking/flickering between frames. Instead each
+# frame is rendered off-screen into lines, and only the lines that differ from
+# what's already on screen are sent - as ONE write that overwrites in place
+# (never an up-front erase), wrapped in synchronized-output markers (DEC mode
+# 2026) so terminals that support it present the update atomically; others
+# ignore the markers. Sending just the changed lines keeps traffic to a few
+# hundred bytes per refresh, so a slow link has far less to stall on.
+_ALT_SCREEN_ON = "\x1b[?1049h\x1b[?25l"
+_ALT_SCREEN_OFF = "\x1b[?25h\x1b[?1049l"
+_SYNC_BEGIN, _SYNC_END = "\x1b[?2026h", "\x1b[?2026l"
+
+
+def _frame_lines(renderable, console):
+    """*renderable* rendered to exactly console.height ANSI-styled lines."""
+    width, height = console.size
+    buf = io.StringIO()
+    Console(file=buf, force_terminal=True, width=width, height=height,
+            color_system=console.color_system or "standard").print(renderable, end="")
+    lines = buf.getvalue().split("\n")[:height]
+    return lines + [""] * (height - len(lines))
+
+
+def _frame_update(lines, previous):
+    """The terminal string that turns the screen showing *previous* into
+    *lines*: only the changed rows when the size is unchanged, else a full
+    redraw (first frame / resized terminal)."""
+    if previous is None or len(previous) != len(lines):
+        changed = range(len(lines))
+        clear = "\x1b[J"
+    else:
+        changed = [i for i, (new, old) in enumerate(zip(lines, previous)) if new != old]
+        clear = ""
+    body = "".join(f"\x1b[{i + 1};1H{lines[i]}\x1b[K" for i in changed)
+    return f"{_SYNC_BEGIN}{body}{clear}{_SYNC_END}"
 
 
 def cmd_logs(args):
@@ -879,6 +930,9 @@ def main():
     p_watch = sub.add_parser(
         "watch", help="Live dashboard: every running job's generation/best "
                       "fitness updating in place, detail logs tailed below.")
+    p_watch.add_argument("--interval", type=float, default=5.0,
+                         help="Seconds between refreshes (default 5.0; raise it on a "
+                              "slower link; lower it for snappier updates).")
     p_watch.set_defaults(func=cmd_watch)
 
     args = parser.parse_args()

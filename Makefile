@@ -23,6 +23,7 @@ B        ?=
 EVOLVE_ARGS ?=
 HOST     ?=
 REMOTE   ?=
+WATCH_ARGS ?=
 SYNC_ARGS ?=
 
 .PHONY: help sync test test-cov lint lint-fix check \
@@ -112,7 +113,7 @@ queue-logs-running: ## Follow every currently running job's log at once, prefixe
 	$(QUEUE) logs -f --all-jobs
 
 queue-watch: ## Live dashboard: every running job's generation/best fitness updating in place, detail logs below
-	$(QUEUE) watch
+	$(QUEUE) watch $(WATCH_ARGS)
 
 queue-remove: ## Delete a job from the queue/history (needs ID=)
 	@test -n "$(ID)" || (echo "error: ID=<job id> is required" >&2; exit 1)
@@ -167,7 +168,7 @@ sync-exp-remote: ## Pull experiment_*/ from the remote, deleting local files abs
 queue-watch-remote: ## Live queue-watch dashboard of a remote host's own queue, read over ssh (needs HOST=<ssh alias> REMOTE=<path>)
 	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
 	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
-	ssh -t $(HOST) "cd '$(REMOTE)' && make queue-watch"
+	ssh -t -C -o ServerAliveInterval=15 -o ServerAliveCountMax=8 $(HOST) "cd '$(REMOTE)' && make queue-watch WATCH_ARGS='$(WATCH_ARGS)'"
 
 clean: ## Remove Python bytecode caches
 	find . -type d -name '__pycache__' -not -path './.venv/*' -prune -exec rm -rf {} +
