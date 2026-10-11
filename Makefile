@@ -165,10 +165,10 @@ sync-exp-remote: ## Pull experiment_*/ from the remote, deleting local files abs
 	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
 	scripts/sync-experiments.sh --pull --experiments-only --delete $(SYNC_ARGS) $(HOST) '$(REMOTE)'
 
-queue-watch-remote: ## Live queue-watch dashboard of a remote host's own queue, read over ssh (needs HOST=<ssh alias> REMOTE=<path>)
+queue-watch-remote: ## Live queue-watch dashboard of a remote host's own queue, read over ssh, reconnecting automatically if the link drops (needs HOST=<ssh alias> REMOTE=<path>)
 	@test -n "$(HOST)" || (echo "error: HOST=<Host alias from ~/.ssh/config> is required" >&2; exit 1)
 	@test -n "$(REMOTE)" || (echo "error: REMOTE=<remote project path> is required" >&2; exit 1)
-	ssh -t -C -o ServerAliveInterval=15 -o ServerAliveCountMax=8 $(HOST) "cd '$(REMOTE)' && make queue-watch WATCH_ARGS='$(WATCH_ARGS)'"
+	scripts/watch-remote.sh $(HOST) '$(REMOTE)' $(WATCH_ARGS)
 
 clean: ## Remove Python bytecode caches
 	find . -type d -name '__pycache__' -not -path './.venv/*' -prune -exec rm -rf {} +
