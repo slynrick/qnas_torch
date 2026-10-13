@@ -179,8 +179,13 @@ def load_best_networks_per_stage(gen_data, stage_ranges):
     return stages
 
 
-def load_retrain_results(experiment_path):
-    for path in glob.glob(os.path.join(experiment_path, "retrain_results_*.txt")):
+def load_retrain_results(experiment_path, config_code=None):
+    pattern = "retrain_results_*.txt" if config_code is None else f"retrain_results_{config_code}*.txt"
+    for path in glob.glob(os.path.join(experiment_path, pattern)):
+        name = os.path.basename(path)[len("retrain_results_"):-len(".txt")]
+        # "run1" must not pick up "run10"'s file: only <code>.txt or <code>_<lr_scheduler>.txt.
+        if config_code is not None and name != config_code and not name.startswith(f"{config_code}_"):
+            continue
         with open(path) as f:
             try:
                 return json.load(f)
@@ -242,14 +247,21 @@ def actual_running_time_seconds(gen_data, pause_factor=3.0):
     return sum(d for d in deltas if threshold is None or d <= threshold)
 
 
-def load_retrain_runs(experiment_path):
+def load_retrain_runs(experiment_path, config_code=None):
     """Per-repetition retrain accuracy/duration, read from retrain_*/ dirs
     (best_accuracy.txt + retraining_params.txt's t0/t1). Falls back to the
     legacy aggregate retrain_results_*.txt format if no per-run dirs exist.
+
+    config_code restricts both to one retrain protocol (retrain_<code>_<i>/ and
+    retrain_results_<code>*.txt), so an experiment retrained twice with different
+    -g codes doesn't mix the two sets of repetitions. None reads every retrain.
     """
+    run_dir_re = re.compile(rf"^retrain_{re.escape(config_code)}_\d+$") if config_code is not None else None
     runs = []
     for acc_path in sorted(glob.glob(os.path.join(experiment_path, "retrain_*", "best_accuracy.txt"))):
         run_dir = os.path.dirname(acc_path)
+        if run_dir_re is not None and not run_dir_re.match(os.path.basename(run_dir)):
+            continue
         try:
             accuracy = load_yaml(acc_path).get("best_accuracy")
         except Exception:
@@ -277,7 +289,7 @@ def load_retrain_runs(experiment_path):
     if runs:
         return runs
 
-    aggregate = load_retrain_results(experiment_path)
+    aggregate = load_retrain_results(experiment_path, config_code)
     if not aggregate:
         return []
     for run_name, res in aggregate.items():
@@ -668,13 +680,13 @@ def draw_stat_tiles(fig, gs_row, indiv_df, gen_data, search_time_s, retrain_runs
                 fontsize=8.5, color=MUTED)
 
 
-def generate_infographic(experiment_path, output_path):
+def generate_infographic(experiment_path, output_path, config_code=None):
     gen_data = load_generation_data(experiment_path)
     best_net = load_best_network(experiment_path, gen_data)
     indiv_df = load_individuals(experiment_path)
     stage_ranges = stage_generation_ranges(gen_data)
     stage_nets = load_best_networks_per_stage(gen_data, stage_ranges)
-    retrain_runs = load_retrain_runs(experiment_path)
+    retrain_runs = load_retrain_runs(experiment_path, config_code)
     run_config = load_run_config(experiment_path)
     search_time_s = actual_running_time_seconds(gen_data)
     cache_stats = load_cache_stats(experiment_path, gen_data)
@@ -711,9 +723,14 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_path", type=str, required=True,
                         help="Directory with the Q-NAS search (and optionally retrain) artifacts.")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output image path. Defaults to <experiment_path>/infographic.png.")
+                        help="Output image path. Defaults to <experiment_path>/infographic.png, "
+                             "or infographic_<config_code>.png when --config_code is given.")
+    parser.add_argument("--config_code", type=str, default=None,
+                        help="Only use the retrain repetitions of this config code (retrain_<code>_<i>/). "
+                             "Default: every retrain_*/ dir in the experiment.")
     args = parser.parse_args()
 
-    out = args.output or os.path.join(args.experiment_path, "infographic.png")
-    result_path = generate_infographic(args.experiment_path, out)
+    default_name = "infographic.png" if args.config_code is None else f"infographic_{args.config_code}.png"
+    out = args.output or os.path.join(args.experiment_path, default_name)
+    result_path = generate_infographic(args.experiment_path, out, args.config_code)
     print(f"Infographic saved to {result_path}")

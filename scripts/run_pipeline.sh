@@ -18,7 +18,10 @@
 #   -X  pass to enable population crossover (en_pop_crossover flag, no value)
 #
 # Optional (retrain):
-#   -g  config_code, used for output filenames (default: run1)
+#   -g  config_code, used for output filenames (default: run1). The infographic
+#       only uses this code's retrain_<code>_<i>/ repetitions and is written to
+#       infographic.png for run1, infographic_<code>.png otherwise, so retraining an
+#       experiment again with a new -g keeps the earlier retrains and infographic.
 #   -E  retrain max_epochs (default: 300)
 #   -R  retrain num_repetitions (default: 1)
 #   -L  retrain lr_scheduler: cosine|reduce_on_plateau|exponential|multistep|None (default: None)
@@ -132,7 +135,12 @@ fi
 
 if should_run "infographic"; then
     echo "=== [3/3] Infographic: ${experiment_path} ==="
-    uv run python "${SRC_DIR}/generate_infographic.py" --experiment_path "$experiment_path"
+    infographic_name="infographic.png"
+    [[ "$config_code" != "run1" ]] && infographic_name="infographic_${config_code}.png"
+    uv run python "${SRC_DIR}/generate_infographic.py" \
+        --experiment_path "$experiment_path" \
+        --config_code "$config_code" \
+        --output "${experiment_path}/${infographic_name}"
 else
     echo "=== [3/3] Infographic: skipped ==="
 fi
