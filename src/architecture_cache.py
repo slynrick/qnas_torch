@@ -88,12 +88,17 @@ class ArchitectureCache:
                 fcntl.flock(f, fcntl.LOCK_UN)
         return result
 
-    def find_cached_result(self, net_list: List[str]) -> Optional[dict]:
+    def find_cached_result(self, net_list: List[str],
+                           protocol: Optional[str] = None) -> Optional[dict]:
         """Return the cached result for this exact architecture, or None if unseen.
         On a hit, atomically increments that entry's hit_count in the cache.
 
         Args:
             net_list: decoded network (list of op names) for the candidate individual.
+            protocol: fitness-proxy signature (plan v2, D2 - see
+                evaluation.cache_protocol); None is the original proxy. An entry only
+                matches the protocol it was registered with, and entries written before
+                protocols existed (no 'protocol' key) count as None.
 
         Returns:
             {"fitness", "params_m", "inference_us", "hit_count"} if this exact
@@ -103,6 +108,8 @@ class ArchitectureCache:
 
         def mutate(index):
             entry = index.get(key)
+            if entry is not None and entry.get("protocol") != protocol:
+                return None
             if entry is not None:
                 entry["hit_count"] = entry.get("hit_count", 0) + 1
                 index[key] = entry
@@ -111,7 +118,7 @@ class ArchitectureCache:
         return self._locked_read_modify_write(mutate)
 
     def register(self, net_list: List[str], fitness: float, params_m: float,
-                 inference_us: float):
+                 inference_us: float, protocol: Optional[str] = None):
         """Register an evaluated architecture's result in the cache, merging with
         whatever other worker processes have already written (locked read-modify-write
         of the shared cache.json - safe to call concurrently from multiple processes).
@@ -120,6 +127,10 @@ class ArchitectureCache:
         A diverged individual can produce a non-finite fitness (NaN/Inf); orjson (unlike
         stdlib json) raises on those instead of silently writing the literal, so they are
         stored as None here rather than crashing the write.
+
+        *protocol* (see find_cached_result) is stored only when set, so the original
+        proxy keeps writing exactly the entries it always wrote. One entry per
+        architecture: registering under another protocol replaces it.
         """
         key = net_list_signature(net_list)
 
@@ -131,5 +142,7 @@ class ArchitectureCache:
                 "inference_us": _finite_or_none(inference_us),
                 "hit_count": existing.get("hit_count", 0),
             }
+            if protocol is not None:
+                index[key]["protocol"] = protocol
 
         self._locked_read_modify_write(mutate)

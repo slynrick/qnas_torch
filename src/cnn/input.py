@@ -295,6 +295,10 @@ class GenericDataLoader:
       if self.params['limit_data'] and self.params['limit_data_value'] < num_train:
         train_samples = (int(self.train_split * self.params['limit_data_value'])) 
         val_samples = (int(self.params['limit_data_value'] - train_samples))
+        # train.limit_val_value (plan v2, D2): a bigger, less noisy validation set without
+        # touching the training subset - validation indices come from val_idx only.
+        if self.params.get('limit_val_value'):
+          val_samples = min(int(self.params['limit_val_value']), len(val_idx))
         
         train_count_per_class = train_samples // self.num_classes
         val_count_per_class = val_samples // self.num_classes

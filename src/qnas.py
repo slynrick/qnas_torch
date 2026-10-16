@@ -12,6 +12,7 @@ from pickle import dump, load, HIGHEST_PROTOCOL, UnpicklingError
 import numpy as np
 import time
 
+import surrogate
 from population import QPopulationNetwork, QPopulationParams
 from util import delete_old_dirs, init_log, load_pkl, calculate_time
 
@@ -96,6 +97,21 @@ class QNAS(object):
         # (i.e. did NOT hit the architecture cache) - see eval_pop().
         self.new_architectures_count = 0
 
+        # Options of docs/QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN_V2.md - see initialize_qnas().
+        # All off by default (the original search).
+        self.surrogate_enabled = False
+        self.surrogate_rng = None
+        self.sampling_tau0 = None
+        self.niche_max_age = None
+        self.niche_restart_patience = None
+        self.niche_restart_kl = None
+        self.niche_best = None              # best fitness ever produced by each niche
+        self.niche_last_improve = None      # generation of that best
+        self.fidelity_enabled = False
+        self.selection_capacity_lambda = 0.0
+        self._stage_start_gen = 0           # generation at which the current stage began
+        self.last_screening = None          # (pool size, evaluated, tau) of the last screening
+
     def initialize_qnas(self, num_quantum_ind, params_ranges, repetition, max_generations,
                         crossover_rate, update_quantum_gen, replace_method, fn_list,
                         initial_probs, update_quantum_rate, max_num_nodes, reducing_fns_list,
@@ -113,7 +129,16 @@ class QNAS(object):
                         quantum_rank_weighting='uniform', quantum_top_k=1,
                         quantum_negative_lr=0.0, quantum_prob_floor=0.0,
                         quantum_max_update=0.05, quantum_max_prob=0.99,
-                        prune_criterion='pmf'):
+                        prune_criterion='pmf', surrogate_enabled=False,
+                        surrogate_oversample=1, surrogate_n_eval=None,
+                        surrogate_warmup_evals=200, surrogate_tau0=1.0, surrogate_tau_min=0.1,
+                        surrogate_tau_decay_gens=20, surrogate_beta=0.5,
+                        surrogate_random_frac=0.2, surrogate_ensemble=5,
+                        surrogate_ridge_lambda=3.0, surrogate_seed=0, sampling_tau0=None,
+                        sampling_tau_min=0.3, sampling_tau_decay_gens=30, niche_max_age=None,
+                        niche_restart_patience=None, niche_restart_kl=None,
+                        fidelity_enabled=False, fidelity_low_epochs=10, fidelity_oversample=2,
+                        selection_capacity_lambda=0.0):
 
         """ Initialize algorithm with several parameter values.
 
@@ -214,7 +239,27 @@ class QNAS(object):
                 'lift' - mean probability divided by its value at the start of the
                 stage, so ops with a large prior (pooling, no_op) don't survive on the
                 prior alone; 'empirical' - mean fitness percentile of the individuals
-                evaluated in the stage that used the op at that node.
+                evaluated in the stage that used the op at that node; 'surrogate' - the
+                op's coefficient in a ridge-ensemble fit of the stage's evaluations (its
+                marginal effect on fitness, controlling for the other nodes).
+
+            The remaining arguments are the options of
+            docs/QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN_V2.md (defaults in
+            src/option_defaults.py; every default is the original search):
+            surrogate_*: D1, surrogate-assisted screening - each generation samples
+                surrogate_oversample x surrogate_n_eval candidates and trains only
+                surrogate_n_eval of them, picked by Boltzmann sampling on a ridge-ensemble
+                prediction (see generate_classical / src/surrogate.py).
+            sampling_tau0 / sampling_tau_min / sampling_tau_decay_gens: D3, temperature of
+                the PMF sampling, annealed within each stage.
+            niche_max_age / niche_restart_patience / niche_restart_kl: D4, used with
+                replace_method 'niche' (one quota of the classical population per quantum
+                individual's lineage).
+            fidelity_enabled / fidelity_low_epochs / fidelity_oversample: D2, two-rung
+                evaluation - fidelity_oversample x the evaluated individuals train for
+                fidelity_low_epochs, and only the best continue to the full budget.
+            selection_capacity_lambda: D2, adds lambda * log(params in millions) to the
+                fitness used for selection (the raw fitness is unchanged).
         """
 
         self.generations = max_generations
@@ -225,6 +270,18 @@ class QNAS(object):
         self._set_update_and_prune_options(
             quantum_lr, quantum_rank_weighting, quantum_top_k, quantum_negative_lr,
             quantum_prob_floor, quantum_max_prob, prune_criterion, progressive_mode)
+        self._set_v2_options(
+            num_quantum_ind, repetition, replace_method, progressive_mode,
+            dict(enabled=surrogate_enabled, oversample=surrogate_oversample,
+                 n_eval=surrogate_n_eval, warmup_evals=surrogate_warmup_evals,
+                 tau0=surrogate_tau0, tau_min=surrogate_tau_min,
+                 tau_decay_gens=surrogate_tau_decay_gens, beta=surrogate_beta,
+                 random_frac=surrogate_random_frac, ensemble=surrogate_ensemble,
+                 ridge_lambda=surrogate_ridge_lambda, seed=surrogate_seed),
+            sampling_tau0, sampling_tau_min, sampling_tau_decay_gens,
+            niche_max_age, niche_restart_patience, niche_restart_kl,
+            fidelity_enabled, fidelity_low_epochs, fidelity_oversample,
+            selection_capacity_lambda)
         self.penalize_number = penalize_number
         self.patience = patience
         self.early_stopping = early_stopping
@@ -308,6 +365,85 @@ class QNAS(object):
         if self.progressive_mode == 'dynamic':
             self._init_stability_streaks()
         self._snapshot_stage_start_probs()
+        self.niche_best = np.full(num_quantum_ind, -np.inf)
+        self.niche_last_improve = np.zeros(num_quantum_ind, dtype=np.int64)
+
+    REPLACE_METHODS = ('best', 'elitism', 'niche')
+
+    def _set_v2_options(self, num_quantum_ind, repetition, replace_method, progressive_mode,
+                        surrogate, sampling_tau0, sampling_tau_min, sampling_tau_decay_gens,
+                        niche_max_age, niche_restart_patience, niche_restart_kl,
+                        fidelity_enabled, fidelity_low_epochs, fidelity_oversample,
+                        selection_capacity_lambda):
+        """ Validate and store the options of docs/QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN_V2.md. """
+        if replace_method not in self.REPLACE_METHODS:
+            raise ValueError(f"replace_method must be one of {self.REPLACE_METHODS}, "
+                             f"got {replace_method!r}")
+        num_classic = num_quantum_ind * repetition
+
+        if surrogate['enabled']:
+            if progressive_mode == 'dynamic':
+                raise ValueError("surrogate screening is not supported with progressive "
+                                 "mode 'dynamic'.")
+            if int(surrogate['oversample']) < 1:
+                raise ValueError("surrogate oversample must be >= 1.")
+            if surrogate['n_eval'] is not None and not \
+                    num_quantum_ind <= surrogate['n_eval'] <= num_classic:
+                raise ValueError("surrogate n_eval must be between num_quantum_ind and "
+                                 "num_quantum_ind * repetition.")
+            if surrogate['tau0'] <= 0 or surrogate['tau_min'] <= 0:
+                raise ValueError("surrogate tau0 and tau_min must be > 0.")
+            if surrogate['tau_decay_gens'] <= 0:
+                raise ValueError("surrogate tau_decay_gens must be > 0.")
+            if not 0.0 <= surrogate['random_frac'] <= 1.0:
+                raise ValueError("surrogate random_frac must be in [0, 1].")
+            if surrogate['warmup_evals'] < 0 or surrogate['ensemble'] < 1:
+                raise ValueError("surrogate warmup_evals must be >= 0 and ensemble >= 1.")
+        self.surrogate_enabled = bool(surrogate['enabled'])
+        self.surrogate_oversample = int(surrogate['oversample'])
+        self.surrogate_n_eval = surrogate['n_eval']
+        self.surrogate_warmup_evals = surrogate['warmup_evals']
+        self.surrogate_tau0 = surrogate['tau0']
+        self.surrogate_tau_min = surrogate['tau_min']
+        self.surrogate_tau_decay_gens = surrogate['tau_decay_gens']
+        self.surrogate_beta = surrogate['beta']
+        self.surrogate_random_frac = surrogate['random_frac']
+        self.surrogate_ensemble = surrogate['ensemble']
+        self.surrogate_ridge_lambda = surrogate['ridge_lambda']
+        # Own RNG: screening must never draw from the global numpy RNG that the rest of
+        # the search consumes.
+        self.surrogate_rng = np.random.default_rng(surrogate['seed'])
+
+        if sampling_tau0 is not None and (sampling_tau0 <= 0 or sampling_tau_min <= 0
+                                          or sampling_tau_decay_gens <= 0):
+            raise ValueError("sampling_temperature tau0, tau_min and tau_decay_gens must be > 0.")
+        self.sampling_tau0 = sampling_tau0
+        self.sampling_tau_min = sampling_tau_min
+        self.sampling_tau_decay_gens = sampling_tau_decay_gens
+
+        niche_opts = (niche_max_age, niche_restart_patience, niche_restart_kl)
+        if replace_method != 'niche' and any(v is not None for v in niche_opts):
+            raise ValueError("niche max_age / restart_patience / restart_kl require "
+                             "replace_method: niche.")
+        if niche_max_age is not None and niche_max_age < 1:
+            raise ValueError("niche max_age must be >= 1.")
+        if niche_restart_patience is not None and niche_restart_patience < 1:
+            raise ValueError("niche restart_patience must be >= 1.")
+        if niche_restart_kl is not None and niche_restart_kl <= 0:
+            raise ValueError("niche restart_kl must be > 0.")
+        self.niche_max_age = niche_max_age
+        self.niche_restart_patience = niche_restart_patience
+        self.niche_restart_kl = niche_restart_kl
+
+        if fidelity_enabled and (int(fidelity_oversample) < 1 or fidelity_low_epochs < 1):
+            raise ValueError("fidelity oversample and low_epochs must be >= 1.")
+        self.fidelity_enabled = bool(fidelity_enabled)
+        self.fidelity_low_epochs = fidelity_low_epochs
+        self.fidelity_oversample = int(fidelity_oversample)
+
+        if selection_capacity_lambda < 0:
+            raise ValueError("selection_capacity_lambda must be >= 0.")
+        self.selection_capacity_lambda = float(selection_capacity_lambda)
 
     def replace_pop(self, new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
                     new_ancestor=None):
@@ -335,6 +471,8 @@ class QNAS(object):
         if new_ancestor is None:
             new_ancestor = np.arange(new_fitnesses.shape[0]) % self.qpop_net.num_ind
         new_ancestor = new_ancestor.astype(np.int64)
+        if self.replace_method == 'niche':
+            self._track_niche_progress(new_fitnesses, new_ancestor)
 
         if self.current_gen == 0 or (self._just_transitioned and self.qpop_net.current_pop is None):
             # In the 1st generation, and right after a progressive-stage transition that
@@ -379,7 +517,9 @@ class QNAS(object):
                                                     select_new,
                                                     extra=[new_ancestor])
                 selected = range(1)
-            elif self.replace_method == 'best':
+            elif self.replace_method in ('best', 'niche'):
+                # 'niche' keeps every old individual here too; the per-lineage quotas are
+                # applied to the union below (_niche_selection).
                 selected = range(self.fitnesses.shape[0])
 
             # Concatenate populations
@@ -403,13 +543,23 @@ class QNAS(object):
 
         # Order the population based on fitness
         num_classic = self.qpop_params.num_ind * self.qpop_params.repetition
+        if self.replace_method == 'niche':
+            keep = self._niche_selection(num_classic)
+            self.fitnesses = self.fitnesses[keep]
+            self.raw_fitnesses = self.raw_fitnesses[keep]
+            self.qpop_params.current_pop = self.qpop_params.current_pop[keep]
+            self.qpop_net.current_pop = self.qpop_net.current_pop[keep]
+            self.classic_age = self.classic_age[keep]
+            self.classic_ancestor = self.classic_ancestor[keep]
         self.fitnesses, self.raw_fitnesses, self.qpop_params.current_pop, \
             self.qpop_net.current_pop, (self.classic_age, self.classic_ancestor) = \
             self.order_pop(self.fitnesses,
                             self.raw_fitnesses,
                             self.qpop_params.current_pop,
                             self.qpop_net.current_pop,
-                            selection=range(num_classic),
+                            # the population can start below num_classic when fewer
+                            # individuals are evaluated per generation (surrogate n_eval)
+                            selection=range(min(num_classic, self.fitnesses.shape[0])),
                             extra=[self.classic_age, self.classic_ancestor])
 
         # self.fitnesses[0] is normally the best-ever individual (elitism/best always
@@ -453,6 +603,79 @@ class QNAS(object):
 
         return fitnesses, raw_fitnesses, pop_params, pop_net
 
+    def _niche_selection(self, num_classic):
+        """ replace_method 'niche' (plan v2, D4): row indices of the union population to keep.
+
+        Each quantum individual's lineage (classic_ancestor) gets num_classic // num_ind
+        slots, filled with its best members; free slots (a lineage short of members) go to
+        the best remaining individuals of any lineage. With niche_max_age, individuals that
+        survived more than that many generations are only used once nobody else is left -
+        except the best individual of the union, which is always kept.
+        """
+        fit = np.nan_to_num(np.asarray(self.fitnesses, dtype=np.float64), nan=-np.inf)
+        n = fit.shape[0]
+        if n <= num_classic and self.niche_max_age is None:
+            return np.arange(n)
+        num_ind = self.qpop_net.num_ind
+        eligible = np.ones(n, dtype=bool)
+        if self.niche_max_age is not None:
+            eligible = self.classic_age <= self.niche_max_age
+            eligible[int(np.argmax(fit))] = True
+
+        quota = num_classic // num_ind
+        keep = []
+        for q in range(num_ind):
+            members = np.where(eligible & (self.classic_ancestor == q))[0]
+            keep.extend(members[np.argsort(-fit[members], kind='stable')][:quota].tolist())
+        taken = np.zeros(n, dtype=bool)
+        taken[keep] = True
+        for pool in (eligible & ~taken, ~eligible & ~taken):
+            if len(keep) >= num_classic:
+                break
+            rest = np.where(pool)[0]
+            rest = rest[np.argsort(-fit[rest], kind='stable')]
+            keep.extend(rest[:num_classic - len(keep)].tolist())
+        return np.array(sorted(keep), dtype=np.int64)
+
+    def _track_niche_progress(self, new_fitnesses, new_ancestor):
+        """ Record each niche's best fitness and when it last improved (niche restarts). """
+        fit = np.nan_to_num(np.asarray(new_fitnesses, dtype=np.float64), nan=-np.inf)
+        for q in np.unique(new_ancestor):
+            best = fit[new_ancestor == q].max()
+            if best > self.niche_best[q] + self.tolerance:
+                self.niche_best[q] = best
+                self.niche_last_improve[q] = self.current_gen
+
+    def _maybe_restart_niches(self):
+        """ replace_method 'niche' (plan v2, D4): reset a quantum individual's PMF to uniform
+            when its niche stalls (no improvement for niche_restart_patience generations)
+            or collapses onto the best niche (mean KL to it below niche_restart_kl) - the
+            per-stage reset that helped in the experiments, applied to one niche at a time.
+            The niche holding the best fitness is never restarted. """
+        if self.replace_method != 'niche' or (self.niche_restart_patience is None
+                                              and self.niche_restart_kl is None):
+            return
+        best_niche = int(np.argmax(self.niche_best))
+        for q in range(self.qpop_net.num_ind):
+            if q == best_niche:
+                continue
+            stalled = (self.niche_restart_patience is not None
+                       and self.current_gen - self.niche_last_improve[q] >= self.niche_restart_patience)
+            collapsed = False
+            if self.niche_restart_kl is not None:
+                kls = []
+                for probs in self.qpop_net.probabilities:
+                    p = np.clip(probs[q], 1e-12, None)
+                    r = np.clip(probs[best_niche], 1e-12, None)
+                    kls.append(float((p * (np.log(p) - np.log(r))).sum()))
+                collapsed = float(np.mean(kls)) < self.niche_restart_kl
+            if stalled or collapsed:
+                for probs in self.qpop_net.probabilities:
+                    probs[q] = 1.0 / probs.shape[1]
+                self.niche_last_improve[q] = self.current_gen
+                self.logger.info(f"Niche restart: quantum individual {q} reset to uniform "
+                                 f"({'stalled' if stalled else 'collapsed onto niche ' + str(best_niche)}).")
+
     def update_best_id(self, new_fitnesses):
         """ Checks if the new population contains the best individual so far and updates
             *self.best_so_far_id*.
@@ -475,7 +698,29 @@ class QNAS(object):
 
         # Generate distance for crossover and quantum updates every generation
         self.random = np.random.rand()
+        self.qpop_net.sampling_tau = self._sampling_tau()
 
+        if self.surrogate_enabled or self.fidelity_enabled:
+            new_pop_params, new_pop_net, new_ancestor, new_fitnesses, raw_fitnesses = \
+                self._generate_screened()
+            self._record_stage_evaluations(new_pop_net, new_fitnesses)
+            self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
+                             new_ancestor)
+            return
+
+        new_pop_params, new_pop_net, new_ancestor = self._sample_block()
+
+        self.logger.info("new population created =%s", new_pop_net)
+        new_fitnesses, raw_fitnesses = self.eval_pop(new_pop_params, new_pop_net)
+        self._record_stage_evaluations(new_pop_net, new_fitnesses)
+
+        self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
+                        new_ancestor)
+
+    def _sample_block(self):
+        """ One classical population (num_ind x repetition rows) observed from the quantum
+            populations, with the hyperparameter and population crossovers - the original
+            generate_classical() body. Returns (params, net, ancestor). """
         # Generate classical pop for hyperparameters
         new_pop_params = self.qpop_params.generate_classical()
         if self.current_gen > 0:
@@ -504,14 +749,113 @@ class QNAS(object):
                     best_current_pop, new_pop_net[:num_offspring]
                 )
 
-        self.logger.info("new population created =%s", new_pop_net)
-        new_fitnesses, raw_fitnesses = self.eval_pop(new_pop_params, new_pop_net)
-        if self.prune_criterion == 'empirical':
-            self._stage_eval_net.append(np.array(new_pop_net))
-            self._stage_eval_fit.append(np.array(new_fitnesses, dtype=np.float64))
+        return new_pop_params, new_pop_net, new_ancestor
 
-        self.replace_pop(new_pop_params, new_pop_net, new_fitnesses, raw_fitnesses,
-                        new_ancestor)
+    def _record_stage_evaluations(self, pop_net, fitnesses):
+        """ Keep the current stage's evaluations in memory for the criteria/screening that
+            learn from them ('empirical' / 'surrogate' pruning, surrogate screening). """
+        if self.prune_criterion in ('empirical', 'surrogate') or self.surrogate_enabled:
+            self._stage_eval_net.append(np.array(pop_net))
+            self._stage_eval_fit.append(np.array(fitnesses, dtype=np.float64))
+
+    def _stage_training_data(self):
+        """ (net, fitness) of every finite evaluation of the current stage: the in-memory
+            record, or cache.json after a resume. (None, None) if there is none. """
+        if self._stage_eval_net:
+            net = np.concatenate(self._stage_eval_net)
+            fit = np.concatenate(self._stage_eval_fit)
+        else:
+            net, fit = self._stage_evaluations_from_cache()
+        if net is None:
+            return None, None
+        finite = np.isfinite(fit)
+        return net[finite], fit[finite]
+
+    def _gens_in_stage(self):
+        return max(0, self.current_gen - self._stage_start_gen)
+
+    def _sampling_tau(self):
+        """ D3: temperature of this generation's PMF sampling (1.0 = unchanged PMF). """
+        if self.sampling_tau0 is None:
+            return 1.0
+        return max(self.sampling_tau_min,
+                   self.sampling_tau0 / (1.0 + self._gens_in_stage() / self.sampling_tau_decay_gens))
+
+    def _surrogate_tau(self):
+        return max(self.surrogate_tau_min,
+                   self.surrogate_tau0 / (1.0 + self._gens_in_stage() / self.surrogate_tau_decay_gens))
+
+    def _generate_screened(self):
+        """ Plan v2, D1 + D2: build a candidate pool by repeating the original sampling,
+            keep n_eval of them (surrogate screening, once the stage has
+            surrogate_warmup_evals evaluations) and evaluate - in two fidelity rungs when
+            fidelity is enabled. Returns (params, net, ancestor, fitness, raw_fitness) of
+            the individuals that get a final fitness. """
+        num_classic = self.qpop_net.num_ind * self.qpop_net.repetition
+        n_eval = (self.surrogate_n_eval or num_classic) if self.surrogate_enabled else num_classic
+        n_rung = n_eval * (self.fidelity_oversample if self.fidelity_enabled else 1)
+
+        train_net = train_fit = None
+        screening = False
+        if self.surrogate_enabled:
+            train_net, train_fit = self._stage_training_data()
+            screening = train_net is not None and train_net.shape[0] >= self.surrogate_warmup_evals
+        pool_size = n_rung * (self.surrogate_oversample if screening else 1)
+
+        blocks = [self._sample_block() for _ in range(int(np.ceil(pool_size / num_classic)))]
+        params = np.concatenate([b[0] for b in blocks])
+        net = np.concatenate([b[1] for b in blocks])
+        anc = np.concatenate([b[2] for b in blocks])
+        params, net, anc = self._dedupe_pool(params, net, anc, train_net, pool_size)
+
+        if screening and net.shape[0] > n_rung:
+            tau = self._surrogate_tau()
+            idx, _ = surrogate.screen(
+                net, self.qpop_net.chromosome.num_functions, train_net, train_fit, n_rung,
+                tau, self.surrogate_beta, self.surrogate_random_frac, self.surrogate_rng,
+                num_models=self.surrogate_ensemble, ridge_lambda=self.surrogate_ridge_lambda)
+            idx = np.sort(idx)
+            self.last_screening = (int(net.shape[0]), int(idx.shape[0]), tau)
+        else:
+            idx = np.arange(min(n_rung, net.shape[0]))
+            self.last_screening = None
+        params, net, anc = params[idx], net[idx], anc[idx]
+
+        self.logger.info("new population created =%s", net)
+        if not self.fidelity_enabled:
+            fit, raw = self.eval_pop(params, net)
+            return params, net, anc, fit, raw
+
+        # Cheap rung for everyone (folders gen_<offset + i>, cleaned at the end of the
+        # generation), then the best n_eval resume from their checkpoint to the full budget
+        # in folders gen_0..gen_<n_eval - 1>, so best_so_far_id names a real folder.
+        low_fit, _ = self.eval_pop(params, net, fidelity_rung='low',
+                                   fidelity_epochs=self.fidelity_low_epochs,
+                                   id_offset=self.FIDELITY_ID_OFFSET)
+        order = np.argsort(-np.nan_to_num(low_fit, nan=-np.inf), kind='stable')
+        keep = np.sort(order[:n_eval])
+        self.logger.info(f"Fidelity: {net.shape[0]} individuals trained for "
+                         f"{self.fidelity_low_epochs} epochs, {keep.shape[0]} continue.")
+        fit, raw = self.eval_pop(params[keep], net[keep], fidelity_rung='resume',
+                                 resume_ids=[self.FIDELITY_ID_OFFSET + int(i) for i in keep])
+        return params[keep], net[keep], anc[keep], fit, raw
+
+    # Folder offset of the cheap fidelity rung (gen_1000, gen_1001, ...).
+    FIDELITY_ID_OFFSET = 1000
+
+    @staticmethod
+    def _dedupe_pool(params, net, anc, seen_net, needed):
+        """ Order the pool so architectures that are new to the stage come first, then
+            repeats (of the pool itself or of the stage's evaluations); repeats are dropped
+            when there are at least *needed* new ones. """
+        seen = set() if seen_net is None else {tuple(r) for r in seen_net}
+        in_pool = set()
+        fresh, repeated = [], []
+        for i, row in enumerate(map(tuple, net)):
+            (repeated if row in in_pool or row in seen else fresh).append(i)
+            in_pool.add(row)
+        order = np.array(fresh if len(fresh) >= needed else fresh + repeated, dtype=np.int64)
+        return params[order], net[order], anc[order]
 
     def decode_pop(self, pop_params, pop_net):
         """ Decode a population of parameters and networks.
@@ -535,12 +879,15 @@ class QNAS(object):
 
         return decoded_params, decoded_nets
 
-    def eval_pop(self, pop_params, pop_net):
+    def eval_pop(self, pop_params, pop_net, **fidelity_kwargs):
         """ Decode and evaluate a population of networks and hyperparameters.
 
         Args:
             pop_params: float numpy array with a classic population of hyperparameters.
             pop_net: int ndarray of operation indices.
+            fidelity_kwargs: two-rung evaluation only (plan v2, D2) - fidelity_rung
+                ('low' or 'resume'), fidelity_epochs, id_offset, resume_ids; forwarded to
+                eval_func. Not passed at all on the original path.
 
         Returns:
             (penalized_fitnesses, raw_fitnesses)
@@ -551,6 +898,7 @@ class QNAS(object):
         fitnesses, cache_hits = self.eval_func(
             decoded_params, decoded_nets,
             generation=self.current_gen,
+            **fidelity_kwargs,
         )
         # "New architecture discovered" = did NOT hit the fitness cache this
         # generation, i.e. it was actually trained (see architecture_cache.py).
@@ -560,6 +908,17 @@ class QNAS(object):
         if self.penalize_number:
             penalties = self.get_penalties(pop_net)
             penalized_fitnesses -= penalties
+
+        if self.selection_capacity_lambda:
+            # Plan v2, D2: the retrain rewards capacity that the short search proxy does
+            # not see - bias selection (never the reported raw fitness) toward bigger nets.
+            params_m = getattr(self.eval_func, 'last_params_m', None)
+            if params_m is None or len(params_m) != len(penalized_fitnesses):
+                raise RuntimeError("selection_capacity_lambda needs an evaluator that "
+                                   "exposes last_params_m (EvalPopulation does).")
+            penalized_fitnesses += self.selection_capacity_lambda * np.log(
+                np.clip(np.nan_to_num(np.asarray(params_m, dtype=np.float64), nan=1e-3),
+                        1e-3, None))
 
         # Update the total evaluation counter
         self.total_eval = self.total_eval + np.size(pop_params, axis=0)
@@ -619,12 +978,22 @@ class QNAS(object):
             )
 
         entropy, kl = self._pmf_stats()
+        v2_lines = ''
+        if self.qpop_net.sampling_tau != 1.0:
+            v2_lines += f'- Sampling temperature: {self.qpop_net.sampling_tau:.4f}\n'
+        if self.last_screening is not None:
+            pool, kept, tau = self.last_screening
+            v2_lines += f'- Surrogate screening: {kept}/{pool} candidates evaluated (tau={tau:.4f})\n'
+        gpu_seconds = getattr(self.eval_func, 'gpu_seconds_total', None)
+        if gpu_seconds:
+            v2_lines += f'- GPU time so far: {gpu_seconds / 3600:.2f} h\n'
         self.logger.info(f'New generation finished running!\n'
                         f'- Generation: {self.current_gen}\n'
                         f'{stage_line}'
                         f'- New architectures discovered: {self.new_architectures_count}\n'
                         f'- PMF: normalized entropy={entropy:.4f}, '
                         f'KL to stage start={kl:.4f}\n'
+                        f'{v2_lines}'
                         f'- Best so far: {self.best_so_far_id} --> {self.best_so_far:.5f}\n'
                         f'- Fitnesses: {self.fitnesses}\n'
                         f'- Fitnesses without penalties: {self.raw_fitnesses}\n')
@@ -656,7 +1025,14 @@ class QNAS(object):
                  'classic_ancestor': self.classic_ancestor,
                  # Per-node mean PMF at the start of the current stage ('lift' pruning
                  # reference, restored on resume) and how far the PMF has moved.
-                 'stage_start_probs': self._stage_start_probs}
+                 'stage_start_probs': self._stage_start_probs,
+                 # Plan v2 state (absent from older checkpoints; read back with .get()).
+                 'stage_start_gen': self._stage_start_gen,
+                 'niche_best': self.niche_best,
+                 'niche_last_improve': self.niche_last_improve,
+                 'sampling_tau': self.qpop_net.sampling_tau,
+                 'screening': self.last_screening,
+                 'gpu_seconds': getattr(self.eval_func, 'gpu_seconds_total', None)}
         entry['pmf_entropy'], entry['pmf_kl_stage_start'] = self._pmf_stats()
 
         if self.progressive_stages:
@@ -819,6 +1195,20 @@ class QNAS(object):
         self._stage_eval_net = []
         self._stage_eval_fit = []
 
+        # Plan v2 state. Checkpoints that predate it: the stage's first generation comes from
+        # the stage list (deterministic) or is unknown (0); niche records restart empty.
+        stage_start_gen = log_data.get('stage_start_gen')
+        if stage_start_gen is None:
+            stage_start_gen = (self.progressive_stages[self.current_stage_idx]['gen_start']
+                               if self.progressive_stages else 0)
+        self._stage_start_gen = stage_start_gen
+        if log_data.get('niche_best') is not None:
+            self.niche_best = np.array(log_data['niche_best'], dtype=np.float64)
+            self.niche_last_improve = np.array(log_data['niche_last_improve'], dtype=np.int64)
+        gpu_seconds = log_data.get('gpu_seconds')
+        if gpu_seconds is not None and hasattr(self.eval_func, 'gpu_seconds_total'):
+            self.eval_func.gpu_seconds_total = gpu_seconds
+
     def check_early_stopping(self):
         """
         Compute the early stopping of the evolution. If the best fitness does not improve 
@@ -884,7 +1274,7 @@ class QNAS(object):
                 self.qpop_net.update_quantum(intensity=self.random)
     
     RANK_WEIGHTINGS = ('uniform', 'linear', 'nes')
-    PRUNE_CRITERIA = ('pmf', 'lift', 'empirical')
+    PRUNE_CRITERIA = ('pmf', 'lift', 'empirical', 'surrogate')
     # Pseudo-count pulling an op's empirical score toward the neutral 0.5 percentile, so
     # an op seen in only a couple of individuals can't win (or lose) the prune on luck.
     EMPIRICAL_PRIOR_COUNT = 5
@@ -918,7 +1308,7 @@ class QNAS(object):
                              f"got {prune_criterion!r}")
         if prune_criterion != 'pmf' and progressive_mode == 'dynamic':
             raise ValueError(
-                "prune_criterion 'lift'/'empirical' is only supported in deterministic "
+                "prune_criterion 'lift'/'empirical'/'surrogate' is only supported in deterministic "
                 "progressive mode - dynamic nucleus pruning thresholds cumulative "
                 "probability mass, which these scores are not."
             )
@@ -982,6 +1372,7 @@ class QNAS(object):
         self._stage_start_probs = [p.mean(axis=0).copy() for p in self.qpop_net.probabilities]
         self._stage_eval_net = []
         self._stage_eval_fit = []
+        self._stage_start_gen = self.current_gen
 
     def _reconstruct_stage_start_probs(self):
         """ Best guess of the stage-start PMF for a checkpoint that predates its recording:
@@ -1017,6 +1408,13 @@ class QNAS(object):
             or None for the original 'pmf' criterion (the caller keeps its own mean). """
         if self.prune_criterion == 'pmf':
             return None
+        if self.prune_criterion == 'surrogate':
+            scores = self._surrogate_op_scores()
+            if scores is not None:
+                return scores
+            self.logger.warning(
+                "Op pruning: too few evaluations of this stage for the surrogate - ranking by 'lift'."
+            )
         if self.prune_criterion == 'empirical':
             scores = self._empirical_op_scores()
             if scores is not None:
@@ -1075,6 +1473,24 @@ class QNAS(object):
             scores.append((sums + 0.5 * prior) / (counts + prior))
         return scores
 
+    def _surrogate_op_scores(self):
+        """ Score of op k at node i = its coefficient in a ridge-ensemble fit of the stage's
+            evaluations (plan v2, D1/D3): the op's marginal effect on fitness with the other
+            nodes accounted for, unlike 'empirical', which averages over whatever those other
+            nodes happened to be. None with fewer than 2 finite evaluations. """
+        net, fit = self._stage_training_data()
+        if net is None or net.shape[0] < 2:
+            return None
+        num_functions = self.qpop_net.chromosome.num_functions
+        model = surrogate.RidgeEnsembleSurrogate(
+            num_models=self.surrogate_ensemble if self.surrogate_enabled else 5,
+            ridge_lambda=self.surrogate_ridge_lambda if self.surrogate_enabled else 3.0,
+            rng=np.random.default_rng(0))
+        model.fit(surrogate.one_hot(net, num_functions), fit)
+        if not model.fitted:
+            return None
+        return model.op_effects(num_functions)
+
     def _stage_evaluations_from_cache(self):
         """ (net, fitness) of every cached architecture that fits the current depth and
             per-node op menus - the current stage's evaluations when resuming. Cached
@@ -1105,6 +1521,7 @@ class QNAS(object):
         """
 
         self.update_quantum()
+        self._maybe_restart_niches()
 
         self.save_data()
         self.log_data()

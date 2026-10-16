@@ -24,6 +24,8 @@ from util import create_info_file, init_log, load_yaml
 
 
 TRAIN_TIMEOUT = 5400
+# Model + optimizer state saved by the cheap fidelity rung (plan v2, D2).
+FIDELITY_CHECKPOINT = 'fidelity_ckpt.pth'
 
 # Console output always on (also how individual training progress reaches the
 # terminal live - see the per-epoch print() in train()). The file handler is
@@ -120,6 +122,19 @@ def evaluate(model, criterion, data_loader, params):
 
     return validation_loss, accuracy
 
+def aggregate_fitness(val_accuracies, val_losses, best_accuracy, best_loss,
+                      aggregation='max', last_k=None):
+    """ (accuracy, loss) that define an individual's fitness. 'max' returns the best values
+        seen (the original behavior); 'mean_last_k' the mean of the last *last_k* evaluated
+        epochs (every evaluated epoch if last_k is None). """
+    if aggregation == 'max' or not val_accuracies:
+        return best_accuracy, best_loss
+    if aggregation != 'mean_last_k':
+        raise ValueError(f"Invalid fitness_aggregation: {aggregation}")
+    k = len(val_accuracies) if last_k is None else min(last_k, len(val_accuracies))
+    return float(sum(val_accuracies[-k:]) / k), float(sum(val_losses[-k:]) / k)
+
+
 def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.optim.Optimizer, 
         train_loader:torch.utils.data.DataLoader, val_loader:torch.utils.data.DataLoader, 
         params:Dict, debug=False) -> Dict:
@@ -185,7 +200,10 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
 
     id_num = f"{params.get('generation', '?')}_{params.get('individual', '?')}"
 
-    for epoch in range(1, max_epochs + 1):
+    # start_epoch > 1 only when resuming the cheap fidelity rung (plan v2, D2) - the model
+    # and optimizer state were loaded by fitness_calculation.
+    epoch = params.get('start_epoch', 1) - 1
+    for epoch in range(params.get('start_epoch', 1), max_epochs + 1):
         train_loss, train_accuracy = train_epoch(model, criterion, optimizer, train_loader, params,scaler)
         training_losses.append(train_loss)
         training_accuracies.append(train_accuracy)
@@ -244,6 +262,7 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
         elif epoch % 5 == 0:
             print(f"Epoch [{epoch}/{max_epochs}] - Training Loss: {train_loss:.4f}")
             
+    params['last_epoch'] = epoch
     params['t1'] = time.time()
     params['training_time'] = params['t1'] - params['t0']
     
@@ -262,11 +281,18 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     fitness_metric = params['fitness_metric']
     mo_base_metric = params['mo_metric_base']
 
+    # Fitness aggregation over the evaluated epochs (plan v2, D2): 'max' (default) is the
+    # best value seen, as before; 'mean_last_k' averages the last fitness_last_k evaluated
+    # epochs (all of them if unset), which is less noisy than a maximum.
+    fitness_accuracy, fitness_loss = aggregate_fitness(
+        validation_accuracies, validation_losses, best_accuracy, best_validation_loss,
+        params.get('fitness_aggregation', 'max'), params.get('fitness_last_k'))
+
     if fitness_metric == 'best_accuracy' or (fitness_metric == 'scalar_multi_objective' and mo_base_metric == 'accuracy'):
-        metric_value = best_accuracy
+        metric_value = fitness_accuracy
         metric_type = 'accuracy'
     elif fitness_metric == 'best_loss' or (fitness_metric == 'scalar_multi_objective' and mo_base_metric == 'loss'):
-        metric_value = best_validation_loss
+        metric_value = fitness_loss
         metric_type = 'loss'
     else:
         raise ValueError(f"Invalid fitness_metric: {fitness_metric}")   
@@ -275,7 +301,7 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     scalar_multi_objective = fitness_utils.mofitness(metric_value=metric_value,params=total_trainable_params,inference_time=cuda_inference_time,
                                     T_p=params['max_params'], T_t=params['max_inference_time'],metric_type=metric_type)
         
-    fitness_val_loss = (1 / (1 + best_validation_loss))*100.0 # Lower loss leads to higher fitness - Reciprocal Transformation
+    fitness_val_loss = (1 / (1 + fitness_loss))*100.0 # Lower loss leads to higher fitness - Reciprocal Transformation
     
     params['total_trainable_params'] = total_trainable_params
     params['cuda_inference_time'] = cuda_inference_time
@@ -304,6 +330,7 @@ def train(model:torch.nn.Module, criterion:torch.nn.Module, optimizer:torch.opti
     training_results['total_trainable_params'] = total_trainable_params / 1e6 # in millions
     training_results['total_flops'] = total_flops / 1e6  # Convert to MFLOPs
     training_results['best_accuracy'] = best_accuracy
+    training_results['fitness_accuracy'] = fitness_accuracy
     training_results['fitness_val_loss'] = fitness_val_loss
     training_results['scalar_multi_objective'] = scalar_multi_objective        
     return training_results
@@ -369,8 +396,10 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     # retraining. No weights are stored or reused, only the fitness/params/inference
     # time values. Checked BEFORE building any model, so a hit skips model construction
     # and the warm-up forward pass too, not just training.
+    fidelity_rung = params.get('fidelity_rung')
     if architecture_cache is not None:
-        cache_hit = architecture_cache.find_cached_result(net_list)
+        cache_hit = architecture_cache.find_cached_result(
+            net_list, protocol=params.get('cache_protocol'))
         if cache_hit is not None:
             # A diverged individual is cached with fitness/params_m/inference_us as None
             # (architecture_cache.py can't store NaN/Inf) - convert back to NaN so this
@@ -429,6 +458,20 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
     else:
         optimizer = torch.optim.SGD(model_net.parameters(), lr=params['learning_rate'])
 
+    # Two-rung fidelity (plan v2, D2): the second rung continues the cheap rung's model
+    # from its checkpoint instead of training from scratch.
+    if fidelity_rung == 'resume':
+        ckpt_path = os.path.join(params['experiment_path'], params['resume_from'],
+                                 FIDELITY_CHECKPOINT)
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model_net.load_state_dict(ckpt['model'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+            params['start_epoch'] = ckpt['epoch'] + 1
+        else:
+            LOGGER.warning(f"No fidelity checkpoint at {ckpt_path} - training {id_num} "
+                           f"from scratch.")
+
     # Training time start counting here.
     params['t0'] = time.time()
 
@@ -440,7 +483,8 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
             return result
         else:
             if params['fitness_metric'] == 'best_accuracy':
-                return_val[0] = results_dict['best_accuracy']
+                # fitness_accuracy == best_accuracy unless train.fitness_aggregation is set
+                return_val[0] = results_dict['fitness_accuracy']
                 return_val[1] = results_dict['total_trainable_params']
                 return_val[2] = results_dict['cuda_inference_time']
             elif params['fitness_metric'] == 'best_loss':
@@ -454,8 +498,18 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
             else:
                 raise ValueError(f"Invalid fitness metric: {params['fitness_metric']}")
             return_val[3] = 0.0  # actually trained - a new architecture this generation
+            if len(return_val) > 4:
+                return_val[4] = params['training_time']  # GPU seconds spent on this individual
 
         LOGGER.info(f"Training of model {id_num} finished, best {params['fitness_metric']}: {round(return_val[0], 2)}")
+
+        if fidelity_rung == 'low':
+            # Cheap rung: keep what the second rung needs to continue, and never cache a
+            # low-fidelity fitness as if it were final.
+            torch.save({'model': model_net.state_dict(), 'optimizer': optimizer.state_dict(),
+                        'epoch': params.get('last_epoch', params['max_epochs'])},
+                       os.path.join(model_path, FIDELITY_CHECKPOINT))
+            return
 
         # Save weights (used by the retrain step / infographic, not by the fitness cache)
         best_model_path = os.path.join(model_path, 'best_model.pth')
@@ -471,16 +525,17 @@ def fitness_calculation(id_num: str, params: Dict[str, Any],
                 net_list, fitness=return_val[0],
                 params_m=results_dict['total_trainable_params'],  # already in millions
                 inference_us=results_dict['cuda_inference_time'],
+                protocol=params.get('cache_protocol'),
             )
 
     except (TimeoutError, MemoryError) as e:
         LOGGER.error(f"Exception: {e}")
-        return_val[:] = [0.0, 0.0, 0.0, 0.0]
+        return_val[:] = [0.0] * len(return_val)
     except Exception as e:
         if "out of memory" in str(e):
             LOGGER.error(f"CUDA out of memory exception, error: {e}")
-            return_val[:] = [0.0, 0.0, 0.0, 0.0]
+            return_val[:] = [0.0] * len(return_val)
         else:
             LOGGER.error(f"Exception: {e}")
-            return_val[:] = [0.0, 0.0, 0.0, 0.0]
+            return_val[:] = [0.0] * len(return_val)
         raise e

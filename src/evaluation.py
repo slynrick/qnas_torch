@@ -16,6 +16,20 @@ from cnn import train, input
 from util import init_log
 from architecture_cache import ArchitectureCache
 
+
+def cache_protocol(train_params: dict):
+    """Signature of the fitness proxy for the architecture cache (plan v2, D2), or None for
+    the original proxy, so that a fitness measured one way is never reused for another.
+    Only the options of option_defaults.TRAIN_DEFAULTS make a run's proxy non-default."""
+    import option_defaults
+    if all(train_params.get(key, default) == default
+           for key, default in option_defaults.TRAIN_DEFAULTS.items()):
+        return None
+    keys = ('max_epochs', 'epochs_to_eval', 'limit_data_value', 'data_augmentation',
+            *option_defaults.TRAIN_DEFAULTS)
+    return '|'.join(f'{key}={train_params.get(key)}' for key in keys)
+
+
 class EvalPopulation(object):
     """
     Evaluate a population using multiple processes.
@@ -94,10 +108,18 @@ class EvalPopulation(object):
         # finishes rather than batching updates until the whole generation completes.
         cache_path = os.path.join(params['experiment_path'], 'cache.json')
         self.architecture_cache = ArchitectureCache(cache_path=cache_path)
+        self.train_params['cache_protocol'] = cache_protocol(self.train_params)
+
+        # Read by QNAS (plan v2): parameters (millions) of the last evaluated population,
+        # for selection_capacity_lambda, and GPU seconds spent training so far.
+        self.last_params_m = None
+        self.gpu_seconds_total = 0.0
 
         self.logger.info(f"Evaluation process initialized with {len(self.gpus)} GPUs")
 
-    def __call__(self, decoded_params: list, decoded_nets: list, generation: int
+    def __call__(self, decoded_params: list, decoded_nets: list, generation: int,
+                 fidelity_rung: Optional[str] = None, fidelity_epochs: Optional[int] = None,
+                 id_offset: int = 0, resume_ids: Optional[list] = None
                  ) -> "tuple[np.ndarray, np.ndarray]":
         """
         Evaluate the population.
@@ -110,6 +132,10 @@ class EvalPopulation(object):
             List of operation-name lists.
         generation : int
             Current generation number.
+        fidelity_rung, fidelity_epochs, id_offset, resume_ids
+            Two-rung evaluation (plan v2, D2): 'low' trains for fidelity_epochs and keeps
+            a checkpoint, in folders generation_<id_offset + i>; 'resume' continues
+            individual i from folder generation_<resume_ids[i]>.
 
         Returns
         -------
@@ -121,15 +147,26 @@ class EvalPopulation(object):
         pop_size = len(decoded_nets)
         evaluations = np.empty(shape=(pop_size,))
         # 4th slot: 1.0 if this individual was a cache hit, 0.0 if it was actually
-        # trained - written by cnn/train.py's fitness_calculation.
-        variables = [mp.Array('f', 4) for _ in range(pop_size)]
+        # trained; 5th: seconds spent training it - written by cnn/train.py's
+        # fitness_calculation.
+        variables = [mp.Array('f', 5) for _ in range(pop_size)]
+
+        overrides = {}
+        if fidelity_rung == 'low':
+            overrides = {'fidelity_rung': 'low', 'max_epochs': fidelity_epochs}
+        elif fidelity_rung == 'resume':
+            overrides = {'fidelity_rung': 'resume'}
 
         # Distribute individuals across threads
         selected_thread = 0
         individual_per_thread = []
         for idx in range(pop_size):
+            extra = dict(overrides)
+            if fidelity_rung == 'resume':
+                extra['resume_from'] = f"{generation}_{resume_ids[idx]}"
             individual_per_thread.append(
-                (idx, selected_thread, decoded_nets[idx], decoded_params[idx], variables[idx])
+                (id_offset + idx, selected_thread, decoded_nets[idx], decoded_params[idx],
+                 variables[idx], extra)
             )
             selected_thread = (selected_thread + 1) % self.train_params['threads']
 
@@ -153,9 +190,13 @@ class EvalPopulation(object):
             p.join()
 
         cache_hits = np.empty(shape=(pop_size,), dtype=bool)
+        params_m = np.empty(shape=(pop_size,))
         for idx, val in enumerate(variables):
             evaluations[idx] = val[0]
+            params_m[idx] = val[1]
             cache_hits[idx] = bool(val[3])
+            self.gpu_seconds_total += float(val[4])
+        self.last_params_m = params_m
 
         evol_end = time.perf_counter()
         elapsed_min = (evol_end - evol_time_start) / 60
@@ -170,9 +211,9 @@ class EvalPopulation(object):
     def run_individuals(self, generation, train_params, fn_dict, fn_list,
                         individuals_selected_thread, gpu_device, architecture_cache):
         train_loader, val_loader = self.loader.get_loader(pin_memory_device=gpu_device)
-        for individual, selected_thread, decoded_net, decoded_params, return_val in \
+        for individual, selected_thread, decoded_net, decoded_params, return_val, extra in \
                 individuals_selected_thread:
-            p = {**train_params, 'device': gpu_device}
+            p = {**train_params, 'device': gpu_device, **extra}
             id_num = f"{generation}_{individual}"
             train.fitness_calculation(
                 id_num, p, fn_dict, decoded_net,

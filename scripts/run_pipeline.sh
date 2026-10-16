@@ -24,8 +24,13 @@
 #       experiment again with a new -g keeps the earlier retrains and infographic.
 #   -E  retrain max_epochs (default: 300)
 #   -R  retrain num_repetitions (default: 1)
-#   -L  retrain lr_scheduler: cosine|reduce_on_plateau|exponential|multistep|None (default: None)
-#   -A  pass to enable retrain data_augmentation (flag, no value)
+#   -L  retrain lr_scheduler: cosine|reduce_on_plateau|exponential|multistep|None
+#       (default: multistep)
+#   -A  retrain data_augmentation - now the default, kept so older commands still work
+#   -Z  legacy retrain protocol: no data augmentation and lr_scheduler None (what the
+#       pipeline did before 2026-10; -L still overrides the scheduler). The default
+#       (augmentation + multistep) is the protocol the reports compare against the
+#       Daniela/Diego baselines - see reports/analise_experiment_cifar_pqnas.md
 #   -T  pass to enable retrain early stopping (flag, no value)
 #   -P  retrain early_stopping_patience (default: 10, only used if -T is passed)
 #   -M  pass to enable AMP mixed precision during retrain (default: FP32, flag, no value)
@@ -46,15 +51,16 @@ continue_path=""
 config_code="run1"
 retrain_max_epochs=300
 retrain_num_repetitions=1
-lr_scheduler="None"
-data_augmentation_flag=""
+lr_scheduler=""
+data_augmentation_flag="--data_augmentation"
+legacy_retrain=""
 early_stopping_flag=""
 early_stopping_patience=10
 en_pop_crossover_flag=""
 mixed_precision_flag=""
 skip_steps=""
 
-while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:XM" opt; do
+while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:XMZ" opt; do
     case "$opt" in
         e) experiment_path="$OPTARG" ;;
         c) config_file="$OPTARG" ;;
@@ -72,9 +78,16 @@ while getopts "e:c:d:n:m:C:g:E:R:L:ATP:S:XM" opt; do
         S) skip_steps="$OPTARG" ;;
         X) en_pop_crossover_flag="--en_pop_crossover" ;;
         M) mixed_precision_flag="--mixed_precision" ;;
+        Z) legacy_retrain=1 ;;
         *) echo "Unknown option"; exit 1 ;;
     esac
 done
+
+if [[ -n "$legacy_retrain" ]]; then
+    data_augmentation_flag=""
+    [[ -z "$lr_scheduler" ]] && lr_scheduler="None"
+fi
+[[ -z "$lr_scheduler" ]] && lr_scheduler="multistep"
 
 if [[ -z "$experiment_path" ]]; then
     echo "Error: -e experiment_path is required." >&2

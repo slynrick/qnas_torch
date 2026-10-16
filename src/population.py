@@ -165,6 +165,9 @@ class QPopulationNetwork(QPopulation):
 
         self.max_update = max_update
         self.max_prob = max_prob
+        # Temperature of generate_classical's sampling, set every generation by QNAS when
+        # QNAS.sampling_temperature is configured; 1.0 samples the PMF unchanged.
+        self.sampling_tau = 1.0
 
         self.chromosome = QChromosomeNetwork(max_num_nodes, fn_list, self.dtype)
 
@@ -197,12 +200,24 @@ class QPopulationNetwork(QPopulation):
 
         for node in range(self.chromosome.num_genes):
             size = len(self.chromosome.fn_list[node])
-            temp_prob = np.tile(self.probabilities[node], (self.repetition, 1))
+            probs = self.probabilities[node]
+            if self.sampling_tau != 1.0:
+                probs = self.tempered(probs, self.sampling_tau)
+            temp_prob = np.tile(probs, (self.repetition, 1))
             for ind in range(self.num_ind * self.repetition):
                 new_pop[ind, node] = np.random.choice(size, p=temp_prob[ind, :])
 
         return new_pop
-    
+
+    @staticmethod
+    def tempered(probs, tau):
+        """ Rows of *probs* raised to 1/tau and renormalized: tau < 1 sharpens the PMF
+            toward its mode, tau > 1 flattens it (plan v2, direction D3). """
+        logits = np.log(np.clip(probs, 1e-300, None)) / tau
+        logits -= logits.max(axis=1, keepdims=True)
+        out = np.exp(logits)
+        return out / out.sum(axis=1, keepdims=True)
+
     def hux_crossover(self, parent1, parent2):
         """ Perform Half Uniform Crossover (HUX) between two parent chromosomes. """
         differing_indices = np.where(parent1 != parent2)[0]

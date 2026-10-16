@@ -278,9 +278,29 @@ class ConfigParameters(object):
                 self.QNAS_spec[key] = config_file['QNAS'].get(key, default)
         if self.QNAS_spec['prune_criterion'] != 'pmf' and active and progressive_mode == 'dynamic':
             raise ValueError(
-                "QNAS.progressive.prune_criterion 'lift'/'empirical' is only supported "
-                "with mode: deterministic"
+                "QNAS.progressive.prune_criterion 'lift'/'empirical'/'surrogate' is only "
+                "supported with mode: deterministic"
             )
+
+        # Options of docs/QNAS_SEARCH_ENGINE_IMPROVEMENT_PLAN_V2.md (optional, config-file
+        # only): QNAS.surrogate / sampling_temperature / niche / fidelity sub-blocks become
+        # flat QNAS_spec keys (option_defaults.NESTED_BLOCKS); absent keys keep the
+        # original behavior. Validated by QNAS.initialize_qnas.
+        for block, (_, defaults) in option_defaults.NESTED_BLOCKS.items():
+            block_cfg = self.QNAS_spec.pop(block, None) or {}
+            unknown = set(block_cfg) - set(defaults)
+            if unknown:
+                raise ValueError(f"Unknown key(s) in QNAS.{block}: {sorted(unknown)}")
+            for name, default in defaults.items():
+                self.QNAS_spec[option_defaults.flat_key(block, name)] = block_cfg.get(name, default)
+        self.QNAS_spec['selection_capacity_lambda'] = config_file['QNAS'].get(
+            'selection_capacity_lambda', option_defaults.V2_QNAS_DEFAULTS['selection_capacity_lambda'])
+        if self.QNAS_spec['surrogate_enabled'] and active and progressive_mode == 'dynamic':
+            raise ValueError("QNAS.surrogate is not supported with progressive mode: dynamic "
+                             "(use mode: deterministic or no progressive mode)")
+        if self.QNAS_spec['fidelity_enabled'] and \
+                self.QNAS_spec['fidelity_low_epochs'] >= config_file['train']['max_epochs']:
+            raise ValueError("QNAS.fidelity.low_epochs must be < train.max_epochs")
 
         if active and progressive_mode == 'dynamic':
             update_quantum_gen = self.QNAS_spec['update_quantum_gen']
@@ -355,12 +375,26 @@ class ConfigParameters(object):
             'seed', input.DEFAULT_DATA_SEED
         )
 
+        # Fitness-proxy options (plan v2, direction D2; config-file only). Defaults keep
+        # the original proxy: max accuracy over the evaluated epochs, validation of
+        # limit_data_value - train samples, augmentation only through the CLI flag.
+        for key, default in option_defaults.TRAIN_DEFAULTS.items():
+            self.train_spec[key] = config_file['train'].get(key, default)
+        if self.train_spec['fitness_aggregation'] not in ('max', 'mean_last_k'):
+            raise ValueError("train.fitness_aggregation must be 'max' or 'mean_last_k'")
+        last_k = self.train_spec['fitness_last_k']
+        if last_k is not None and not 1 <= last_k <= config_file['train']['epochs_to_eval']:
+            raise ValueError("train.fitness_last_k must be in [1, train.epochs_to_eval]")
+        if self.train_spec['limit_val_value'] is not None and self.train_spec['limit_val_value'] < 1:
+            raise ValueError("train.limit_val_value must be a positive number of images")
+
         self._get_fn_spec()
 
         self.train_spec['experiment_path'] = self.args['experiment_path']
         self.train_spec['fitness_metric'] = self.args['fitness_metric']
         self.train_spec['optimizer'] = self.args['optimizer']
-        self.train_spec['data_augmentation'] = self.args['data_augmentation']
+        self.train_spec['data_augmentation'] = (self.args['data_augmentation']
+                                                or self.train_spec['search_data_augmentation'])
         self.train_spec['network_config'] = self.args['network_config']
         self.train_spec['network_gap'] = self.args['network_gap']
         self.train_spec['save_checkpoints_epochs'] = self.args['save_checkpoints_epochs']
